@@ -1,0 +1,8 @@
+# Generated CSV data
+data_clean/
+
+# Credentials
+.env
+
+# Python cache
+__pycache__/
