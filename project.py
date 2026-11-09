@@ -1,4 +1,3 @@
-import json
 from getpass import getpass
 from pathlib import Path
 import psycopg
@@ -26,7 +25,7 @@ def main():
         print("Connected to PostgreSQL!")
 
         plan = get_postgres_plan(connection, query)
-        print(json.dumps(plan, indent=2))
+        print(plan.model_dump_json(indent=2, exclude_defaults=True))
 
 
 if __name__ == "__main__":
