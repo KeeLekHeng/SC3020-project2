@@ -67,3 +67,19 @@ CREATE TABLE LINEITEM ( L_ORDERKEY    INTEGER NOT NULL,
                              L_SHIPINSTRUCT CHAR(25) NOT NULL,
                              L_SHIPMODE     CHAR(10) NOT NULL,
                              L_COMMENT      VARCHAR(44) NOT NULL);
+
+-- Primary keys defined by the project schema. PostgreSQL automatically
+-- creates a unique B-tree index for each primary key.
+ALTER TABLE REGION   ADD PRIMARY KEY (R_REGIONKEY);
+ALTER TABLE NATION   ADD PRIMARY KEY (N_NATIONKEY);
+ALTER TABLE PART     ADD PRIMARY KEY (P_PARTKEY);
+ALTER TABLE SUPPLIER ADD PRIMARY KEY (S_SUPPKEY);
+ALTER TABLE PARTSUPP ADD PRIMARY KEY (PS_PARTKEY, PS_SUPPKEY);
+ALTER TABLE CUSTOMER ADD PRIMARY KEY (C_CUSTKEY);
+ALTER TABLE ORDERS   ADD PRIMARY KEY (O_ORDERKEY);
+ALTER TABLE LINEITEM ADD PRIMARY KEY
+    (L_ORDERKEY, L_PARTKEY, L_SUPPKEY, L_LINENUMBER);
+
+-- Refresh planner statistics after the data is imported. Run ANALYZE again
+-- after loading data when this schema is executed before the import.
+ANALYZE;
