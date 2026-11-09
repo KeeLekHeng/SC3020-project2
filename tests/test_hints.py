@@ -47,6 +47,18 @@ def test_hints_fix_scans_joins_and_order() -> None:
     assert "SeqScan(o)" in hints and "SeqScan(c)" in hints
 
 
+def test_joins_below_a_full_join_get_their_own_leading_hint() -> None:
+    inner = hash_join(scan("s", "supplier"), scan("n", "nation", "Outer"))
+    full = hash_join(scan("l", "lineitem"), inner)
+    full = full.model_copy(update={"join_type": "Full"})
+    query = "SELECT 1 FROM supplier s JOIN nation n ON true FULL JOIN lineitem l ON true"
+
+    hints = build_hints(full, query)
+
+    assert "Leading((l (s n)))" in hints
+    assert "Leading((s n))" in hints
+
+
 def test_switch_offs_cover_only_unused_operators() -> None:
     plan = hash_join(scan("o", "orders"), scan("c", "customer", "Outer"))
     query = "SELECT * FROM orders o JOIN customer c ON true"
@@ -56,6 +68,7 @@ def test_switch_offs_cover_only_unused_operators() -> None:
     assert "Set(enable_mergejoin off)" in hints
     assert "Set(enable_hashjoin off)" not in hints
     assert "enable_" not in build_hints(plan, query, switch_offs=False)
+    assert "Leading" not in build_hints(plan, query, leading=False)
 
 
 @pytest.mark.parametrize(("tables", "lifted"), [(8, False), (9, True)])
@@ -208,6 +221,52 @@ def test_decisions_ignore_a_subquery_scan_postgresql_may_drop() -> None:
 
     assert decisions(with_scan).keys() == decisions(without_scan).keys()
     assert differences(with_scan, without_scan) == []
+
+
+def test_moving_the_gather_is_a_difference() -> None:
+    lineitem = scan("l", "lineitem", "Outer")
+    lineitem = lineitem.model_copy(update={"parallel_aware": True})
+    orders = scan("o", "orders", "Outer")
+    early = hash_join(PlanNode(node_type="Gather", children=(lineitem,)), orders)
+    late = PlanNode(node_type="Gather", children=(hash_join(lineitem, orders),))
+
+    moved = [str(d.decision) for d in differences(early, late)]
+
+    assert moved == ["gather(l)", "gather(l, o)"]
+
+
+def parallel_aggregate(partial: str, final: str) -> PlanNode:
+    """A two-stage parallel aggregate over lineitem with the given strategies."""
+    stage = PlanNode(
+        node_type="Aggregate",
+        strategy=partial,
+        partial_mode="Partial",
+        parent_relationship="Outer",
+        children=(scan("l", "lineitem", "Outer"),),
+    )
+    return PlanNode(
+        node_type="Aggregate",
+        strategy=final,
+        partial_mode="Finalize",
+        children=(PlanNode(node_type="Gather Merge", children=(stage,)),),
+    )
+
+
+def test_parallel_and_serial_aggregates_are_one_decision() -> None:
+    # TPC-H Q1's shapes: the workers hash, and the Finalize stage sorts only because
+    # Gather Merge delivers sorted rows.
+    lineitem = scan("l", "lineitem", "Outer")
+    serial = PlanNode(node_type="Aggregate", strategy="Hashed", children=(lineitem,))
+    parallel = parallel_aggregate("Hashed", "Sorted")
+
+    assert {d.decision.kind for d in differences(serial, parallel)} == {"gather"}
+
+
+def test_partial_aggregate_strategy_is_compared() -> None:
+    hashed = parallel_aggregate("Hashed", "Sorted")
+    grouped = parallel_aggregate("Sorted", "Sorted")
+
+    assert [str(d.decision) for d in differences(hashed, grouped)] == ["aggregate(l)"]
 
 
 def test_differences_name_the_decision_and_both_choices() -> None:

@@ -112,6 +112,18 @@ SHAPES = {
         "SELECT sum(n) FROM r"
     ),
     "FULL JOIN": "SELECT count(*) FROM customer c FULL JOIN orders o ON o.o_custkey = c.c_custkey",
+    "join of two outer-join results": (
+        "SELECT count(*) FROM (nation n "
+        "LEFT JOIN supplier s ON s.s_nationkey = n.n_nationkey) "
+        "JOIN (region r LEFT JOIN customer c ON c.c_nationkey = r.r_regionkey) "
+        "ON n.n_regionkey = r.r_regionkey"
+    ),
+    "joins below a FULL JOIN": (
+        "SELECT l.l_returnflag, count(*) FROM region r "
+        "JOIN nation n ON r.r_regionkey = n.n_regionkey "
+        "JOIN supplier s ON n.n_nationkey = s.s_nationkey FULL JOIN lineitem l "
+        "ON s.s_suppkey = l.l_suppkey GROUP BY l.l_returnflag"
+    ),
     "INTERSECT": "SELECT o_custkey FROM orders INTERSECT SELECT c_custkey FROM customer",
     "TID scan": "SELECT * FROM region WHERE ctid = '(0,1)'",
     "hash-only GROUP BY": "SELECT xmin, count(*) FROM region GROUP BY xmin",

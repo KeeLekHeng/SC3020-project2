@@ -351,7 +351,9 @@ FROM_ITEM = (exp.From, exp.Join, exp.Lateral)
 NAME_LIMIT = 63
 
 
-def build_hints(plan: PlanNode, query: str, switch_offs: bool = True) -> str:
+def build_hints(
+    plan: PlanNode, query: str, switch_offs: bool = True, leading: bool = True
+) -> str:
     """
     Return pg_hint_plan hints that ask PostgreSQL to use this plan.
 
@@ -365,9 +367,11 @@ def build_hints(plan: PlanNode, query: str, switch_offs: bool = True) -> str:
     - the method and index of every Seq Scan, Index Scan, Index Only Scan and Bitmap
       Heap Scan
     - the method of every Hash Join, Merge Join and Nested Loop
-    - the join order and outer and inner sides, with one Leading hint per query level;
-      a level's joins stop at named relations and at any operator that is not a join or
-      a pass-through operator, and what lies below gets its own Leading hint
+    - unless leading=False, the join order and outer and inner sides, with one Leading
+      hint per query level;
+      a level's joins stop at named relations, at a FULL JOIN's inputs and at any
+      operator that is not a join or a pass-through operator, and what lies below gets
+      its own Leading hint
     - for a join of more than COLLAPSE_LIMIT relations, join_collapse_limit and
       from_collapse_limit high enough to plan it as one join, with GEQO off, so the
       Leading hint applies
@@ -404,6 +408,10 @@ def build_hints(plan: PlanNode, query: str, switch_offs: bool = True) -> str:
       tables PostgreSQL copies.
     - A parallel scan with no Gather above it gets no Parallel hint, because its worker
       count is unknown.
+    - pg_hint_plan honours one Leading hint per join problem. In nested FULL JOINs the
+      outer FULL JOINs' sides may not be forced, and a join between two outer-join
+      results, such as two LEFT JOINs joined together, falls back to a penalized Nested
+      Loop under any Leading hint; comparison.force_plan() then retries without them.
     - PostgreSQL cannot follow a plan it has no path for, for example an index or bitmap
       scan without a usable condition, a nested loop for a FULL JOIN, some outer and
       anti join side swaps, or a parallel scan inside a nested loop.
@@ -413,6 +421,7 @@ def build_hints(plan: PlanNode, query: str, switch_offs: bool = True) -> str:
     query lacks.
     """
     hints: list[str] = []
+    leading_hints: list[str] = []
     leading_sizes: list[int] = []
     parsed = _parse(query)
     relations = {t.alias_or_name: t.name for t in _relations(parsed)} if parsed else {}
@@ -483,13 +492,16 @@ def build_hints(plan: PlanNode, query: str, switch_offs: bool = True) -> str:
             hints.append(f"{JOIN_HINTS[node.node_type]}({aliases})")
 
             if not ordered:
-                hints.append(f"Leading({_format_leading(tree)})")
+                leading_hints.append(f"Leading({_format_leading(tree)})")
                 leading_sizes.append(len(flat))
 
         # Inputs of a join or pass-through operator stay in the same query
         # level, so a Leading hint above still covers them; anything else
-        # starts a new level that needs its own.
-        same_level = node.node_type in JOIN_HINTS or node.node_type in PASS_THROUGH
+        # starts a new level that needs its own. PostgreSQL never reorders
+        # tables across a FULL JOIN, so the joins below one are planned apart.
+        same_level = node.node_type in PASS_THROUGH or (
+            node.node_type in JOIN_HINTS and node.join_type != "Full"
+        )
         for child in node.inputs:
             visit(child, (ordered or tree is not None) and same_level, workers)
 
@@ -499,6 +511,12 @@ def build_hints(plan: PlanNode, query: str, switch_offs: bool = True) -> str:
             visit(subplan, False, None)
 
     visit(plan, ordered=False, workers=None)
+
+    # pg_hint_plan reports all but one Leading hint of a join problem as duplicates,
+    # yet the joins below a FULL JOIN keep their order only when their hint comes
+    # first, so emit the deepest scope first.
+    if leading:
+        hints += reversed(leading_hints)
 
     size = max(leading_sizes, default=0)
     if size > COLLAPSE_LIMIT:

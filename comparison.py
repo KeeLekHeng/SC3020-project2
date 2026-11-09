@@ -14,10 +14,10 @@ import psycopg
 from preprocessing import GATHER, JOIN_HINTS, PlanNode, build_hints, get_postgres_plan
 
 # Operators that make no decision of their own: a Hash belongs to its Hash Join, a
-# Gather to the parallel scans below it, a Bitmap Index Scan to its heap scan, and a
-# Subquery Scan only passes rows through. PostgreSQL drops a Subquery Scan when nothing
-# above needs it, so counting it would make two equal plans differ.
-FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan", *GATHER}
+# Bitmap Index Scan to its heap scan, and a Subquery Scan only passes rows through.
+# PostgreSQL drops a Subquery Scan when nothing above needs it, so counting it would
+# make two equal plans differ.
+FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
 
 # Decision kinds that build_hints() can force; realization_gaps() checks only these.
 FORCED_KINDS = {"scan", "parallel", "join", "outer"}
@@ -26,9 +26,8 @@ FORCED_KINDS = {"scan", "parallel", "join", "outer"}
 class Decision(NamedTuple):
     """A planner decision: its kind, such as "join", and the tables it covers."""
 
-    # "scan", "parallel", "join", "outer", "aggregate", "partial aggregate",
-    # "finalize aggregate", or any other operator's lowercased node_type, such as
-    # "sort", "limit" or "materialize".
+    # "scan", "parallel", "join", "outer", "aggregate", "gather", or any other
+    # operator's lowercased node_type, such as "sort", "limit" or "materialize".
     kind: str
     # Sorted aliases, such as ("c", "o").
     tables: tuple[str, ...]
@@ -45,7 +44,8 @@ class Choice(NamedTuple):
     # - parallel: "parallel" or "serial"
     # - join: "Hash Join", "Merge Join" or "Nested Loop"
     # - outer: the outer side's aliases, such as "o" for join(c, o)
-    # - aggregates: "Plain", "Sorted", "Hashed" or "Mixed"
+    # - aggregate: "Plain", "Sorted", "Hashed" or "Mixed"
+    # - gather: "Gather" or "Gather Merge"
     # - other operators: their operation, strategy or sort keys, else "used"
     value: str
     node: PlanNode
@@ -72,8 +72,11 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
     - scan(o): the operator reading alias o, such as "Index Scan on orders_pkey", and
       parallel(o): "parallel" or "serial"
     - join(c, o): "Hash Join", and outer(c, o): "o", the outer side
-    - aggregate(c, o): its strategy; parallel stages are partial aggregate(...) and
-      finalize aggregate(...)
+    - aggregate(c, o): its strategy; a parallel aggregate's Partial and Finalize stages
+      are one decision, with the Partial stage's strategy, so serial and parallel
+      grouping compare by how the rows are grouped
+    - gather(l): "Gather" or "Gather Merge", the operator combining parallel workers'
+      rows, keyed by the tables below it, so moving it is a different decision
     - any other operator, by its lowercased type: its operation, strategy or sort keys,
       or "used" if it has none, such as sort(o): "o.o_orderdate"
 
@@ -86,13 +89,14 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
       the same aliases.
     - Two operators of the same type over the same tables make one decision, so only the
       last one is kept.
-    - Not compared: Gather placement and worker counts (parallelism is recorded per
-      scan), conditions, filters, costs and row estimates.
+    - Not compared: worker counts, conditions, filters, costs and row estimates.
     """
     found: dict[Decision, Choice] = {}
 
     for node in plan.walk():
-        if node.node_type in FOLDED:
+        # The Partial stage below, where the workers group the rows, stands for the
+        # whole parallel aggregate; the Finalize method follows from the Gather kind.
+        if node.node_type in FOLDED or node.partial_mode == "Finalize":
             continue
 
         if node.alias:
@@ -113,9 +117,9 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
             found[Decision("join", tables)] = Choice(node.node_type, node)
             kind, value = "outer", ", ".join(_tables(node.inputs[0]))
         elif node.node_type == "Aggregate":
-            mode = node.partial_mode or "Simple"
-            kind = "aggregate" if mode == "Simple" else f"{mode.lower()} aggregate"
-            value = node.strategy or "Plain"
+            kind, value = "aggregate", node.strategy or "Plain"
+        elif node.node_type in GATHER:
+            kind, value = "gather", node.node_type
         else:
             kind = node.node_type.lower()
             sort_keys = ", ".join(node.sort_keys)
@@ -142,8 +146,8 @@ def realization_gaps(requested: PlanNode, forced: PlanNode) -> list[Difference]:
     Return the realization gaps: the forced decisions PostgreSQL did not follow.
 
     requested is the plan given to build_hints(), as each Difference's a; forced is the
-    plan PostgreSQL chose with those hints, as b. Only the kinds in FORCED_KINDS are checked. An empty
-    result means every forced decision was followed.
+    plan PostgreSQL chose with those hints, as b. Only the kinds in FORCED_KINDS are
+    checked. An empty result means every forced decision was followed.
 
     A gap can be a decision no hint asked for, because build_hints() skips some scans
     and joins (see its limitations). Check it against the hints before concluding that
@@ -159,30 +163,34 @@ def force_plan(
     """
     Force plan on PostgreSQL and return (hints used, plan chosen, realization gaps).
 
-    A switch-off in build_hints() backfires when plan needs the operator but does not
-    show it. So when the forced plan has gaps, this forces again without switch-offs and
-    returns the result with fewer gaps; a tie keeps the switch-offs.
+    Some hints backfire: a switch-off when plan needs the operator but does not show
+    it, and a Leading hint over a join of two outer-join results (see build_hints()).
+    So while the forced plan has gaps, this tries again without switch-offs, then
+    without Leading hints, and returns the result with the fewest gaps; a tie keeps the
+    fuller hints.
 
-    Raises ValueError when build_hints() refuses the plan, and psycopg.errors.UndefinedFile
-    or InsufficientPrivilege when pg_hint_plan cannot be loaded (see get_postgres_plan()).
+    Raises ValueError when build_hints() refuses the plan, and
+    psycopg.errors.UndefinedFile or InsufficientPrivilege when pg_hint_plan cannot be
+    loaded (see get_postgres_plan()).
     """
-    hints = build_hints(plan, query)
-    forced = get_postgres_plan(connection, query, hints=hints)
-    gaps = realization_gaps(plan, forced)
-    if not gaps:
-        return hints, forced, gaps
+    best: tuple[str, PlanNode, list[Difference]] | None = None
 
-    fallback_hints = build_hints(plan, query, switch_offs=False)
-    fallback = get_postgres_plan(connection, query, hints=fallback_hints)
-    fallback_gaps = realization_gaps(plan, fallback)
-    if len(fallback_gaps) < len(gaps):
-        return fallback_hints, fallback, fallback_gaps
+    for switch_offs, leading in ((True, True), (False, True), (True, False)):
+        hints = build_hints(plan, query, switch_offs, leading)
+        forced = get_postgres_plan(connection, query, hints=hints)
+        gaps = realization_gaps(plan, forced)
+        if best is None or len(gaps) < len(best[2]):
+            best = (hints, forced, gaps)
 
-    return hints, forced, gaps
+        if not gaps:
+            break
+
+    assert best is not None
+    return best
 
 
 def _tables(node: PlanNode) -> tuple[str, ...]:
-    """Sorted aliases of the relations read below node, outside InitPlans and SubPlans."""
+    """Sorted aliases of the relations below node, outside InitPlans and SubPlans."""
     return tuple(sorted(node.relations()))
 
 
