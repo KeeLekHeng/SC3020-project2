@@ -3,6 +3,7 @@ from getpass import getpass
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
 
 from project import CONNECTION_SETTINGS
 
@@ -44,7 +45,8 @@ LOAD_ORDER = [
     "partsupp", "customer", "orders", "lineitem",
 ]
 
-schema = (project_folder / "schema.sql").read_text(encoding="utf-8")
+# Bytes, because psycopg types accept str only as literal SQL text.
+schema = (project_folder / "schema.sql").read_bytes()
 password = getpass("PostgreSQL password: ")
 
 try:
@@ -56,18 +58,20 @@ try:
             for table in LOAD_ORDER:
                 csv_path = output_folder / f"{table}.csv"
                 with csv_path.open(encoding="utf-8") as data, cursor.copy(
-                    f"COPY {table} FROM STDIN (FORMAT csv)"
+                    sql.SQL("COPY {} FROM STDIN (FORMAT csv)").format(sql.Identifier(table))
                 ) as copy:
                     while chunk := data.read(1 << 20):
                         copy.write(chunk)
                 print(f"{table}: loaded {cursor.rowcount:,} rows")
 
             cursor.execute("ANALYZE")
+
 except psycopg.errors.DuplicateTable:
     raise SystemExit(
         "The TPC-H tables already exist. Drop them, or recreate the "
         f"{CONNECTION_SETTINGS['dbname']} database, then run this again."
     )
+
 except psycopg.OperationalError as error:
     raise SystemExit(f"Could not connect to PostgreSQL: {error}")
 
