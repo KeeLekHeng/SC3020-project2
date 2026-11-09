@@ -2,7 +2,7 @@
 
 import pytest
 
-from comparison import decisions, differences
+from comparison import Decision, decisions, differences
 from preprocessing import PlanNode, build_hints, unique_aliases
 
 
@@ -260,6 +260,18 @@ def test_parallel_and_serial_aggregates_are_one_decision() -> None:
     parallel = parallel_aggregate("Hashed", "Sorted")
 
     assert {d.decision.kind for d in differences(serial, parallel)} == {"gather"}
+
+
+def test_finalize_aggregate_without_partial_stage_keeps_its_decision() -> None:
+    lineitem = scan("l", "lineitem", "Outer")
+    finalize = PlanNode(
+        node_type="Aggregate",
+        strategy="Sorted",
+        partial_mode="Finalize",
+        children=(lineitem,),
+    )
+
+    assert str(decisions(finalize)[Decision("aggregate", ("l",))]) == "Sorted"
 
 
 def test_partial_aggregate_strategy_is_compared() -> None:

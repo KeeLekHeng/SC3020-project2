@@ -96,7 +96,11 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
     for node in plan.walk():
         # The Partial stage below, where the workers group the rows, stands for the
         # whole parallel aggregate; the Finalize method follows from the Gather kind.
-        if node.node_type in FOLDED or node.partial_mode == "Finalize":
+        # A Finalize stage without one, as an AI plan may write, stands for itself.
+        partial_below = node.partial_mode == "Finalize" and any(
+            n.partial_mode == "Partial" for n in node.walk(subplans=False)
+        )
+        if node.node_type in FOLDED or partial_below:
             continue
 
         if node.alias:
