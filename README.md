@@ -5,50 +5,45 @@ Prepare TPC-H data and inspect PostgreSQL query plans as JSON.
 ## Requirements
 
 - Python 3 with the Windows `py` launcher.
-- A running PostgreSQL server and a database named `tpch`.
-- Psycopg 3 for the Python database connection:
+- A running PostgreSQL server and a database named `tpch`. The `Dockerfile`
+  provides PostgreSQL 16 with `pg_hint_plan`:
+
+  ```bash
+  docker build -t pg-tpch .
+  docker run -d --name tpch -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=tpch \
+    -p 127.0.0.1:5432:5432 -v tpch-db:/var/lib/postgresql/data pg-tpch
+  ```
+- The packages in `requirements.txt` (Psycopg 3 and the Anthropic SDK):
 
   ```powershell
-  py -m pip install "psycopg[binary]"
+  py -m pip install -r requirements.txt
   ```
 
-## Prepare the table data
+  With `uv`: `uv venv`, then `uv pip install -r requirements.txt`.
+- An Anthropic API key in the `ANTHROPIC_API_KEY` environment variable.
 
-The repository includes one set of the eight generated TPC-H `.tbl` files
-in `data/`: `customer.tbl`,
-`lineitem.tbl`, `nation.tbl`, `orders.tbl`, `part.tbl`, `partsupp.tbl`,
-`region.tbl`, and `supplier.tbl`.
+## Load the database
 
-From the project root, run:
+`data/` holds the eight generated TPC-H `.tbl` files. Create an empty `tpch`
+database, then from the project root run:
 
 ```powershell
 py prepare_data.py
 ```
 
-The script searches the project folder and its subfolders for exactly eight
-`.tbl` files. It removes the trailing `|` delimiter from each row and converts
-the data into CSV files without headers in `data_clean/`, such as
-`data_clean/customer.csv`. It prints the number of rows converted for each file.
-Running it again overwrites the corresponding CSV files.
+Enter your PostgreSQL password when prompted. The script requires exactly eight
+`.tbl` files in the project folder and its subfolders. It strips each row's
+trailing `|` and writes headerless CSV files to `data_clean/`, overwriting old
+ones. It then runs `schema.sql`, loads the tables in foreign key order and runs
+`ANALYZE`, using the connection settings in `project.py`.
 
-## Create the database tables
-
-Create the `tpch` database if needed, then connect to it in your database's SQL
-client. Run `schema.sql` to create the eight TPC-H tables,
-then import each CSV from `data_clean/` into its matching table using your
-database's CSV import tool. Configure the import for comma-separated UTF-8 data
-without a header row.
-
-`py prepare_data.py` prepares the data files; `schema.sql` creates the database
-tables.
+The load is one transaction, so a failure leaves no tables behind. If the tables
+already exist, the script stops; drop them or recreate the database first.
 
 ## Explain a query
 
-Edit `query.sql` and save the SQL query whose plan you want to inspect. The
-current example joins `customer` and `orders`, filters orders from
-`1995-01-01` onward, and counts orders for each customer.
-
-Keep a single query in the file, without an `EXPLAIN` prefix. For example:
+Save one SQL query in `query.sql`, without an `EXPLAIN` prefix. The current one
+counts each customer's orders from `1995-01-01` onward. For example:
 
 ```sql
 SELECT *
@@ -62,8 +57,8 @@ From the project root, run:
 py project.py
 ```
 
-Enter your PostgreSQL password when prompted. The connection settings are
-currently defined in `project.py`:
+Enter your PostgreSQL password when prompted. Change these settings in
+`project.py` if your setup differs:
 
 | Setting | Value |
 | --- | --- |
@@ -73,24 +68,18 @@ currently defined in `project.py`:
 | User | `postgres` |
 | Connection timeout | 10 seconds |
 
-Update those settings in `project.py` if your local PostgreSQL setup differs.
-
-`project.py` reads `query.sql` on every run and opens a read-only database
-connection. It passes the query to `get_postgres_plan()` in `preprocessing.py`,
-which adds `EXPLAIN (FORMAT JSON)` and retrieves the plan. The program prints
-`Connected to PostgreSQL!`, followed by the formatted JSON plan tree.
-
-To inspect another query, change `query.sql`, save it, and run `py project.py`
-again. This uses `EXPLAIN` without `ANALYZE`, so the output contains the
-planner's estimates; it does not execute the query or report actual timings.
+`project.py` reads `query.sql` on each run over a read-only connection, then
+prints `Connected to PostgreSQL!` and the formatted JSON plan tree. It uses
+`EXPLAIN` without `ANALYZE`, so the plan shows estimates only; the query does
+not run.
 
 ## Project files
 
 | File | Purpose |
 | --- | --- |
 | `data/*.tbl` | Source TPC-H table data. |
-| `prepare_data.py` | Converts the source data to CSV files in `data_clean/`. |
+| `prepare_data.py` | Converts the source data to CSV files in `data_clean/` and loads the database. |
 | `schema.sql` | Creates the eight database tables. |
 | `query.sql` | Query to explain; edit this file to change the input. |
 | `project.py` | Prompts for the password, connects to PostgreSQL, and prints the plan. |
-| `preprocessing.py` | Runs `EXPLAIN (FORMAT JSON)` and returns the root `Plan` object. |
+| `preprocessing.py` | `get_postgres_plan()` runs `EXPLAIN (FORMAT JSON)` and returns the root `Plan` object. |

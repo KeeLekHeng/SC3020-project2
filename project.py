@@ -5,6 +5,14 @@ import psycopg
 
 from preprocessing import get_postgres_plan
 
+CONNECTION_SETTINGS = {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "tpch",
+    "user": "postgres",
+    "connect_timeout": 10,
+}
+
 
 def main():
     password = getpass("PostgreSQL password: ")
@@ -13,14 +21,7 @@ def main():
     project_folder = Path(__file__).resolve().parent
     query = (project_folder / "query.sql").read_text(encoding="utf-8")
 
-    with psycopg.connect(
-        host="localhost",
-        port=5432,
-        dbname="tpch",
-        user="postgres",
-        password=password,
-        connect_timeout=10,
-    ) as connection:
+    with psycopg.connect(**CONNECTION_SETTINGS, password=password) as connection:
         connection.read_only = True
         print("Connected to PostgreSQL!")
 
