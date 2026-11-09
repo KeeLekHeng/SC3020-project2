@@ -44,7 +44,7 @@ class Choice(NamedTuple):
     # - scan: node_type plus any index, such as "Index Scan on orders_pkey"
     # - parallel: "parallel" or "serial"
     # - join: "Hash Join", "Merge Join" or "Nested Loop"
-    # - outer: the outer side's aliases, such as "c, o"
+    # - outer: the outer side's aliases, such as "o" for join(c, o)
     # - aggregates: "Plain", "Sorted", "Hashed" or "Mixed"
     # - other operators: their operation, strategy or sort keys, else "used"
     value: str
@@ -139,10 +139,10 @@ def differences(a: PlanNode, b: PlanNode) -> list[Difference]:
 
 def realization_gaps(requested: PlanNode, forced: PlanNode) -> list[Difference]:
     """
-    Return the forced decisions PostgreSQL did not follow.
+    Return the realization gaps: the forced decisions PostgreSQL did not follow.
 
-    requested is the plan given to build_hints(), as a; forced is the plan PostgreSQL
-    chose with those hints, as b. Only the kinds in FORCED_KINDS are checked. An empty
+    requested is the plan given to build_hints(), as each Difference's a; forced is the
+    plan PostgreSQL chose with those hints, as b. Only the kinds in FORCED_KINDS are checked. An empty
     result means every forced decision was followed.
 
     A gap can be a decision no hint asked for, because build_hints() skips some scans
@@ -162,14 +162,17 @@ def force_plan(
     A switch-off in build_hints() backfires when plan needs the operator but does not
     show it. So when the forced plan has gaps, this forces again without switch-offs and
     returns the result with fewer gaps; a tie keeps the switch-offs.
+
+    Raises ValueError when build_hints() refuses the plan, and psycopg.errors.UndefinedFile
+    or InsufficientPrivilege when pg_hint_plan cannot be loaded (see get_postgres_plan()).
     """
-    hints = build_hints(plan)
+    hints = build_hints(plan, query)
     forced = get_postgres_plan(connection, query, hints=hints)
     gaps = realization_gaps(plan, forced)
     if not gaps:
         return hints, forced, gaps
 
-    fallback_hints = build_hints(plan, switch_offs=False)
+    fallback_hints = build_hints(plan, query, switch_offs=False)
     fallback = get_postgres_plan(connection, query, hints=fallback_hints)
     fallback_gaps = realization_gaps(plan, fallback)
     if len(fallback_gaps) < len(gaps):
@@ -179,16 +182,8 @@ def force_plan(
 
 
 def _tables(node: PlanNode) -> tuple[str, ...]:
-    """Sorted aliases of the tables read below node in its own query level."""
-    return tuple(
-        sorted(
-            {
-                n.alias
-                for n in node.walk(subplans=False)
-                if n.alias and n.node_type not in FOLDED
-            }
-        )
-    )
+    """Sorted aliases of the relations read below node, outside InitPlans and SubPlans."""
+    return tuple(sorted(node.relations()))
 
 
 def _value(choice: Choice | None) -> str | None:

@@ -12,7 +12,7 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
   docker run -d --name tpch -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=tpch \
     -p 127.0.0.1:5432:5432 -v tpch-db:/var/lib/postgresql/data pg-tpch
   ```
-- The packages in `requirements.txt`: Psycopg 3, Pydantic and the Anthropic SDK:
+- The packages in `requirements.txt`: Psycopg 3, Pydantic, sqlglot and the Anthropic SDK:
 
   ```powershell
   py -m pip install -r requirements.txt
@@ -51,7 +51,19 @@ Enter your PostgreSQL password when prompted. Change these settings in `project.
 | User | `postgres` |
 | Connection timeout | 10 seconds |
 
-`project.py` reads `query.sql` over a read-only connection and prints PostgreSQL's plan as an indented tree. It then forces that plan with `pg_hint_plan` hints, prints the hints and the plan PostgreSQL chose with them, and reports any forced decision PostgreSQL did not follow. If `pg_hint_plan` cannot be loaded, it says so and stops. It uses `EXPLAIN` without `ANALYZE`, so the query does not run.
+`project.py` reads `query.sql` over a read-only connection and prints PostgreSQL's plan as an indented tree. If the query reads one table name more than once, it first gives each later use its own alias, such as `lineitem2`, and prints the rewritten query, because hints cannot tell two uses of one name apart. It then forces that plan with `pg_hint_plan` hints, prints the hints and the plan PostgreSQL chose with them, and reports any forced decision PostgreSQL did not follow. If `pg_hint_plan` cannot be loaded, it says so and stops. It uses `EXPLAIN` without `ANALYZE`, so the query does not run.
+
+## Run the tests
+
+Install the test dependencies, set your PostgreSQL password, then run the tests from the project root:
+
+```powershell
+py -m pip install -r requirements-dev.txt
+$env:PGPASSWORD = "postgres"
+py -m pytest
+```
+
+`tests/test_hints.py` needs no database. It covers hint building, the alias rewrite and plan comparison. `tests/test_forcing.py` forces PostgreSQL's own plan for TPC-H Q1–Q22 and for query shapes that broke forcing before, and checks that every forced decision is followed. It is skipped when the database or `pg_hint_plan` is unavailable. Both use `EXPLAIN` only, so no query runs.
 
 ## Project files
 
@@ -62,5 +74,6 @@ Enter your PostgreSQL password when prompted. Change these settings in `project.
 | `schema.sql` | Creates the eight database tables. |
 | `query.sql` | Query to explain; edit this file to change the input. |
 | `project.py` | Prompts for the password, prints PostgreSQL's plan, then forces the same plan with hints, prints it and reports any decision not followed. |
-| `preprocessing.py` | Defines `PlanNode`, the plan form shared by every plan source; `get_postgres_plan()` runs `EXPLAIN` (optionally `ANALYZE` or with hints) and returns a `PlanNode` tree; `build_hints()` turns a plan into `pg_hint_plan` hints. |
+| `preprocessing.py` | Defines `PlanNode`, the plan form shared by every plan source; `get_postgres_plan()` runs `EXPLAIN` (optionally `ANALYZE` or with hints) and returns a `PlanNode` tree; `unique_aliases()` gives each reused table name its own alias; `build_hints()` turns a plan into `pg_hint_plan` hints. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
+| `tests/` | Tests for hint building and comparison, and for forcing plans on PostgreSQL. |

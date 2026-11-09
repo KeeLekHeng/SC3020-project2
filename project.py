@@ -5,7 +5,7 @@ from typing import Any
 import psycopg
 
 from comparison import force_plan
-from preprocessing import get_postgres_plan
+from preprocessing import get_postgres_plan, unique_aliases
 
 CONNECTION_SETTINGS: dict[str, Any] = {
     "host": "localhost",
@@ -21,7 +21,12 @@ def main() -> None:
     password = getpass("PostgreSQL password: ")
 
     project_folder = Path(__file__).resolve().parent
-    query = (project_folder / "query.sql").read_text(encoding="utf-8")
+    original = (project_folder / "query.sql").read_text(encoding="utf-8")
+
+    # Hints cannot tell apart two uses of one table name, so give each its own alias.
+    query = unique_aliases(original)
+    if query != original:
+        print(f"Query with each reused table given its own alias:\n{query}")
 
     with psycopg.connect(**CONNECTION_SETTINGS, password=password) as connection:
         connection.read_only = True

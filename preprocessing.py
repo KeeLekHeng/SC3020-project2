@@ -3,8 +3,10 @@ Read query plans and prepare them for comparison.
 
 The project compares PostgreSQL's plan for a query with a plan proposed by an AI agent.
 This module defines PlanNode, the single representation both plans are converted into,
-and two functions:
+and three functions:
 
+- unique_aliases() rewrites a query so that no relation name is read twice, which
+  hints cannot tell apart.
 - get_postgres_plan() runs EXPLAIN and returns PostgreSQL's plan as a PlanNode tree,
   optionally with measured times (ANALYZE), hints, or both.
 - build_hints() turns a PlanNode tree into pg_hint_plan hints that ask PostgreSQL to use
@@ -20,7 +22,11 @@ import textwrap
 from typing import Callable, Iterator
 
 import psycopg
+import sqlglot
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 # Parent relationships of subqueries that PostgreSQL plans separately.
 SEPARATE_PLANS = ("InitPlan", "SubPlan")
@@ -213,6 +219,14 @@ class PlanNode(BaseModel):
         """Children that are subqueries planned separately (InitPlan, SubPlan)."""
         return tuple(c for c in self.children if c.parent_relationship in SEPARATE_PLANS)
 
+    def relations(self) -> set[str]:
+        """Aliases of the relations read in this subtree, outside InitPlans and SubPlans."""
+        return {
+            n.alias
+            for n in self.walk(subplans=False)
+            if n.alias and n.node_type != "Subquery Scan"
+        }
+
     def walk(self, subplans: bool = True) -> Iterator["PlanNode"]:
         """
         Yield this node and every node below it, parents first.
@@ -242,11 +256,9 @@ def get_postgres_plan(
     """
     Return PostgreSQL's execution plan for a query as a PlanNode tree.
 
-    query must be one SQL statement without its own hint comment. With analyze=True it
-    runs exactly as given, so use a read-only connection.
-
-    analyze=True runs the query and fills the actual_* fields; this function also sets
-    planning_time_ms and execution_time_ms on the root node.
+    query must be one SQL statement without its own hint comment. analyze=True runs it
+    exactly as given, so use a read-only connection; it fills the actual_* fields and
+    sets planning_time_ms and execution_time_ms on the root node.
 
     hints come from build_hints().
 
@@ -287,6 +299,10 @@ JOIN_HINTS = {
     "Nested Loop": "NestLoop",
 }
 GATHER = ("Gather", "Gather Merge")
+# PostgreSQL's default join_collapse_limit and from_collapse_limit. A join of more
+# relations is planned in pieces, and from geqo_threshold (12) relations by GEQO; either
+# way PostgreSQL ignores Leading hints. Assumes the server's default settings.
+COLLAPSE_LIMIT = 8
 SORTED_INPUT = {
     "Sort", "Incremental Sort", "Merge Join", "Merge Append", "Unique", "Group",
     "WindowAgg", "Gather Merge",
@@ -319,16 +335,30 @@ SWITCH_OFFS: dict[str, Callable[[PlanNode], bool]] = {
 
 # Operators that pass rows through within one query level. Any other
 # operator without an alias, such as an Aggregate under a join, is the top of
-# a subquery whose alias EXPLAIN dropped, so hints cannot refer to it.
+# a subquery whose alias EXPLAIN dropped; build_hints() recovers it from the query.
 PASS_THROUGH = {"Hash", "Sort", "Incremental Sort", "Materialize", "Memoize", *GATHER}
 
 # A join tree: an alias for one relation, or an (outer, inner) pair of trees.
 JoinTree = str | tuple
 
+# A query's FROM subqueries, each as (aliases of the relations inside, its alias).
+Subqueries = list[tuple[frozenset[str], str]]
 
-def build_hints(plan: PlanNode, switch_offs: bool = True) -> str:
+# Where a subquery is a FROM item rather than an IN, EXISTS or scalar subquery.
+FROM_ITEM = (exp.From, exp.Join, exp.Lateral)
+
+# PostgreSQL cuts names to 63 bytes (NAMEDATALEN - 1), and EXPLAIN shows them cut.
+NAME_LIMIT = 63
+
+
+def build_hints(plan: PlanNode, query: str, switch_offs: bool = True) -> str:
     """
     Return pg_hint_plan hints that ask PostgreSQL to use this plan.
+
+    query is the SQL the plan is for. From it, build_hints learns the aliases of FROM
+    subqueries, so joins over them get hints; which aliases the query writes, so c_1 is
+    not taken for a generated name; and which aliases exist, so a scan under a misnamed
+    alias is refused. If sqlglot cannot parse query, these steps are skipped.
 
     The hints fix:
 
@@ -338,6 +368,9 @@ def build_hints(plan: PlanNode, switch_offs: bool = True) -> str:
     - the join order and outer and inner sides, with one Leading hint per query level;
       a level's joins stop at named relations and at any operator that is not a join or
       a pass-through operator, and what lies below gets its own Leading hint
+    - for a join of more than COLLAPSE_LIMIT relations, join_collapse_limit and
+      from_collapse_limit high enough to plan it as one join, with GEQO off, so the
+      Leading hint applies
     - which scans run in parallel, and with how many workers; a plan without a Gather
       also gets Set(max_parallel_workers_per_gather 0), which turns parallelism off for
       the whole query
@@ -358,25 +391,47 @@ def build_hints(plan: PlanNode, switch_offs: bool = True) -> str:
     - A switched-off operator the plan needs but does not show, such as a Materialize
       under a Nested Loop whose inner side is a join, adds PostgreSQL's cost for a
       disabled operator, 1e10, to every candidate plan. The planner then cannot compare
-      their real costs and may break other hints; comparison.force_plan() catches this.
-    - Hints name tables by alias. A node without an alias gets no scan hint, and a join
-      over an unnamed operator, such as an Aggregate from a subquery or an Append over
-      partitions, gets no join or Leading hint; only the switch-offs limit its method.
+      their real costs and may break other hints; comparison.force_plan() then retries
+      without switch-offs.
+    - Hints name tables by alias. A node without an alias gets no scan hint. A join over
+      an unnamed operator, such as an Append over partitions or an IN subquery turned
+      into a join, gets no join or Leading hint; only the switch-offs limit its method.
     - A name used twice, such as an unaliased lineitem in both the query and a subquery,
       appears in EXPLAIN as lineitem and lineitem_1. pg_hint_plan ignores the generated
       name and applies the lineitem hint to every use, so when a hint would need the
-      generated name, build_hints raises ValueError. Distinct aliases in the query
-      avoid this.
+      generated name, build_hints raises ValueError. Planning the query from
+      unique_aliases() avoids this, except for a NOT MATERIALIZED CTE used twice, whose
+      tables PostgreSQL copies.
     - A parallel scan with no Gather above it gets no Parallel hint, because its worker
       count is unknown.
     - PostgreSQL cannot follow a plan it has no path for, for example an index or bitmap
       scan without a usable condition, a nested loop for a FULL JOIN, some outer and
       anti join side swaps, or a parallel scan inside a nested loop.
 
-    Raises ValueError when the plan cannot be forced: a name used twice, as above, or a
-    name that cannot be written safely in a hint comment.
+    Raises ValueError when the plan cannot be forced: a name used twice, as above, a
+    name that cannot be written safely in a hint comment, or a scan under an alias the
+    query lacks.
     """
     hints: list[str] = []
+    leading_sizes: list[int] = []
+    parsed = _parse(query)
+    relations = {t.alias_or_name: t.name for t in _relations(parsed)} if parsed else {}
+
+    # Each FROM or LATERAL subquery, with the relations its own level reads; those in
+    # an IN, EXISTS or scalar subquery inside it belong to another level. A LATERAL
+    # subquery's alias sits on the Lateral around it.
+    subqueries: Subqueries = []
+    for sub in parsed.find_all(exp.Subquery) if parsed else ():
+        alias = sub.parent.alias if isinstance(sub.parent, exp.Lateral) else sub.alias
+        if alias and isinstance(sub.parent, FROM_ITEM):
+            inner = {
+                id(t)
+                for q in sub.find_all(exp.Subquery, exp.Exists)
+                if not isinstance(q.parent, FROM_ITEM)
+                for t in q.find_all(exp.Table)
+            }
+            own = (t.alias_or_name for t in _relations(sub) if id(t) not in inner)
+            subqueries.append((frozenset(own), alias))
     hinted: set[str] = set()
     nodes = list(plan.walk())
     parallel = any(n.node_type in GATHER for n in nodes)
@@ -420,14 +475,16 @@ def build_hints(plan: PlanNode, switch_offs: bool = True) -> str:
                 # Otherwise PostgreSQL may also run this scan in parallel.
                 hints.append(f"Parallel({_hint_name(node.alias)} 0 hard)")
 
-        tree = _join_tree(node) if node.node_type in JOIN_HINTS else None
+        tree = _join_tree(node, subqueries) if node.node_type in JOIN_HINTS else None
         if tree:
-            hinted.update(_flatten(tree))
-            aliases = " ".join(_hint_name(a) for a in _flatten(tree))
+            flat = _flatten(tree)
+            hinted.update(flat)
+            aliases = " ".join(_hint_name(a) for a in flat)
             hints.append(f"{JOIN_HINTS[node.node_type]}({aliases})")
 
             if not ordered:
                 hints.append(f"Leading({_format_leading(tree)})")
+                leading_sizes.append(len(flat))
 
         # Inputs of a join or pass-through operator stay in the same query
         # level, so a Leading hint above still covers them; anything else
@@ -443,18 +500,47 @@ def build_hints(plan: PlanNode, switch_offs: bool = True) -> str:
 
     visit(plan, ordered=False, workers=None)
 
-    # Hints cannot reach a generated alias, so a plan that needs one cannot be forced.
-    blocked = sorted(hinted & _generated_aliases(plan))
+    size = max(leading_sizes, default=0)
+    if size > COLLAPSE_LIMIT:
+        limits = [f"Set({limit}_collapse_limit {size})" for limit in ("join", "from")]
+        hints = [*limits, "Set(geqo off)", *hints]
+
+    # EXPLAIN names the second use of a name lineitem_1, which hints cannot reach. An
+    # alias the query writes itself, such as c_1, is not such a name.
+    aliases = {n.alias for n in nodes if n.alias}
+    written = set(relations) | {alias for _, alias in subqueries}
+    generated = {
+        alias
+        for alias in aliases - written
+        if (match := re.fullmatch(r"(.+)_\d+", alias)) and match.group(1) in aliases
+    }
+    blocked = sorted(hinted & generated)
     if blocked:
         raise ValueError(
-            f"Cannot force this plan: {', '.join(blocked)} reuse a name used elsewhere "
-            "in the query. Give each use of a table its own alias."
+            f"Cannot force this plan: hints cannot reach {', '.join(blocked)}, a name "
+            "PostgreSQL generated for a table read twice under one name."
+        )
+
+    # A scan of a query table under another alias would get a hint that matches nothing.
+    tables = set(relations.values())
+    unknown = sorted(
+        n.alias
+        for n in nodes
+        if n.node_type in SCAN_HINTS
+        and n.alias
+        and n.alias not in relations
+        and n.relation in tables
+    )
+    if unknown:
+        raise ValueError(
+            f"Cannot force this plan: {', '.join(unknown)} is not an alias in the "
+            "query."
         )
 
     return " ".join(hints)
 
 
-def _join_tree(node: PlanNode) -> JoinTree | None:
+def _join_tree(node: PlanNode, subqueries: Subqueries) -> JoinTree | None:
     """Join tree of the relations under node, or None if one is unnamed."""
     if node.alias:
         return node.alias
@@ -462,13 +548,19 @@ def _join_tree(node: PlanNode) -> JoinTree | None:
     inputs = node.inputs
 
     if node.node_type in JOIN_HINTS and len(inputs) == 2:
-        outer, inner = (_join_tree(child) for child in inputs)
+        outer, inner = (_join_tree(child, subqueries) for child in inputs)
         return (outer, inner) if outer and inner else None
 
     if node.node_type in PASS_THROUGH and len(inputs) == 1:
-        return _join_tree(inputs[0])
+        return _join_tree(inputs[0], subqueries)
 
-    return None
+    # Any other unnamed operator heads a subquery whose alias EXPLAIN dropped: name it
+    # after the one FROM subquery that reads exactly the relations below it.
+    below = node.relations()
+    names = [alias for inside, alias in subqueries if inside == below]
+
+    return names[0] if below and len(names) == 1 else None
+
 
 
 def _flatten(tree: JoinTree) -> list[str]:
@@ -489,15 +581,112 @@ def _format_leading(tree: JoinTree) -> str:
     return f"({_format_leading(outer)} {_format_leading(inner)})"
 
 
-def _generated_aliases(plan: PlanNode) -> set[str]:
-    """Aliases EXPLAIN made up for a reused name, like lineitem_1 next to lineitem."""
-    aliases = {n.alias for n in plan.walk() if n.alias}
 
-    return set(
-        alias
-        for alias in aliases
-        if (match := re.fullmatch(r"(.+)_\d+", alias)) and match.group(1) in aliases
-    )
+def unique_aliases(query: str) -> str:
+    """
+    Return query with its own alias for every reused relation name.
+
+    EXPLAIN names a table read twice under one name as lineitem and lineitem_1, which
+    hints cannot reach (see build_hints()). This keeps the outermost use and gives each
+    other use an alias such as lineitem2, then requalifies its columns. It edits only
+    those names, so the rest of the text is unchanged. A query without reused names, or
+    one sqlglot cannot parse, is returned unchanged.
+    """
+    parsed = _parse(query)
+    if parsed is None:
+        return query
+
+    tables = _relations(parsed)
+    taken = {t.alias_or_name for t in tables} | {
+        a.name for a in parsed.find_all(exp.TableAlias)
+    }
+    # A qualified column refers to the nearest enclosing query block that declares its
+    # qualifier, so record which blocks declare which names.
+    declared = {(id(t.parent_select), t.alias_or_name) for t in tables}
+    seen: set[str] = set()
+    renames: dict[tuple[int, str], str] = {}
+    edits: list[tuple[int, int, str]] = []
+
+    for table in tables:
+        name = table.alias_or_name
+        if name not in seen:
+            seen.add(name)
+            continue
+
+        number = 2
+        while True:
+            # Cut the name so that it fits in NAME_LIMIT bytes with its number.
+            new = _truncate(name, NAME_LIMIT - len(str(number))) + str(number)
+            if new not in taken:
+                break
+
+            number += 1
+
+        taken.add(new)
+        renames[id(table.parent_select), name] = new
+        written = exp.to_identifier(new).sql(dialect="postgres")
+        if alias := table.args.get("alias"):
+            edits.append((*_span(alias.this), written))
+        else:
+            end = _span(table.this)[1]
+            edits.append((end, end, f" {written}"))
+
+    renamed = {name for _, name in renames}
+    for column in parsed.find_all(exp.Column):
+        if column.table not in renamed:
+            continue
+
+        block = column.parent_select
+        while block is not None and (id(block), column.table) not in declared:
+            block = block.parent_select
+
+        if block is not None and (new := renames.get((id(block), column.table))):
+            # A schema-qualified column, public.lineitem.x, loses its schema too.
+            first = column.args.get("db") or column.args["table"]
+            start, end = _span(first)[0], _span(column.args["table"])[1]
+            edits.append((start, end, exp.to_identifier(new).sql(dialect="postgres")))
+
+    for start, end, text in sorted(edits, reverse=True):
+        query = query[:start] + text + query[end:]
+
+    return query
+
+
+def _span(identifier: exp.Expr) -> tuple[int, int]:
+    """Start and end offsets of identifier, quotes included, in the parsed text."""
+    return identifier.meta["start"], identifier.meta["end"] + 1
+
+
+def _parse(query: str) -> exp.Expr | None:
+    """
+    Parse query with sqlglot, or return None if it is unparsable.
+
+    Names are normalized as PostgreSQL does, lowercased unless quoted and cut to
+    NAME_LIMIT bytes, so they match EXPLAIN's aliases.
+    """
+    try:
+        parsed = sqlglot.parse_one(query, read="postgres")
+    except SqlglotError:
+        return None
+
+    parsed = normalize_identifiers(parsed, "postgres")
+    for identifier in parsed.find_all(exp.Identifier):
+        identifier.set("this", _truncate(identifier.name))
+
+    return parsed
+
+
+
+def _truncate(name: str, limit: int = NAME_LIMIT) -> str:
+    """Cut name to limit bytes of UTF-8 without splitting a character."""
+    return name.encode()[:limit].decode(errors="ignore")
+
+
+def _relations(parsed: exp.Expr) -> list[exp.Table]:
+    """Relations read in FROM and JOIN clauses, outermost first."""
+    tables = parsed.find_all(exp.Table)
+    return [t for t in tables if isinstance(t.parent, (exp.From, exp.Join))]
+
 
 
 def _hint_name(name: str) -> str:

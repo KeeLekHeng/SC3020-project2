@@ -8,3 +8,5 @@ data_clean/
 __pycache__/
 
 .venv/
+
+.pytest_cache/
