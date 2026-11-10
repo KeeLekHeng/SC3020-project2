@@ -129,6 +129,46 @@ def test_tables_of_an_in_subquery_do_not_count_toward_the_from_subquery() -> Non
     assert "HashJoin(y c)" in build_hints(plan, query)
 
 
+def test_unique_aliases_leaves_a_name_also_used_bare() -> None:
+    # nation here may be the table's whole row; renaming the table would change it.
+    query = (
+        "SELECT count(*) FROM nation WHERE n_nationkey IN "
+        "(SELECT n_nationkey FROM nation WHERE nation IS NOT NULL)"
+    )
+
+    assert unique_aliases(query) == query
+
+
+def test_unique_aliases_renames_a_name_that_is_also_an_output_column() -> None:
+    # As in TPC-H Q9, nation is a column the subquery outputs, never the table's row.
+    query = (
+        "SELECT nation FROM (SELECT n_name AS nation FROM nation) x "
+        "JOIN nation ON n_nationkey = 1"
+    )
+
+    assert "FROM nation nation2) x" in unique_aliases(query)
+
+
+def test_unique_aliases_leaves_columns_of_a_subquery_alias_that_hides_the_table() -> None:
+    query = (
+        "SELECT 1 FROM nation WHERE n_nationkey IN (SELECT n_nationkey FROM nation "
+        "WHERE EXISTS (SELECT 1 FROM (VALUES (1)) nation(k) WHERE nation.k = 1))"
+    )
+
+    assert unique_aliases(query) == query.replace(
+        "FROM nation WHERE EXISTS", "FROM nation nation2 WHERE EXISTS"
+    )
+
+
+def test_unique_aliases_drops_the_database_of_renamed_columns() -> None:
+    query = (
+        "SELECT 1 FROM tpch.public.nation WHERE EXISTS "
+        "(SELECT tpch.public.nation.n_name FROM tpch.public.nation)"
+    )
+
+    assert "(SELECT nation2.n_name FROM" in unique_aliases(query)
+
+
 def test_names_are_quoted_and_unsafe_names_refused() -> None:
     quoted = build_hints(scan("Cust", "customer"), 'SELECT 1 FROM customer "Cust"')
     assert 'SeqScan("Cust")' in quoted

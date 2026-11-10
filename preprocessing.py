@@ -608,7 +608,10 @@ def unique_aliases(query: str) -> str:
     hints cannot reach (see build_hints()). This keeps the outermost use and gives each
     other use an alias such as lineitem2, then requalifies its columns. It edits only
     those names, so the rest of the text is unchanged. A query without reused names, or
-    one sqlglot cannot parse, is returned unchanged.
+    one sqlglot cannot parse, is returned unchanged. So is a reused name that also
+    appears bare, as in count(nation), where it may mean the table's whole row, unless
+    the query also names an output column so; a query that uses one name both ways is
+    renamed anyway.
     """
     parsed = _parse(query)
     if parsed is None:
@@ -620,14 +623,22 @@ def unique_aliases(query: str) -> str:
     }
     # A qualified column refers to the nearest enclosing query block that declares its
     # qualifier, so record which blocks declare which names.
-    declared = {(id(t.parent_select), t.alias_or_name) for t in tables}
+    # A subquery or VALUES alias can hide a table's name.
+    declared = {(id(t.parent_select), t.alias_or_name) for t in tables} | {
+        (id(a.parent_select), a.name) for a in parsed.find_all(exp.TableAlias)
+    }
+    # Whether a bare name means a table's whole row depends on the columns in scope,
+    # which are unknown here. A name given to an output column, as in n_name AS nation,
+    # is taken to mean that column.
+    outputs = {alias.alias for alias in parsed.find_all(exp.Alias)}
+    bare = {c.name for c in parsed.find_all(exp.Column) if not c.table} - outputs
     seen: set[str] = set()
     renames: dict[tuple[int, str], str] = {}
     edits: list[tuple[int, int, str]] = []
 
     for table in tables:
         name = table.alias_or_name
-        if name not in seen:
+        if name not in seen or name in bare:
             seen.add(name)
             continue
 
@@ -659,8 +670,9 @@ def unique_aliases(query: str) -> str:
             block = block.parent_select
 
         if block is not None and (new := renames.get((id(block), column.table))):
-            # A schema-qualified column, public.lineitem.x, loses its schema too.
-            first = column.args.get("db") or column.args["table"]
+            # A qualified column, as in tpch.public.lineitem.x, loses its catalog and
+            # schema too.
+            first = column.args.get("catalog") or column.args.get("db") or column.args["table"]
             start, end = _span(first)[0], _span(column.args["table"])[1]
             edits.append((start, end, exp.to_identifier(new).sql(dialect="postgres")))
 
