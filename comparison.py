@@ -11,7 +11,14 @@ from typing import NamedTuple
 
 import psycopg
 
-from preprocessing import GATHER, JOIN_HINTS, PlanNode, build_hints, get_postgres_plan
+from preprocessing import (
+    GATHER,
+    JOIN_HINTS,
+    PASS_THROUGH,
+    PlanNode,
+    build_hints,
+    get_postgres_plan,
+)
 
 # Operators that make no decision of their own: a Hash belongs to its Hash Join, a
 # Bitmap Index Scan to its heap scan, and a Subquery Scan only passes rows through.
@@ -29,7 +36,7 @@ class Decision(NamedTuple):
     # "scan", "parallel", "join", "outer", "aggregate", "gather", or any other
     # operator's lowercased node_type, such as "sort", "limit" or "materialize".
     kind: str
-    # Sorted aliases, such as ("c", "o").
+    # Sorted aliases, such as ("c", "o"), and <Result>-style names for unnamed leaves.
     tables: tuple[str, ...]
 
     def __str__(self) -> str:
@@ -67,10 +74,12 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
     Return the planner's decisions in plan.
 
     A decision names the tables it covers by alias, so the same decision in two plans is
-    equal. Written as decision: choice:
+    equal. An unnamed operator with no inputs, such as a Result, counts as a table
+    named <Result>. Written as decision: choice:
 
     - scan(o): the operator reading alias o, such as "Index Scan on orders_pkey", and
-      parallel(o): "parallel" or "serial"
+      parallel(o): "parallel" or "serial"; a scan that names no index, as a hand-built
+      plan may, equals the same scan on any index
     - join(c, o): "Hash Join", and outer(c, o): "o", the outer side
     - aggregate(c, o): its strategy; a parallel aggregate's Partial and Finalize stages
       are one decision, with the Partial stage's strategy, so serial and parallel
@@ -94,12 +103,14 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
     found: dict[Decision, Choice] = {}
 
     for node in plan.walk():
-        # The Partial stage below, where the workers group the rows, stands for the
-        # whole parallel aggregate; the Finalize method follows from the Gather kind.
-        # A Finalize stage without one, as an AI plan may write, stands for itself.
-        partial_below = node.partial_mode == "Finalize" and any(
-            n.partial_mode == "Partial" for n in node.walk(subplans=False)
-        )
+        # The Partial stage under a Finalize stage's Gather, where the workers group the
+        # rows, stands for the whole parallel aggregate; the Finalize method follows from
+        # the Gather kind. A Finalize stage without one, as an AI plan may write, stands
+        # for itself.
+        below = node.inputs[0] if node.partial_mode == "Finalize" and node.inputs else None
+        while below and below.node_type in PASS_THROUGH and below.inputs:
+            below = below.inputs[0]
+        partial_below = below is not None and below.partial_mode == "Partial"
         if node.node_type in FOLDED or partial_below:
             continue
 
@@ -141,7 +152,7 @@ def differences(a: PlanNode, b: PlanNode) -> list[Difference]:
     return [
         Difference(decision, found_a.get(decision), found_b.get(decision))
         for decision in sorted(found_a.keys() | found_b.keys())
-        if _value(found_a.get(decision)) != _value(found_b.get(decision))
+        if not _same(decision, found_a.get(decision), found_b.get(decision))
     ]
 
 
@@ -194,9 +205,26 @@ def force_plan(
 
 
 def _tables(node: PlanNode) -> tuple[str, ...]:
-    """Sorted aliases of the relations below node, outside InitPlans and SubPlans."""
-    return tuple(sorted(node.relations()))
+    """
+    Sorted aliases of the relations below node, outside InitPlans and SubPlans.
+
+    An unnamed operator without inputs, such as a Result, counts as <Result>, so a
+    join over it and the join below get different decisions.
+    """
+    unnamed = {
+        f"<{n.node_type}>"
+        for n in node.walk(subplans=False)
+        if not n.alias and not n.inputs and n.node_type not in FOLDED
+    }
+    return tuple(sorted(node.relations() | unnamed))
 
 
-def _value(choice: Choice | None) -> str | None:
-    return choice.value if choice else None
+def _same(decision: Decision, a: Choice | None, b: Choice | None) -> bool:
+    """Whether two plans chose the same; a scan that names no index matches any index."""
+    if a is None or b is None:
+        return a is b
+
+    x, y = a.value, b.value
+    return x == y or decision.kind == "scan" and (
+        x.startswith(f"{y} on ") or y.startswith(f"{x} on ")
+    )

@@ -129,6 +129,26 @@ def test_tables_of_an_in_subquery_do_not_count_toward_the_from_subquery() -> Non
     assert "HashJoin(y c)" in build_hints(plan, query)
 
 
+def test_scan_without_index_name_matches_any_index() -> None:
+    named = PlanNode(node_type="Index Scan", alias="o", index_name="orders_pkey")
+    unnamed = named.model_copy(update={"index_name": None})
+
+    assert differences(unnamed, named) == []
+    assert differences(unnamed.model_copy(update={"node_type": "Seq Scan"}), named) != []
+
+
+def test_join_over_an_unnamed_input_is_its_own_decision() -> None:
+    below = hash_join(scan("s", "supplier"), scan("n", "nation", "Outer"))
+    above = hash_join(below, PlanNode(node_type="Result")).model_copy(
+        update={"node_type": "Nested Loop"}
+    )
+
+    found = decisions(above)
+
+    assert str(found[Decision("join", ("n", "s"))]) == "Hash Join"
+    assert str(found[Decision("join", ("<Result>", "n", "s"))]) == "Nested Loop"
+
+
 def test_unique_aliases_leaves_a_name_also_used_bare() -> None:
     # nation here may be the table's whole row; renaming the table would change it.
     query = (
@@ -314,6 +334,22 @@ def test_finalize_aggregate_without_partial_stage_keeps_its_decision() -> None:
     )
 
     assert str(decisions(finalize)[Decision("aggregate", ("l",))]) == "Sorted"
+
+
+def test_finalize_aggregate_ignores_a_partial_stage_of_another_aggregate() -> None:
+    join = hash_join(parallel_aggregate("Hashed", "Sorted"), scan("o", "orders", "Outer"))
+    finalize = PlanNode(
+        node_type="Aggregate", strategy="Hashed", partial_mode="Finalize", children=(join,)
+    )
+
+    assert str(decisions(finalize)[Decision("aggregate", ("l", "o"))]) == "Hashed"
+
+
+def test_only_scans_match_any_index() -> None:
+    plain = PlanNode(node_type="Sort", sort_keys=("x",), children=(scan("o", "orders"),))
+    longer = plain.model_copy(update={"sort_keys": ("x on y",)})
+
+    assert [str(d.decision) for d in differences(plain, longer)] == ["sort(o)"]
 
 
 def test_partial_aggregate_strategy_is_compared() -> None:
