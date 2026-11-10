@@ -36,6 +36,7 @@ import anthropic
 import psycopg
 import sqlglot
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
+from pydantic.json_schema import GenerateJsonSchema
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
@@ -1339,7 +1340,9 @@ def agent_system_prompt() -> str:
 
     It holds nothing query-specific, so it is identical across queries and cacheable.
     """
-    schema = json.dumps(_prompt_schema(AgentAnswer.model_json_schema()), separators=(",", ":"))
+    schema = json.dumps(
+        AgentAnswer.model_json_schema(schema_generator=_LeanSchema), separators=(",", ":")
+    )
     return AGENT_INSTRUCTIONS.format(schema=schema, example=AGENT_EXAMPLE)
 
 
@@ -1660,24 +1663,25 @@ def _range_columns(parsed: exp.Expr) -> set[str]:
     }
 
 
-def _prompt_schema(schema: Any) -> Any:
+class _LeanSchema(GenerateJsonSchema):
     """
-    schema without the parts pydantic adds that do not help the agent: titles, defaults,
-    and anyOf [type, null] for optional fields, which becomes just the type.
+    JSON Schema without what pydantic adds that does not help the agent: titles,
+    defaults, and the null option of optional fields.
     """
-    if isinstance(schema, list):
-        return [_prompt_schema(item) for item in schema]
 
-    if not isinstance(schema, dict):
-        return schema
+    def field_title_should_be_set(self, schema):
+        return False
 
-    cleaned = {k: _prompt_schema(v) for k, v in schema.items() if k not in ("title", "default")}
-    options = cleaned.get("anyOf")
-    if isinstance(options, list) and len(options) == 2 and {"type": "null"} in options:
-        cleaned.pop("anyOf")
-        cleaned = {**next(o for o in options if o != {"type": "null"}), **cleaned}
+    def nullable_schema(self, schema):
+        return self.generate_inner(schema["schema"])
 
-    return cleaned
+    def default_schema(self, schema):
+        return self.generate_inner(schema["schema"])
+
+    def model_schema(self, schema):
+        out = super().model_schema(schema)
+        out.pop("title", None)
+        return out
 
 
 AGENT_INSTRUCTIONS = """\
