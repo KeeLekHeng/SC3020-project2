@@ -30,7 +30,7 @@ import os
 import re
 import textwrap
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, NamedTuple, get_args
+from typing import Any, Callable, Iterator, Literal, NamedTuple
 
 import anthropic
 import psycopg
@@ -945,8 +945,6 @@ AgentNodeType = Literal[
 AgentJoinType = Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Right Anti"]
 AgentStrategy = Literal["Plain", "Sorted", "Hashed", "Mixed"]
 
-AGENT_NODE_TYPES: tuple[str, ...] = get_args(AgentNodeType)
-
 # Scans that name an index.
 INDEXED = ("Index Scan", "Index Only Scan", "Bitmap Heap Scan")
 
@@ -1143,9 +1141,9 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
     Check the agent's answer and return it as an AgentAnswer.
 
     output is the agent's JSON, as text or already loaded. Raises AgentPlanError listing
-    every problem at once: JSON and schema errors, and the structural rules pydantic
-    cannot check (input counts, required and misplaced fields, reused aliases, parallel
-    operators outside a Gather).
+    the problems: JSON and schema errors first, then, once the schema holds, the
+    structural rules (input counts, required and misplaced fields, reused aliases,
+    parallel operators outside a Gather).
     """
     raw = output if isinstance(output, str) else json.dumps(output)
     data: Any = output
@@ -1161,21 +1159,19 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
                 raw,
             ) from None
 
-    errors: list[str] = []
-    answer = None
     try:
         answer = AgentAnswer.model_validate(data)
     except ValidationError as error:
-        errors += [_format_error(e) for e in error.errors(include_url=False)]
+        raise AgentPlanError(
+            [_format_error(e) for e in error.errors(include_url=False)], raw
+        ) from None
 
-    root = data.get("plan") if isinstance(data, dict) else None
-    if isinstance(root, dict):
-        if root.get("parent_relationship"):
-            errors.append("plan: the root operator cannot be a subquery (parent_relationship).")
+    errors: list[str] = []
+    if answer.plan.parent_relationship:
+        errors.append("plan: the root operator cannot be a subquery (parent_relationship).")
 
-        _check_agent_node(root, "plan", {}, False, errors)
-
-    if errors or answer is None:
+    _check_agent_node(answer.plan, "plan", {}, False, errors)
+    if errors:
         raise AgentPlanError(errors, raw)
 
     return answer
@@ -1527,20 +1523,16 @@ def _agent_database_errors(
 
 
 def _check_agent_node(
-    node: dict, path: str, aliases: dict[str, str], under_gather: bool, errors: list[str]
+    node: AgentPlanNode, path: str, aliases: dict[str, str], under_gather: bool, errors: list[str]
 ) -> None:
     """
-    Add the structural problems of the raw agent node at path and its subtree to errors.
+    Add the structural problems of the agent node at path and its subtree to errors.
 
     aliases maps each alias seen so far to where it was seen; under_gather means a
-    Gather above node is in the same query level. This works on the raw JSON so it runs
-    even when pydantic rejects the answer, and it skips values of the wrong type, which
-    pydantic already reports.
+    Gather above node is in the same query level.
     """
-    node_type = node.get("node_type")
-    children = node.get("children")
-    children = [c for c in children if isinstance(c, dict)] if isinstance(children, list) else []
-    inputs = [c for c in children if c.get("parent_relationship") not in SEPARATE_PLANS]
+    node_type = node.node_type
+    inputs = [c for c in node.children if c.parent_relationship not in SEPARATE_PLANS]
 
     if node_type in AGENT_INPUT_COUNTS:
         low, high = AGENT_INPUT_COUNTS[node_type]
@@ -1559,31 +1551,31 @@ def _check_agent_node(
             errors.append(message)
 
     for field in AGENT_REQUIRED_FIELDS.get(node_type, ()):
-        if not node.get(field):
+        if not getattr(node, field):
             errors.append(f"{path}: a {node_type} needs {field}.")
 
     for field, owners in AGENT_FIELD_OWNERS.items():
-        if node.get(field) is not None and node_type in AGENT_NODE_TYPES and node_type not in owners:
+        if getattr(node, field) is not None and node_type not in owners:
             errors.append(
                 f"{path}: {field} only belongs on {', '.join(owners)}, not on a {node_type}."
             )
 
-    alias = node.get("alias")
-    if isinstance(alias, str) and alias:
+    alias = node.alias
+    if alias:
         if alias in aliases:
             errors.append(f"{path}: alias {alias!r} is already used at {aliases[alias]}.")
         else:
             aliases[alias] = path
 
-    if node.get("parallel_aware") is True and not under_gather:
+    if node.parallel_aware and not under_gather:
         errors.append(f"{path}: parallel_aware is only valid below a Gather or Gather Merge.")
 
     if node_type in GATHER and under_gather:
         errors.append(f"{path}: a {node_type} cannot sit below another Gather.")
 
-    for number, child in enumerate(children):
+    for number, child in enumerate(node.children):
         # A subquery is planned on its own, so it starts outside any Gather.
-        subquery = child.get("parent_relationship") in SEPARATE_PLANS
+        subquery = child.parent_relationship in SEPARATE_PLANS
         below = not subquery and (under_gather or node_type in GATHER)
         _check_agent_node(child, f"{path}.children[{number}]", aliases, below, errors)
 

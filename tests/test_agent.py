@@ -4,7 +4,7 @@ import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import psycopg
 import pytest
@@ -12,10 +12,10 @@ import pytest
 from comparison import force_plan
 from preprocessing import (
     AGENT_EXAMPLE,
-    AGENT_NODE_TYPES,
     GATHER,
     JOIN_HINTS,
     SCAN_HINTS,
+    AgentNodeType,
     AgentPlanError,
     DatabaseDescription,
     PlanNode,
@@ -68,7 +68,7 @@ def join_of(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_vocabulary_covers_every_forceable_operator() -> None:
-    assert set(SCAN_HINTS) | set(JOIN_HINTS) | set(GATHER) <= set(AGENT_NODE_TYPES)
+    assert set(SCAN_HINTS) | set(JOIN_HINTS) | set(GATHER) <= set(get_args(AgentNodeType))
 
 
 def test_sample_answer_becomes_a_plan_node_tree() -> None:
@@ -91,6 +91,13 @@ def test_answer_inside_a_markdown_fence_is_accepted() -> None:
 
 def test_text_that_is_not_json_is_rejected() -> None:
     assert errors_of("I would scan customer first.")[0].startswith("The answer is not valid JSON")
+
+
+def test_node_type_that_is_not_a_string_is_reported() -> None:
+    data = answer()
+    data["plan"]["node_type"] = ["Hash Join"]
+
+    assert any(e.startswith("plan.node_type: Input should be") for e in errors_of(data))
 
 
 def test_parsed_plan_builds_hints() -> None:
@@ -222,16 +229,21 @@ def test_root_cannot_be_a_subquery() -> None:
     assert "plan: the root operator cannot be a subquery (parent_relationship)." in errors_of(data)
 
 
-def test_all_problems_are_reported_at_once() -> None:
+def test_schema_problems_are_reported_before_structural_ones() -> None:
     data = answer()
     data["extra"] = True
     join = join_of(data)
     join["join_type"] = "Cross"
     join["children"][0]["alias"] = "o"
 
-    errors = errors_of(data)
+    first = errors_of(data)
+    del data["extra"]
+    join["join_type"] = "Inner"
+    second = errors_of(data)
 
-    assert len(errors) == 3
+    assert len(first) == 2
+    assert len(second) == 1
+    assert "alias 'o' is already used" in second[0]
 
 
 def test_relation_mismatches() -> None:
