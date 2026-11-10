@@ -133,8 +133,10 @@ def test_names_are_quoted_and_unsafe_names_refused() -> None:
     quoted = build_hints(scan("Cust", "customer"), 'SELECT 1 FROM customer "Cust"')
     assert 'SeqScan("Cust")' in quoted
 
-    with pytest.raises(ValueError, match="hint comment"):
-        build_hints(scan("a*/b", "customer"), 'SELECT 1 FROM customer "a*/b"')
+    # PostgreSQL's comments nest, so an opening mark would swallow the statement.
+    for name in ("a*/b", "a/*b"):
+        with pytest.raises(ValueError, match="hint comment"):
+            build_hints(scan(name, "customer"), f'SELECT 1 FROM customer "{name}"')
 
 
 def test_unique_aliases_leaves_queries_without_reused_names_alone() -> None:

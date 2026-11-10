@@ -709,7 +709,8 @@ def _relations(parsed: exp.Expr) -> list[exp.Table]:
 
 def _hint_name(name: str) -> str:
     """Quote a relation, alias or index name for use inside a hint."""
-    if "*/" in name:
+    # PostgreSQL's comments nest, so an opening mark is as unsafe as a closing one.
+    if "*/" in name or "/*" in name:
         raise ValueError(f"Name cannot appear in a hint comment: {name!r}")
 
     if re.fullmatch(r"[a-z_][a-z0-9_$]*", name):
