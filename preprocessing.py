@@ -931,8 +931,6 @@ def _hint_name(name: str) -> str:
 
 # Model that proposes the agent's plan; its key comes from api_key().
 AGENT_MODEL = "claude-haiku-5-5"
-# Effort for each answer in turn: low for the first, medium for any retry.
-AGENT_EFFORTS = ("low", "medium")
 
 # Operators the agent may use. All are PostgreSQL names, so the agent's plan, the
 # PostgreSQL plan and the hinted plan share one vocabulary. Every scan and join here can
@@ -948,8 +946,6 @@ AgentJoinType = Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Right
 AgentStrategy = Literal["Plain", "Sorted", "Hashed", "Mixed"]
 
 AGENT_NODE_TYPES: tuple[str, ...] = get_args(AgentNodeType)
-AGENT_JOIN_TYPES: tuple[str, ...] = get_args(AgentJoinType)
-AGENT_AGGREGATE_STRATEGIES: tuple[str, ...] = get_args(AgentStrategy)
 
 # Scans that name an index.
 INDEXED = ("Index Scan", "Index Only Scan", "Bitmap Heap Scan")
@@ -1185,11 +1181,6 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
     return answer
 
 
-def parse_agent_plan(output: str | dict) -> PlanNode:
-    """Validate the agent's answer (see validate_agent_plan()) and return its plan."""
-    return validate_agent_plan(output).plan.to_plan_node()
-
-
 def relation_mismatches(agent: PlanNode, postgres: PlanNode) -> tuple[set[str], set[str]]:
     """
     Return (missing, extra): aliases PostgreSQL's plan scans that the agent's does not,
@@ -1387,7 +1378,6 @@ def get_agent_plan(
     query: str,
     client: anthropic.Anthropic | None = None,
     postgres_plan: PlanNode | None = None,
-    **options: Any,
 ) -> AgentResult:
     """
     Ask the AI agent for its plan for query and return the plan it settles on.
@@ -1395,7 +1385,7 @@ def get_agent_plan(
     The query is first rewritten by unique_aliases(); result.query holds the rewritten
     text. postgres_plan is PostgreSQL's plan for that text, used only to check that the
     agent read the same tables; it is fetched when not given. client defaults to an
-    anthropic.Anthropic() with the key from api_key(). options go to ask_agent().
+    anthropic.Anthropic() with the key from api_key().
     """
     query = unique_aliases(query)
     database = describe_database(connection, query)
@@ -1405,7 +1395,7 @@ def get_agent_plan(
     if client is None:
         client = anthropic.Anthropic(api_key=api_key())
 
-    return ask_agent(client, query, database, postgres_plan, **options)
+    return ask_agent(client, query, database, postgres_plan)
 
 
 def api_key() -> str | None:
@@ -1435,8 +1425,6 @@ def ask_agent(
     query: str,
     database: DatabaseDescription,
     postgres_plan: PlanNode,
-    model: str = AGENT_MODEL,
-    efforts: tuple[str, ...] = AGENT_EFFORTS,
     max_attempts: int = 3,
 ) -> AgentResult:
     """
@@ -1447,8 +1435,8 @@ def ask_agent(
     exist, and build_hints() must accept the plan. All problems go back in one retry
     message, up to max_attempts answers in all.
 
-    efforts gives the effort (how hard the model thinks) for each answer in turn; the
-    last one repeats for any further answers.
+    The first answer is asked for at low effort (how hard the model thinks), any retry
+    at medium.
 
     Raises AgentPlanError with the last answer's problems when no answer is usable, and
     RuntimeError when the model declines or its answer is cut off.
@@ -1466,11 +1454,11 @@ def ask_agent(
     for attempt in range(1, max_attempts + 1):
         # Streaming avoids HTTP timeouts on long answers.
         with client.messages.stream(
-            model=model,
+            model=AGENT_MODEL,
             max_tokens=64000,
             system=system,
             messages=messages,
-            output_config={"effort": efforts[min(attempt, len(efforts)) - 1]},
+            output_config={"effort": "low" if attempt == 1 else "medium"},
         ) as stream:
             response = stream.get_final_message()
 

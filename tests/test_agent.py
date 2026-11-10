@@ -25,7 +25,6 @@ from preprocessing import (
     build_hints,
     describe_database,
     get_agent_plan,
-    parse_agent_plan,
     _column_stats,
     _parse,
     _range_columns,
@@ -73,7 +72,7 @@ def test_vocabulary_covers_every_forceable_operator() -> None:
 
 
 def test_sample_answer_becomes_a_plan_node_tree() -> None:
-    plan = parse_agent_plan(json.dumps(answer()))
+    plan = validate_agent_plan(json.dumps(answer())).plan.to_plan_node()
 
     assert [n.node_type for n in plan.walk()] == [
         "Aggregate", "Hash Join", "Seq Scan", "Hash", "Seq Scan"
@@ -95,7 +94,7 @@ def test_text_that_is_not_json_is_rejected() -> None:
 
 
 def test_parsed_plan_builds_hints() -> None:
-    hints = build_hints(parse_agent_plan(answer()), QUERY)
+    hints = build_hints(validate_agent_plan(answer()).plan.to_plan_node(), QUERY)
 
     assert "HashJoin(c o)" in hints
     assert "Leading((c o))" in hints
@@ -150,7 +149,7 @@ def test_marked_subquery_child_is_not_an_input() -> None:
     }
     join_of(data)["children"].append(subquery)
 
-    plan = parse_agent_plan(data)
+    plan = validate_agent_plan(data).plan.to_plan_node()
 
     join = plan.children[0]
     assert len(join.inputs) == 2
@@ -211,7 +210,7 @@ def test_parallel_operator_below_a_gather_is_accepted() -> None:
         {"node_type": "Gather", "workers_planned": 2, "children": [join]}
     ]
 
-    plan = parse_agent_plan(data)
+    plan = validate_agent_plan(data).plan.to_plan_node()
 
     assert "Parallel(c 2 hard)" in build_hints(plan, QUERY)
 
@@ -236,13 +235,13 @@ def test_all_problems_are_reported_at_once() -> None:
 
 
 def test_relation_mismatches() -> None:
-    agent = parse_agent_plan(answer())
+    agent = validate_agent_plan(answer()).plan.to_plan_node()
 
     assert relation_mismatches(agent, postgres_plan()) == (set(), set())
 
     data = answer()
     join_of(data)["children"][0]["alias"] = "customer"
-    missing, extra = relation_mismatches(parse_agent_plan(data), postgres_plan())
+    missing, extra = relation_mismatches(validate_agent_plan(data).plan.to_plan_node(), postgres_plan())
 
     assert (missing, extra) == ({"c"}, {"customer"})
 
@@ -258,7 +257,7 @@ def test_system_prompt_is_static_and_free_of_schema_noise() -> None:
 
 
 def test_prompt_example_is_a_valid_answer_without_aliases() -> None:
-    plan = parse_agent_plan(AGENT_EXAMPLE)
+    plan = validate_agent_plan(AGENT_EXAMPLE).plan.to_plan_node()
 
     assert plan.relations() == {"customer", "orders"}
 
