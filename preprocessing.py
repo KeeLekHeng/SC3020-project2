@@ -16,16 +16,23 @@ and three functions:
 A plan from another source, such as the AI agent, is built into PlanNode from field
 names, so comparison.py works on one form for every source.
 
-The AI agent answers in AgentAnswer, whose AgentPlanNode tree is the subset of
-PlanNode the agent decides. validate_agent_plan() checks an answer and lists every
-problem, so they can go back to the agent in one retry message.
+The AI agent's side:
+
+- get_agent_plan() asks an LLM for its plan for a query and returns it as a PlanNode.
+  The answer must match AgentAnswer, whose AgentPlanNode tree is the subset of PlanNode
+  the agent decides. validate_agent_plan() checks an answer, and every problem goes back
+  to the agent in a retry message.
+- describe_database() reads the schema, statistics and indexes the agent plans with.
 """
 
 import json
+import os
 import re
 import textwrap
-from typing import Any, Callable, Iterator, Literal, get_args
+from pathlib import Path
+from typing import Any, Callable, Iterator, Literal, NamedTuple, get_args
 
+import anthropic
 import psycopg
 import sqlglot
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
@@ -917,9 +924,15 @@ def _hint_name(name: str) -> str:
 
     return '"' + name.replace('"', '""') + '"'
 
+
 # ---------------------------------------------------------------------------
 # The AI agent's plan
 # ---------------------------------------------------------------------------
+
+# Model that proposes the agent's plan; its key comes from api_key().
+AGENT_MODEL = "claude-haiku-5-5"
+# Effort for each answer in turn: low for the first, medium for any retry.
+AGENT_EFFORTS = ("low", "medium")
 
 # Operators the agent may use. All are PostgreSQL names, so the agent's plan, the
 # PostgreSQL plan and the hinted plan share one vocabulary. Every scan and join here can
@@ -970,6 +983,25 @@ AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "Subquery Scan": ("alias",),
     "Aggregate": ("strategy",),
 }
+
+# Planner settings shown to the agent, because they shape which plan is cheapest.
+AGENT_SETTINGS = ("max_parallel_workers_per_gather", "work_mem")
+
+# Column statistics shown to the agent, beyond row and distinct counts:
+# - common values only when skewed: the most common covers at least MIN_COMMON of the
+#   rows and is over SKEW times as frequent as an even spread would give. Otherwise the
+#   distinct count says it all, and on a column with many values the sampled common
+#   values are noise.
+# - a range, only for a numeric or date column the query compares with <, >, <=, >= or
+#   BETWEEN, since only those conditions need it
+# - correlation only when its size is over CORRELATED: the table is stored close to the
+#   column's order, so an index range scan reads it almost sequentially
+SKEW = 2
+MIN_COMMON = 0.01
+COMMON_VALUES = 5
+CORRELATED = 0.5
+RANGE_CATEGORIES = ("N", "D")  # PostgreSQL type categories: numeric, date and time
+RANGE_CONDITIONS = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between)
 
 
 class AgentPlanNode(BaseModel):
@@ -1085,6 +1117,31 @@ class AgentPlanError(ValueError):
         super().__init__(f"The agent's plan is invalid:\n{problems}")
 
 
+class DatabaseDescription(NamedTuple):
+    """What the agent is told about the database for one query, from describe_database()."""
+
+    text: str
+    indexes: dict[str, set[str]]
+    """Index names of each table, keyed by table name."""
+
+
+class AgentResult(NamedTuple):
+    """
+    The agent's accepted plan.
+
+    query is the text the agent planned, after unique_aliases(). Plan the PostgreSQL
+    side and force the agent's plan with this text, because the plan's aliases refer to
+    it. answer is the agent's raw final answer. problems lists, for each rejected answer
+    before it, the errors sent back, so there were len(problems) + 1 answers.
+    """
+
+    plan: PlanNode
+    summary: str
+    query: str
+    answer: str
+    problems: list[list[str]]
+
+
 def validate_agent_plan(output: str | dict) -> AgentAnswer:
     """
     Check the agent's answer and return it as an AgentAnswer.
@@ -1145,6 +1202,340 @@ def relation_mismatches(agent: PlanNode, postgres: PlanNode) -> tuple[set[str], 
         return {n.alias for n in plan.walk() if n.relation and n.alias}
 
     return scanned(postgres) - scanned(agent), scanned(agent) - scanned(postgres)
+
+
+def query_relations(query: str) -> list[tuple[str, str, str]] | None:
+    """
+    Return what the query reads, as (alias, name, kind) per FROM item, outermost first.
+
+    kind is "table" (name is the table), "cte" (name is the CTE) or "subquery" (a FROM
+    subquery; name is empty). Returns None if sqlglot cannot parse the query.
+    """
+    parsed = _parse(query)
+    if parsed is None:
+        return None
+
+    ctes = {cte.alias for cte in parsed.find_all(exp.CTE)}
+    items = [
+        (t.alias_or_name, t.name, "cte" if t.name in ctes and not t.db else "table")
+        for t in _relations(parsed)
+    ]
+    for sub in parsed.find_all(exp.Subquery):
+        alias = sub.parent.alias if isinstance(sub.parent, exp.Lateral) else sub.alias
+        if alias and isinstance(sub.parent, FROM_ITEM):
+            items.append((alias, "", "subquery"))
+
+    return items
+
+
+def describe_database(
+    connection: psycopg.Connection, query: str | None = None
+) -> DatabaseDescription:
+    """
+    Describe the database for the agent, read from the catalogs at run time.
+
+    The text gives the PostgreSQL version and AGENT_SETTINGS, then for each table its
+    row and page counts, its columns with types and distinct counts, its indexes and its
+    foreign keys. No schema is hardcoded.
+
+    With a query, only the tables it reads are described, with only the columns it
+    names, and foreign keys only between those tables. A query sqlglot cannot parse
+    describes everything.
+    """
+    parsed = _parse(query) if query else None
+    wanted = {t.name for t in _relations(parsed)} if parsed else None
+    used = {c.name for c in parsed.find_all(exp.Column)} if parsed else None
+    ranged = _range_columns(parsed) if parsed else None
+
+    settings = connection.execute(
+        "SELECT name, setting, unit FROM pg_settings WHERE name = ANY(%s) ORDER BY name",
+        (list(AGENT_SETTINGS),),
+    ).fetchall()
+    shown = ", ".join(f"{name}={value}{unit or ''}" for name, value, unit in settings)
+    lines = [f"Settings: {shown}"]
+
+    tables = [
+        row
+        for row in connection.execute(
+            """
+            SELECT c.oid, n.nspname, c.relname, c.reltuples, c.relpages
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname !~ '^pg_toast'
+            ORDER BY n.nspname, c.relname
+            """
+        )
+        if wanted is None or row[2] in wanted
+    ]
+    oids = [oid for oid, *_ in tables]
+    names = {table for _, _, table, _, _ in tables}
+
+    columns: dict[int, list[str]] = {}
+    for oid, name, type_name, *stats in connection.execute(
+        """
+        SELECT a.attrelid, a.attname, format_type(a.atttypid, a.atttypmod),
+               c.reltuples, s.n_distinct, s.null_frac, t.typcategory,
+               s.most_common_vals::text::text[], s.most_common_freqs,
+               s.histogram_bounds::text::text[], s.correlation
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_type t ON t.oid = a.atttypid
+        LEFT JOIN pg_stats s
+          ON s.schemaname = n.nspname AND s.tablename = c.relname
+          AND s.attname = a.attname AND s.inherited = (c.relkind = 'p')
+        WHERE a.attrelid = ANY(%s) AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attrelid, a.attnum
+        """,
+        (oids,),
+    ):
+        if used is None or name in used:
+            details = _column_stats(*stats, ranged is None or name in ranged)
+            suffix = f" ({'; '.join(details)})" if details else ""
+            columns.setdefault(oid, []).append(f"{name} {type_name}{suffix}")
+
+    index_text: dict[int, list[str]] = {}
+    indexes: dict[str, set[str]] = {}
+    for oid, table, index, unique, definition in connection.execute(
+        """
+        SELECT i.indrelid, t.relname, ic.relname, i.indisunique,
+               pg_get_indexdef(i.indexrelid)
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        WHERE i.indrelid = ANY(%s)
+        ORDER BY i.indrelid, ic.relname
+        """,
+        (oids,),
+    ):
+        # "CREATE UNIQUE INDEX x ON t USING btree (a, b)" becomes "x unique btree (a, b)".
+        method = definition.partition(" USING ")[2]
+        index_text.setdefault(oid, []).append(f"{index} {'unique ' if unique else ''}{method}")
+        indexes.setdefault(table, set()).add(index)
+
+    foreign_keys: dict[int, list[str]] = {}
+    for oid, target, definition in connection.execute(
+        """
+        SELECT conrelid, confrelid::regclass::text, pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = ANY(%s) AND contype = 'f'
+        ORDER BY conrelid, conname
+        """,
+        (oids,),
+    ):
+        # Only a key to another described table says anything about this query's joins.
+        if target.rpartition(".")[2] in names:
+            keys, _, reference = definition.removeprefix("FOREIGN KEY ").partition(" REFERENCES ")
+            foreign_keys.setdefault(oid, []).append(f"{keys.strip('()')} references {reference}")
+
+    for oid, schema, table, rows, pages in tables:
+        name = table if schema == "public" else f"{schema}.{table}"
+        plural = "" if pages == 1 else "s"
+        size = f"~{round(rows):,} rows, {pages:,} page{plural}" if rows >= 0 else "size unknown"
+        lines.append(f"{name}: {size}")
+        for label, items in (
+            ("columns used" if used is not None else "columns", columns.get(oid)),
+            ("indexes", index_text.get(oid) or ["none"]),
+            ("foreign keys", foreign_keys.get(oid)),
+        ):
+            if items:
+                lines.append(f"  {label}: {'; '.join(items)}")
+
+    return DatabaseDescription("\n".join(lines), indexes)
+
+
+def agent_system_prompt() -> str:
+    """
+    Return the agent's system prompt: the task, the plan conventions, the answer's JSON
+    Schema and a worked example.
+
+    It holds nothing query-specific, so it is identical across queries and cacheable.
+    """
+    schema = json.dumps(_prompt_schema(AgentAnswer.model_json_schema()), separators=(",", ":"))
+    return AGENT_INSTRUCTIONS.format(schema=schema, example=AGENT_EXAMPLE)
+
+
+def agent_user_prompt(query: str, database: DatabaseDescription) -> str:
+    """
+    Return the first user message: the database facts for this query, the aliases the
+    plan must use (see query_relations()), and the query itself.
+    """
+    lines = ["Database:", database.text, ""]
+    relations = query_relations(query)
+    if relations:
+        kinds = {"table": "table {}", "cte": "CTE {}", "subquery": "FROM subquery"}
+        aliases = ", ".join(f"{a} ({kinds[k].format(n)})" for a, n, k in relations)
+        lines += [f"Aliases (use exactly these): {aliases}", ""]
+
+    lines += ["Query:", "```sql", query.strip(), "```"]
+    return "\n".join(lines)
+
+
+def agent_retry_prompt(errors: list[str]) -> str:
+    """Return the message that sends the problems in the agent's last answer back."""
+    problems = "\n".join(f"- {error}" for error in errors)
+    return (
+        f"Your plan cannot be used yet:\n{problems}\n\n"
+        "Fix these and answer again with the complete plan as one JSON object in the "
+        "same format."
+    )
+
+
+def get_agent_plan(
+    connection: psycopg.Connection,
+    query: str,
+    client: anthropic.Anthropic | None = None,
+    postgres_plan: PlanNode | None = None,
+    **options: Any,
+) -> AgentResult:
+    """
+    Ask the AI agent for its plan for query and return the plan it settles on.
+
+    The query is first rewritten by unique_aliases(); result.query holds the rewritten
+    text. postgres_plan is PostgreSQL's plan for that text, used only to check that the
+    agent read the same tables; it is fetched when not given. client defaults to an
+    anthropic.Anthropic() with the key from api_key(). options go to ask_agent().
+    """
+    query = unique_aliases(query)
+    database = describe_database(connection, query)
+    if postgres_plan is None:
+        postgres_plan = get_postgres_plan(connection, query)
+
+    if client is None:
+        client = anthropic.Anthropic(api_key=api_key())
+
+    return ask_agent(client, query, database, postgres_plan, **options)
+
+
+def api_key() -> str | None:
+    """
+    Return the Anthropic API key: ANTHROPIC_API_KEY from the environment, or else from
+    the .env file next to this module.
+
+    None lets the SDK look for other credentials, and fail if it finds none.
+    """
+    if key := os.environ.get("ANTHROPIC_API_KEY"):
+        return key
+
+    env = Path(__file__).resolve().parent / ".env"
+    if not env.is_file():
+        return None
+
+    for line in env.read_text(encoding="utf-8").splitlines():
+        name, _, value = line.strip().removeprefix("export ").partition("=")
+        if name.strip() == "ANTHROPIC_API_KEY":
+            return value.strip().strip("'\"") or None
+
+    return None
+
+
+def ask_agent(
+    client: anthropic.Anthropic,
+    query: str,
+    database: DatabaseDescription,
+    postgres_plan: PlanNode,
+    model: str = AGENT_MODEL,
+    efforts: tuple[str, ...] = AGENT_EFFORTS,
+    max_attempts: int = 3,
+) -> AgentResult:
+    """
+    Run the conversation with the agent until it gives a usable plan.
+
+    Each answer is checked by validate_agent_plan(), then against the database: the
+    scanned aliases must match postgres_plan's (relation_mismatches()), every index must
+    exist, and build_hints() must accept the plan. All problems go back in one retry
+    message, up to max_attempts answers in all.
+
+    efforts gives the effort (how hard the model thinks) for each answer in turn; the
+    last one repeats for any further answers.
+
+    Raises AgentPlanError with the last answer's problems when no answer is usable, and
+    RuntimeError when the model declines or its answer is cut off.
+    """
+    system = [{
+        "type": "text",
+        "text": agent_system_prompt(),
+        "cache_control": {"type": "ephemeral"},
+    }]
+    messages: list[Any] = [{"role": "user", "content": agent_user_prompt(query, database)}]
+    problems: list[list[str]] = []
+    errors: list[str] = []
+    text = ""
+
+    for attempt in range(1, max_attempts + 1):
+        # Streaming avoids HTTP timeouts on long answers.
+        with client.messages.stream(
+            model=model,
+            max_tokens=64000,
+            system=system,
+            messages=messages,
+            output_config={"effort": efforts[min(attempt, len(efforts)) - 1]},
+        ) as stream:
+            response = stream.get_final_message()
+
+        if response.stop_reason == "refusal":
+            category = response.stop_details.category if response.stop_details else None
+            raise RuntimeError(f"The model declined to plan the query ({category}).")
+
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError("The agent's answer was cut off at max_tokens.")
+
+        text = "".join(block.text for block in response.content if block.type == "text")
+        try:
+            answer = validate_agent_plan(text)
+            plan = answer.plan.to_plan_node()
+            errors = _agent_database_errors(plan, postgres_plan, query, database)
+        except AgentPlanError as error:
+            errors = error.errors
+
+        if not errors:
+            return AgentResult(plan, answer.summary, query, text, problems)
+
+        problems.append(errors)
+        # Send the whole reply back unchanged, thinking blocks included.
+        messages += [
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": agent_retry_prompt(errors)},
+        ]
+
+    raise AgentPlanError(errors, text)
+
+
+def _agent_database_errors(
+    plan: PlanNode, postgres_plan: PlanNode, query: str, database: DatabaseDescription
+) -> list[str]:
+    """Problems that only show against the query and database; see ask_agent()."""
+    errors: list[str] = []
+    missing, extra = relation_mismatches(plan, postgres_plan)
+    if missing:
+        errors.append(
+            f"The query reads {', '.join(sorted(missing))}, but no scan in the plan has "
+            "that alias."
+        )
+
+    if extra:
+        errors.append(
+            f"The plan scans {', '.join(sorted(extra))}, which is not an alias of a "
+            "table the query reads."
+        )
+
+    for node in plan.walk():
+        known = database.indexes.get(node.relation or "", set())
+        if node.index_name and node.index_name not in known:
+            listed = ", ".join(sorted(known)) or "none"
+            errors.append(
+                f"Scan of {node.alias}: {node.index_name!r} is not an index on "
+                f"{node.relation}. Its indexes are: {listed}."
+            )
+
+    if not errors:
+        try:
+            build_hints(plan, query)
+        except ValueError as error:
+            errors.append(str(error))
+
+    return errors
 
 
 def _check_agent_node(
@@ -1220,3 +1611,164 @@ def _json_text(text: str) -> str:
     """The JSON object in text, without any Markdown fence or prose around it."""
     start, end = text.find("{"), text.rfind("}")
     return text[start:end + 1] if start != -1 and end > start else text
+
+
+def _column_stats(
+    rows: float,
+    n_distinct: float | None,
+    null_frac: float | None,
+    category: str,
+    common_values: list[str] | None,
+    common_freqs: list[float] | None,
+    histogram: list[str] | None,
+    correlation: float | None,
+    show_range: bool,
+) -> list[str]:
+    """
+    A column's statistics from pg_stats, worded for the prompt, most important first:
+    distinct count, NULL fraction, skewed common values, range (when show_range) and
+    correlation. See SKEW for which are shown.
+
+    Only raw statistics are given, never an estimate for a condition in the query, so
+    the agent reasons from the same inputs as PostgreSQL's planner rather than from its
+    conclusions.
+    """
+    if n_distinct is None:
+        return []
+
+    details = []
+    distinct = -n_distinct * rows if n_distinct < 0 else n_distinct
+    details.append("unique" if n_distinct == -1 else f"~{round(distinct):,} distinct")
+
+    if null_frac:
+        details.append(f"{null_frac:.0%} null")
+
+    # Values are cut to 30 characters, so a long text value cannot swamp the prompt.
+    top_freq = common_freqs[0] if common_freqs else 0
+    if common_values and top_freq >= MIN_COMMON and top_freq > SKEW / max(distinct, 1):
+        top = zip(common_values[:COMMON_VALUES], common_freqs or [])
+        details.append("most common: " + ", ".join(f"{v[:30]!r} {f:.0%}" for v, f in top))
+
+    if show_range and histogram and category in RANGE_CATEGORIES:
+        quartiles = [histogram[round(i * (len(histogram) - 1) / 4)] for i in range(5)]
+        details.append(
+            f"range {quartiles[0]} to {quartiles[4]}, quartiles {', '.join(quartiles[1:4])}"
+        )
+
+    if correlation is not None and abs(correlation) > CORRELATED and distinct >= 2:
+        order = "in" if correlation > 0 else "in reverse"
+        details.append(f"table stored {order} this column's order")
+
+    return details
+
+
+def _range_columns(parsed: exp.Expr) -> set[str]:
+    """
+    Names of the columns the query compares with <, >, <=, >= or BETWEEN.
+
+    A subquery inside a comparison, as in l_quantity < (SELECT ...), is not searched,
+    because its columns are compared by its own conditions, if at all.
+    """
+    return {
+        column.name
+        for condition in parsed.find_all(*RANGE_CONDITIONS)
+        for column in condition.walk(prune=lambda e: isinstance(e, exp.Subquery))
+        if isinstance(column, exp.Column)
+    }
+
+
+def _prompt_schema(schema: Any) -> Any:
+    """
+    schema without the parts pydantic adds that do not help the agent: titles, defaults,
+    and anyOf [type, null] for optional fields, which becomes just the type.
+    """
+    if isinstance(schema, list):
+        return [_prompt_schema(item) for item in schema]
+
+    if not isinstance(schema, dict):
+        return schema
+
+    cleaned = {k: _prompt_schema(v) for k, v in schema.items() if k not in ("title", "default")}
+    options = cleaned.get("anyOf")
+    if isinstance(options, list) and len(options) == 2 and {"type": "null"} in options:
+        cleaned.pop("anyOf")
+        cleaned = {**next(o for o in options if o != {"type": "null"}), **cleaned}
+
+    return cleaned
+
+
+AGENT_INSTRUCTIONS = """\
+You are a query optimizer for a PostgreSQL database. For the query in the user message, \
+choose the execution plan you believe runs fastest, using the table sizes, distinct \
+counts and indexes given there. Give your own best plan, not a guess at PostgreSQL's.
+
+The plan is forced on PostgreSQL with pg_hint_plan hints, which name tables by alias and \
+indexes by name. So use PostgreSQL's operator names, exactly the aliases listed with \
+the query, and only listed indexes.
+
+Answer with one JSON object and nothing else, indented with one field per line, \
+matching this JSON Schema. Leave out fields that do not apply.
+
+{schema}
+
+Conventions:
+- Scan each listed table alias exactly once, setting relation and alias.
+- A join has two inputs, outer first. A Hash Join's inner input is a Hash over the build \
+side. A Merge Join needs both inputs sorted on the join keys. A Nested Loop reruns its \
+inner input for each outer row, so an inner Index Scan can look up the outer row's value.
+- EXISTS or IN can become a Semi join, NOT EXISTS an Anti join. A FROM subquery can be \
+merged into the outer joins or kept as a Subquery Scan with its alias.
+- A subquery planned separately, such as a scalar subquery, is a child of the operator \
+that uses its value, after that operator's inputs, with parent_relationship InitPlan \
+(uncorrelated, runs once) or SubPlan (correlated, reruns for each row).
+- A CTE used more than once is an InitPlan named "CTE <name>" on the top operator; each \
+use is a CTE Scan.
+- To run part of the plan in parallel, put it under a Gather or Gather Merge with \
+workers_planned, and set parallel_aware on the operators inside that split their work. \
+A parallel aggregate is an Aggregate under the Gather and another above it.
+
+Example. Aliases: customer (table customer), orders (table orders). Query:
+SELECT c_name, COUNT(*) FROM customer JOIN orders ON c_custkey = o_custkey \
+WHERE o_orderdate >= DATE '1995-01-01' GROUP BY c_custkey, c_name;
+Answer:
+{example}
+"""
+
+AGENT_EXAMPLE = json.dumps(
+    {
+        "summary": "Hash the filtered orders, probe with customer, group per customer.",
+        "plan": {
+            "node_type": "Aggregate",
+            "strategy": "Hashed",
+            "group_keys": ["customer.c_custkey", "customer.c_name"],
+            "reason": "A hash table groups without sorting.",
+            "children": [{
+                "node_type": "Hash Join",
+                "join_type": "Inner",
+                "join_condition": "customer.c_custkey = orders.o_custkey",
+                "reason": "Both inputs are large and unsorted.",
+                "children": [
+                    {
+                        "node_type": "Seq Scan",
+                        "relation": "customer",
+                        "alias": "customer",
+                        "reason": "Every customer is read.",
+                    },
+                    {
+                        "node_type": "Hash",
+                        "children": [{
+                            "node_type": "Seq Scan",
+                            "relation": "orders",
+                            "alias": "orders",
+                            "filter": "orders.o_orderdate >= DATE '1995-01-01'",
+                            "reason": "Most orders pass the filter, which has no index.",
+                        }],
+                    },
+                ],
+            }],
+        },
+    },
+    # Indented, because the agent copies the example's layout, and in one-line JSON it
+    # loses count of the closing brackets of a deep tree.
+    indent=1,
+)

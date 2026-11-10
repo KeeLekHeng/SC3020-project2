@@ -1,26 +1,47 @@
-"""The AI agent's plan: validation and parsing into PlanNode, without a database."""
+"""The AI agent's plan: validation, parsing, the prompt and the retry loop, without an API key."""
 
+import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import psycopg
 import pytest
 
+from comparison import force_plan
 from preprocessing import (
+    AGENT_EXAMPLE,
     AGENT_NODE_TYPES,
     GATHER,
     JOIN_HINTS,
     SCAN_HINTS,
     AgentPlanError,
+    DatabaseDescription,
     PlanNode,
+    agent_system_prompt,
+    agent_user_prompt,
+    ask_agent,
     build_hints,
+    describe_database,
+    get_agent_plan,
     parse_agent_plan,
+    _column_stats,
+    _parse,
+    _range_columns,
+    query_relations,
     relation_mismatches,
+    unique_aliases,
     validate_agent_plan,
 )
+from tests.queries import TPCH
 
 FIXTURES = Path(__file__).parent / "fixtures"
 QUERY = (Path(__file__).parent.parent / "query.sql").read_text(encoding="utf-8")
+DATABASE = DatabaseDescription(
+    "customer: ~15,000 rows, 361 pages\norders: ~150,000 rows, 2,648 pages",
+    {"customer": {"customer_pkey"}, "orders": {"orders_pkey"}},
+)
 
 
 def answer() -> dict[str, Any]:
@@ -224,3 +245,213 @@ def test_relation_mismatches() -> None:
     missing, extra = relation_mismatches(parse_agent_plan(data), postgres_plan())
 
     assert (missing, extra) == ({"c"}, {"customer"})
+
+
+def test_system_prompt_is_static_and_free_of_schema_noise() -> None:
+    prompt = agent_system_prompt()
+
+    assert prompt == agent_system_prompt()
+    assert '"AgentPlanNode"' in prompt
+    assert '"title"' not in prompt
+    assert '"anyOf"' not in prompt
+    assert "customer" in prompt and "lineitem" not in prompt
+
+
+def test_prompt_example_is_a_valid_answer_without_aliases() -> None:
+    plan = parse_agent_plan(AGENT_EXAMPLE)
+
+    assert plan.relations() == {"customer", "orders"}
+
+
+def test_query_relations_lists_tables_ctes_and_subqueries() -> None:
+    q15 = unique_aliases(TPCH["Q15"])
+    q7 = unique_aliases(TPCH["Q7"])
+
+    assert query_relations(q15) == [
+        ("supplier", "supplier", "table"),
+        ("revenue0", "revenue0", "cte"),
+        ("lineitem", "lineitem", "table"),
+        ("revenue02", "revenue0", "cte"),
+    ]
+    assert ("n2", "nation", "table") in query_relations(q7)
+    assert ("shipping", "", "subquery") in query_relations(q7)
+    assert query_relations("not sql at all (") is None
+
+
+def stats(**overrides: Any) -> list[str]:
+    """_column_stats() for a plain 1,000-row column with 100 distinct values."""
+    values: dict[str, Any] = dict(
+        rows=1000, n_distinct=100, null_frac=0, category="N", common_values=None,
+        common_freqs=None, histogram=None, correlation=0.0, show_range=True,
+    )
+    return _column_stats(**{**values, **overrides})
+
+
+def test_column_stats_give_distinct_count_and_null_fraction() -> None:
+    assert stats() == ["~100 distinct"]
+    assert stats(n_distinct=-1) == ["unique"]
+    assert stats(n_distinct=-0.5) == ["~500 distinct"]
+    assert stats(null_frac=0.25) == ["~100 distinct", "25% null"]
+    assert stats(n_distinct=None) == []
+
+
+def test_column_stats_show_common_values_only_when_skewed() -> None:
+    skewed = stats(common_values=["A", "B"], common_freqs=[0.4, 0.1])
+    even = stats(common_values=["A", "B"], common_freqs=[0.011, 0.01])
+    sampling_noise = stats(n_distinct=2500, common_values=["A"], common_freqs=[0.0009])
+
+    assert skewed == ["~100 distinct", "most common: 'A' 40%, 'B' 10%"]
+    assert even == ["~100 distinct"]
+    assert sampling_noise == ["~2,500 distinct"]
+
+
+def test_column_stats_give_quartiles_of_numeric_and_date_ranges() -> None:
+    histogram = [str(n) for n in range(0, 101)]
+
+    assert stats(histogram=histogram) == [
+        "~100 distinct", "range 0 to 100, quartiles 25, 50, 75"
+    ]
+    assert stats(histogram=histogram, show_range=False) == ["~100 distinct"]
+    assert stats(histogram=histogram, category="S") == ["~100 distinct"]
+
+
+def test_column_stats_mention_strong_correlation() -> None:
+    assert stats(correlation=0.99) == ["~100 distinct", "table stored in this column's order"]
+    assert stats(correlation=-0.9)[-1] == "table stored in reverse this column's order"
+    assert stats(correlation=0.3) == ["~100 distinct"]
+    assert stats(n_distinct=1, correlation=1.0) == ["~1 distinct"]
+
+
+def test_range_columns_are_those_compared_with_inequalities() -> None:
+    parsed = _parse(unique_aliases(TPCH["Q17"]) + " and l_extendedprice between 1 and 2")
+
+    assert _range_columns(parsed) == {"l_quantity", "l_extendedprice"}
+
+
+def test_user_prompt_lists_the_aliases_and_the_database() -> None:
+    prompt = agent_user_prompt(QUERY, DATABASE)
+
+    assert "Aliases (use exactly these): c (table customer), o (table orders)" in prompt
+    assert "customer: ~15,000 rows" in prompt
+    assert prompt.rstrip().endswith("```")
+
+
+class FakeClient:
+    """Stands in for anthropic.Anthropic: answers each request with the next reply."""
+
+    def __init__(self, *replies: str, stop_reason: str = "end_turn") -> None:
+        self.replies = list(replies)
+        self.stop_reason = stop_reason
+        self.requests: list[dict[str, Any]] = []
+        self.messages = self
+
+    def stream(self, **request: Any) -> "FakeClient":
+        self.requests.append(copy.deepcopy(request))
+        return self
+
+    def __enter__(self) -> "FakeClient":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        pass
+
+    def get_final_message(self) -> SimpleNamespace:
+        content = [
+            SimpleNamespace(type="thinking", thinking=""),
+            SimpleNamespace(type="text", text=self.replies.pop(0)),
+        ]
+        return SimpleNamespace(
+            content=content, stop_reason=self.stop_reason, stop_details=None
+        )
+
+
+def test_good_first_answer_is_accepted() -> None:
+    client = FakeClient(json.dumps(answer()))
+
+    result = ask_agent(client, QUERY, DATABASE, postgres_plan())
+
+    assert result.problems == []
+    assert result.summary.startswith("Hash the filtered orders")
+    assert result.plan.relations() == {"c", "o"}
+
+    request = client.requests[0]
+    assert request["model"] == "claude-haiku-5-5"
+    assert request["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "c.c_custkey = o.o_custkey" in request["messages"][0]["content"]
+
+
+def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
+    bad = answer()
+    join_of(bad)["children"][0]["alias"] = "customer"
+    client = FakeClient(json.dumps(bad), json.dumps(answer()))
+
+    result = ask_agent(client, QUERY, DATABASE, postgres_plan())
+
+    assert len(result.problems) == 1
+    assert [r["output_config"]["effort"] for r in client.requests] == ["low", "medium"]
+    retry = client.requests[1]["messages"]
+    assert [m["role"] for m in retry] == ["user", "assistant", "user"]
+    assert retry[1]["content"][0].type == "thinking"
+    assert "The query reads c, but no scan in the plan has that alias." in retry[2]["content"]
+
+
+def test_unknown_index_goes_back_to_the_agent() -> None:
+    bad = answer()
+    join_of(bad)["children"][0].update(node_type="Index Scan", index_name="customer_idx")
+    client = FakeClient(json.dumps(bad), json.dumps(answer()))
+
+    ask_agent(client, QUERY, DATABASE, postgres_plan())
+
+    retry = client.requests[1]["messages"][2]["content"]
+    assert "'customer_idx' is not an index on customer. Its indexes are: customer_pkey." in retry
+
+
+def test_agent_gives_up_after_max_attempts() -> None:
+    client = FakeClient("no plan", "still no plan")
+
+    with pytest.raises(AgentPlanError) as caught:
+        ask_agent(client, QUERY, DATABASE, postgres_plan(), max_attempts=2)
+
+    assert caught.value.answer == "still no plan"
+    assert len(client.requests) == 2
+
+
+def test_cut_off_answer_raises() -> None:
+    client = FakeClient("{", stop_reason="max_tokens")
+
+    with pytest.raises(RuntimeError, match="max_tokens"):
+        ask_agent(client, QUERY, DATABASE, postgres_plan())
+
+
+def test_database_description_reads_the_catalogs(connection: psycopg.Connection) -> None:
+    database = describe_database(connection)
+
+    assert database.indexes["customer"] >= {"customer_pkey"}
+    assert "lineitem: ~" in database.text
+    assert "customer_pkey unique btree (c_custkey)" in database.text
+    assert database.text.startswith("Settings: max_parallel_workers_per_gather=")
+    assert "random_page_cost" not in database.text
+
+
+def test_database_description_keeps_only_what_the_query_reads(
+    connection: psycopg.Connection,
+) -> None:
+    database = describe_database(connection, QUERY)
+
+    assert set(database.indexes) == {"customer", "orders"}
+    assert "lineitem" not in database.text
+    assert "c_custkey integer (unique; table stored in this column's order)" in database.text
+    assert "o_orderdate date (~" in database.text and "range 1992-" in database.text
+    assert "c_comment" not in database.text
+    assert "o_custkey references customer(c_custkey)" in database.text
+    # customer's key to nation is left out, since the query does not read nation.
+    assert "references nation" not in database.text
+
+
+def test_agent_plan_is_forced_on_postgres(connection: psycopg.Connection) -> None:
+    result = get_agent_plan(connection, QUERY, client=FakeClient(json.dumps(answer())))
+
+    hints, forced, gaps = force_plan(connection, result.query, result.plan)
+
+    assert "HashJoin(c o)" in hints
+    assert gaps == []
