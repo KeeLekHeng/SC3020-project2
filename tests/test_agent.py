@@ -4,8 +4,9 @@ import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, get_args
+from typing import Any, cast, get_args
 
+import anthropic
 import psycopg
 import pytest
 
@@ -284,8 +285,10 @@ def test_query_relations_lists_tables_ctes_and_subqueries() -> None:
         ("lineitem", "lineitem", "table"),
         ("revenue02", "revenue0", "cte"),
     ]
-    assert ("n2", "nation", "table") in query_relations(q7)
-    assert ("shipping", "", "subquery") in query_relations(q7)
+    q7_relations = query_relations(q7)
+    assert q7_relations is not None
+    assert ("n2", "nation", "table") in q7_relations
+    assert ("shipping", "", "subquery") in q7_relations
     assert query_relations("not sql at all (") is None
 
 
@@ -335,6 +338,7 @@ def test_column_stats_mention_strong_correlation() -> None:
 
 def test_range_columns_are_those_compared_with_inequalities() -> None:
     parsed = _parse(unique_aliases(TPCH["Q17"]) + " and l_extendedprice between 1 and 2")
+    assert parsed is not None
 
     assert _range_columns(parsed) == {"l_quantity", "l_extendedprice"}
 
@@ -368,8 +372,8 @@ class FakeClient:
 
     def get_final_message(self) -> SimpleNamespace:
         content = [
-            SimpleNamespace(type="thinking", thinking=""),
-            SimpleNamespace(type="text", text=self.replies.pop(0)),
+            anthropic.types.ThinkingBlock(type="thinking", thinking="", signature=""),
+            anthropic.types.TextBlock(type="text", text=self.replies.pop(0)),
         ]
         return SimpleNamespace(
             content=content, stop_reason=self.stop_reason, stop_details=None
@@ -379,7 +383,7 @@ class FakeClient:
 def test_good_first_answer_is_accepted() -> None:
     client = FakeClient(json.dumps(answer()))
 
-    result = ask_agent(client, QUERY, DATABASE, postgres_plan())
+    result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
 
     assert result.problems == []
     assert result.summary.startswith("Hash the filtered orders")
@@ -396,7 +400,7 @@ def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
     join_of(bad)["children"][0]["alias"] = "customer"
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
-    result = ask_agent(client, QUERY, DATABASE, postgres_plan())
+    result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
 
     assert len(result.problems) == 1
     assert [r["output_config"]["effort"] for r in client.requests] == ["low", "medium"]
@@ -411,7 +415,7 @@ def test_unknown_index_goes_back_to_the_agent() -> None:
     join_of(bad)["children"][0].update(node_type="Index Scan", index_name="customer_idx")
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
-    ask_agent(client, QUERY, DATABASE, postgres_plan())
+    ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
 
     retry = client.requests[1]["messages"][2]["content"]
     assert "'customer_idx' is not an index on customer. Its indexes are: customer_pkey." in retry
@@ -421,7 +425,7 @@ def test_agent_gives_up_after_max_attempts() -> None:
     client = FakeClient("no plan", "still no plan")
 
     with pytest.raises(AgentPlanError) as caught:
-        ask_agent(client, QUERY, DATABASE, postgres_plan(), max_attempts=2)
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan(), max_attempts=2)
 
     assert caught.value.answer == "still no plan"
     assert len(client.requests) == 2
@@ -431,7 +435,7 @@ def test_cut_off_answer_raises() -> None:
     client = FakeClient("{", stop_reason="max_tokens")
 
     with pytest.raises(RuntimeError, match="max_tokens"):
-        ask_agent(client, QUERY, DATABASE, postgres_plan())
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
 
 
 def test_database_description_reads_the_catalogs(connection: psycopg.Connection) -> None:
@@ -460,7 +464,7 @@ def test_database_description_keeps_only_what_the_query_reads(
 
 
 def test_agent_plan_is_forced_on_postgres(connection: psycopg.Connection) -> None:
-    result = get_agent_plan(connection, QUERY, client=FakeClient(json.dumps(answer())))
+    result = get_agent_plan(connection, QUERY, client=cast(anthropic.Anthropic, FakeClient(json.dumps(answer()))))
 
     hints, forced, gaps = force_plan(connection, result.query, result.plan)
 

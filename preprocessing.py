@@ -1278,7 +1278,7 @@ def describe_database(
         (oids,),
     ):
         if used is None or name in used:
-            details = _column_stats(*stats, ranged is None or name in ranged)
+            details = _column_stats(*stats, show_range=ranged is None or name in ranged)
             suffix = f" ({'; '.join(details)})" if details else ""
             columns.setdefault(oid, []).append(f"{name} {type_name}{suffix}")
 
@@ -1437,7 +1437,7 @@ def ask_agent(
     Raises AgentPlanError with the last answer's problems when no answer is usable, and
     RuntimeError when the model declines or its answer is cut off.
     """
-    system = [{
+    system: list[anthropic.types.TextBlockParam] = [{
         "type": "text",
         "text": agent_system_prompt(),
         "cache_control": {"type": "ephemeral"},
@@ -1465,7 +1465,10 @@ def ask_agent(
         if response.stop_reason == "max_tokens":
             raise RuntimeError("The agent's answer was cut off at max_tokens.")
 
-        text = "".join(block.text for block in response.content if block.type == "text")
+        text = "".join(
+            block.text for block in response.content
+            if isinstance(block, anthropic.types.TextBlock)
+        )
         try:
             answer = validate_agent_plan(text)
             plan = answer.plan.to_plan_node()
