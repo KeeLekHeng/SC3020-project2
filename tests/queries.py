@@ -124,10 +124,93 @@ SHAPES = {
         "JOIN supplier s ON n.n_nationkey = s.s_nationkey FULL JOIN lineitem l "
         "ON s.s_suppkey = l.l_suppkey GROUP BY l.l_returnflag"
     ),
+    "nested FULL JOINs": (
+        "SELECT count(*) FROM (supplier s FULL JOIN customer c "
+        "ON s.s_nationkey = c.c_nationkey) FULL JOIN (nation n JOIN region r "
+        "ON r.r_regionkey = n.n_regionkey) ON n.n_nationkey = s.s_nationkey"
+    ),
+    "IN subquery joined": (
+        "SELECT count(*) FROM customer c WHERE c_custkey IN "
+        "(SELECT o_custkey FROM orders o WHERE o_totalprice > 400000)"
+    ),
+    "grouped IN subquery joined": (
+        "SELECT count(*) FROM customer c WHERE c_custkey IN "
+        "(SELECT o_custkey FROM orders o GROUP BY o_custkey HAVING count(*) > 20)"
+    ),
+    "EXISTS inside EXISTS": (
+        "SELECT count(*) FROM supplier s WHERE EXISTS (SELECT 1 FROM partsupp ps "
+        "WHERE ps.ps_suppkey = s.s_suppkey AND EXISTS (SELECT 1 FROM lineitem l "
+        "WHERE l.l_partkey = ps.ps_partkey AND l.l_suppkey = ps.ps_suppkey "
+        "AND l.l_quantity > 49))"
+    ),
+    "CTE read once joined": (
+        "WITH t AS (SELECT o_custkey, count(*) cnt FROM orders o GROUP BY o_custkey) "
+        "SELECT c.c_name, t.cnt FROM customer c JOIN t ON t.o_custkey = c.c_custkey "
+        "WHERE c.c_acctbal > 9000"
+    ),
+    "subquery with EXISTS joined": (
+        "SELECT count(*) FROM nation n JOIN (SELECT c.c_nationkey k, count(*) cnt "
+        "FROM customer c WHERE EXISTS (SELECT 1 FROM orders o "
+        "WHERE o.o_custkey = c.c_custkey AND o.o_totalprice > 400000) "
+        "GROUP BY c.c_nationkey) a ON a.k = n.n_nationkey"
+    ),
+    "OFFSET 0 subquery joined": (
+        "SELECT count(*) FROM (SELECT l_orderkey FROM lineitem WHERE l_quantity > 45 "
+        "OFFSET 0) t JOIN orders o ON o.o_orderkey = t.l_orderkey"
+    ),
+    "subquery without tables joined": (
+        "SELECT count(*) FROM nation n JOIN (SELECT 1 AS k UNION ALL SELECT 2) u "
+        "ON u.k = n.n_regionkey"
+    ),
+    "DISTINCT VALUES subquery joined": (
+        "SELECT count(*) FROM supplier s JOIN nation n ON n.n_nationkey = s.s_nationkey "
+        "JOIN (SELECT DISTINCT x FROM (VALUES (1), (2), (2)) v(x)) u ON u.x = n.n_regionkey"
+    ),
+    "two IN (VALUES) lists": (
+        "SELECT count(*) FROM customer c WHERE c.c_nationkey IN (VALUES (1), (2), (3)) "
+        "AND c.c_custkey IN (VALUES (10), (20), (30), (40))"
+    ),
+    "min and max of one column": "SELECT min(l_orderkey), max(l_orderkey) FROM lineitem",
+    "8 tables and EXISTS over 2": (
+        "SELECT count(*) FROM lineitem l JOIN orders o ON o.o_orderkey = l.l_orderkey "
+        "JOIN customer c ON c.c_custkey = o.o_custkey "
+        "JOIN nation cn ON cn.n_nationkey = c.c_nationkey "
+        "JOIN region cr ON cr.r_regionkey = cn.n_regionkey "
+        "JOIN supplier s ON s.s_suppkey = l.l_suppkey "
+        "JOIN nation sn ON sn.n_nationkey = s.s_nationkey "
+        "JOIN part p ON p.p_partkey = l.l_partkey WHERE o.o_orderkey < 8000 "
+        "AND EXISTS (SELECT 1 FROM partsupp ps JOIN part p2 ON p2.p_partkey = ps.ps_partkey "
+        "WHERE ps.ps_suppkey = s.s_suppkey AND p2.p_size = 1)"
+    ),
+    "join over UNION ALL of constants above 8 tables": (
+        "SELECT count(*) FROM lineitem l JOIN orders o ON o.o_orderkey = l.l_orderkey "
+        "JOIN customer c ON c.c_custkey = o.o_custkey "
+        "JOIN nation cn ON cn.n_nationkey = c.c_nationkey "
+        "JOIN region cr ON cr.r_regionkey = cn.n_regionkey "
+        "JOIN supplier s ON s.s_suppkey = l.l_suppkey "
+        "JOIN nation sn ON sn.n_nationkey = s.s_nationkey "
+        "JOIN part p ON p.p_partkey = l.l_partkey "
+        "JOIN (SELECT 1 AS k UNION ALL SELECT 2) u ON u.k = cr.r_regionkey "
+        "WHERE o.o_orderkey < 8000"
+    ),
     "INTERSECT": "SELECT o_custkey FROM orders INTERSECT SELECT c_custkey FROM customer",
     "TID scan": "SELECT * FROM region WHERE ctid = '(0,1)'",
     "hash-only GROUP BY": "SELECT xmin, count(*) FROM region GROUP BY xmin",
 }
+
+# PostgreSQL removes five of these LEFT JOINs, but splits the join by the ten it reads.
+REMOVED_JOINS = (
+    "SELECT count(*) FROM customer c LEFT JOIN orders o ON o.o_custkey = c.c_custkey "
+    "LEFT JOIN lineitem l ON l.l_orderkey = o.o_orderkey "
+    "LEFT JOIN part p ON p.p_partkey = l.l_partkey "
+    "LEFT JOIN supplier s ON s.s_suppkey = l.l_suppkey "
+    "LEFT JOIN nation sn ON sn.n_nationkey = s.s_nationkey "
+    "LEFT JOIN region sr ON sr.r_regionkey = sn.n_regionkey "
+    "JOIN nation cn ON cn.n_nationkey = c.c_nationkey "
+    "JOIN region cr ON cr.r_regionkey = cn.n_regionkey "
+    "LEFT JOIN partsupp ps ON ps.ps_partkey = l.l_partkey AND ps.ps_suppkey = l.l_suppkey "
+    "WHERE c.c_custkey < 300"
+)
 
 # PostgreSQL copies the tables of a NOT MATERIALIZED CTE used twice, so no alias
 # can tell the copies apart and forcing is refused.

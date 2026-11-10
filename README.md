@@ -63,7 +63,7 @@ $env:PGPASSWORD = "postgres"
 py -m pytest
 ```
 
-`tests/test_hints.py` needs no database. It covers hint building, the alias rewrite and plan comparison. `tests/test_forcing.py` forces PostgreSQL's own plan for TPC-H Q1–Q22 and for query shapes that broke forcing before, and checks that every forced decision is followed. It is skipped when the database or `pg_hint_plan` is unavailable. Both use `EXPLAIN` only, so no query runs.
+`tests/test_hints.py` needs no database. It covers hint building, the alias rewrite and plan comparison. `tests/test_forcing.py` forces PostgreSQL's own plan for TPC-H Q1–Q22 and for query shapes that broke forcing before, plus a few edited plans such as swapped join sides, and checks that every forced decision is followed. It is skipped when the database or `pg_hint_plan` is unavailable. Both use `EXPLAIN` only, so no query runs.
 
 ## Project files
 

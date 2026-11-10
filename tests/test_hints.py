@@ -129,6 +129,213 @@ def test_tables_of_an_in_subquery_do_not_count_toward_the_from_subquery() -> Non
     assert "HashJoin(y c)" in build_hints(plan, query)
 
 
+GROUPED = "(SELECT o_custkey FROM orders o GROUP BY o_custkey)"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        # An IN subquery PostgreSQL pulls up is made unique, then joined directly.
+        (
+            "SELECT 1 FROM customer c WHERE c_custkey IN (SELECT o_custkey FROM orders o)",
+            "HashJoin(o c) Leading((o c))",
+        ),
+        (f"SELECT 1 FROM customer c WHERE c_custkey IN {GROUPED}", 'HashJoin("ANY_subquery" c)'),
+        (f"WITH t AS {GROUPED} SELECT 1 FROM t JOIN customer c ON true", "HashJoin(t c)"),
+    ],
+)
+def test_join_over_aggregated_subquery_is_named(query: str, expected: str) -> None:
+    aggregate = PlanNode(node_type="Aggregate", children=(scan("o", "orders", "Outer"),))
+    plan = hash_join(aggregate, scan("c", "customer", "Outer"))
+
+    hints = build_hints(plan, query)
+
+    assert all(hint in hints for hint in expected.split())
+
+
+def test_two_grouped_in_subqueries_get_no_any_subquery_hint() -> None:
+    aggregate = PlanNode(node_type="Aggregate", children=(scan("o", "orders", "Outer"),))
+    plan = hash_join(aggregate, scan("c", "customer", "Outer"))
+    query = (
+        f"SELECT 1 FROM customer c WHERE c_custkey IN {GROUPED} "
+        f"AND c_nationkey IN {GROUPED.replace(' o ', ' o2 ')}"
+    )
+
+    assert "ANY_subquery" not in build_hints(plan, query)
+
+
+def test_leading_leaves_out_a_join_whose_inner_side_has_an_outer_join() -> None:
+    left = hash_join(scan("n", "nation"), scan("s", "supplier", "Outer"))
+    left = left.model_copy(update={"join_type": "Left"})
+    plan = hash_join(scan("r", "region"), left)
+    query = "SELECT 1 FROM region r JOIN (nation n LEFT JOIN supplier s ON true) ON true"
+
+    hints = build_hints(plan, query)
+
+    assert "HashJoin(r n s)" in hints
+    assert "Leading((n s))" in hints
+    assert "Leading((r (n s)))" not in hints
+    # With the outer join on the outer side, pg_hint_plan can order the whole level.
+    swapped = hash_join(left, scan("r", "region", "Outer"))
+    assert "Leading(((n s) r))" in build_hints(swapped, query)
+
+
+def test_nested_loop_without_memoize_forbids_one() -> None:
+    orders = scan("o", "orders", "Inner")
+    plain = PlanNode(node_type="Nested Loop", children=(scan("c", "customer", "Outer"), orders))
+    memoize = PlanNode(node_type="Memoize", parent_relationship="Inner", children=(orders,))
+    cached = plain.model_copy(update={"children": (plain.children[0], memoize)})
+    query = "SELECT 1 FROM customer c JOIN orders o ON true"
+
+    assert "NoMemoize(c o)" in build_hints(plain, query)
+    assert "NoMemoize" not in build_hints(cached, query)
+
+
+def test_plan_with_a_gather_zeroes_the_parallel_costs() -> None:
+    lineitem = scan("l", "lineitem", "Outer").model_copy(update={"parallel_aware": True})
+    gather = PlanNode(node_type="Gather", workers_planned=2, children=(lineitem,))
+    query = "SELECT 1 FROM lineitem l"
+
+    assert "Set(parallel_setup_cost 0) Set(parallel_tuple_cost 0)" in build_hints(gather, query)
+    assert "parallel_setup_cost" not in build_hints(lineitem, query)
+
+
+def test_subquery_postgresql_keeps_whole_goes_by_its_alias() -> None:
+    # OFFSET 0 keeps the subquery apart, yet EXPLAIN shows only the scan inside it.
+    plan = hash_join(scan("lineitem", "lineitem"), scan("o", "orders", "Outer"))
+    query = "SELECT 1 FROM (SELECT l_orderkey FROM lineitem{}) t JOIN orders o ON true"
+
+    assert "HashJoin(t o)" in build_hints(plan, query.format(" OFFSET 0"))
+    assert "HashJoin(lineitem o)" in build_hints(plan, query.format(""))
+
+
+def test_subquery_without_tables_goes_by_its_alias() -> None:
+    constants = PlanNode(
+        node_type="Append", children=(PlanNode(node_type="Result"), PlanNode(node_type="Result"))
+    )
+    plan = hash_join(constants, scan("n", "nation", "Outer"))
+    query = "SELECT 1 FROM nation n JOIN (SELECT 1 AS k UNION ALL SELECT 2) u ON true"
+
+    assert "HashJoin(u n)" in build_hints(plan, query)
+
+
+def test_subquery_counts_the_tables_of_an_exists_postgresql_pulls_up() -> None:
+    semi = hash_join(scan("c", "customer"), scan("o", "orders", "Outer"))
+    aggregate = PlanNode(
+        node_type="Aggregate", children=(semi.model_copy(update={"join_type": "Semi"}),)
+    )
+    plan = hash_join(aggregate, scan("n", "nation", "Outer"))
+    query = (
+        "SELECT 1 FROM nation n JOIN (SELECT c_nationkey FROM customer c WHERE EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.o_custkey = c.c_custkey) GROUP BY 1) a ON true"
+    )
+
+    hints = build_hints(plan, query)
+
+    assert "HashJoin(a n)" in hints
+    assert "HashJoin(c o)" in hints
+
+
+def test_subquery_over_values_goes_by_its_alias() -> None:
+    values = PlanNode(node_type="Values Scan", alias="*VALUES*", parent_relationship="Outer")
+    distinct = PlanNode(node_type="Aggregate", children=(values,))
+    plan = hash_join(distinct, scan("n", "nation", "Outer"))
+    query = "SELECT 1 FROM nation n JOIN (SELECT DISTINCT x FROM (VALUES (1)) v(x)) u ON true"
+
+    assert "HashJoin(u n)" in build_hints(plan, query)
+
+
+def test_join_below_an_unhinted_join_gets_no_leading_hint() -> None:
+    unnamed = PlanNode(node_type="Append", children=(PlanNode(node_type="Result"),))
+    plan = hash_join(hash_join(scan("s", "supplier"), scan("n", "nation", "Outer")), unnamed)
+
+    hints = build_hints(plan, "SELECT 1 FROM supplier s JOIN nation n ON true")
+
+    assert "HashJoin(s n)" in hints
+    assert "Leading" not in hints
+
+
+def test_collapse_limits_count_the_relations_the_query_reads() -> None:
+    # PostgreSQL may remove LEFT JOINs from the plan after it has split the join.
+    query = "SELECT 1 FROM " + " LEFT JOIN ".join(f"t{n}" for n in range(1, 10))
+
+    assert "Set(join_collapse_limit 9)" in build_hints(chain(5), query)
+
+
+def test_collapse_limits_ignore_tables_of_other_query_levels() -> None:
+    joined = " JOIN ".join(f"t{n}" for n in range(1, 6))
+    scalar = "(SELECT count(*) FROM u1, u2, u3, u4)"
+
+    assert "collapse_limit" not in build_hints(chain(5), f"SELECT {scalar} FROM {joined}")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # PostgreSQL removed the LEFT JOIN, so only o is left under the Aggregate.
+        "SELECT 1 FROM customer c JOIN (SELECT o_custkey, count(*) FROM orders o "
+        "LEFT JOIN nation n ON true GROUP BY o_custkey) s ON true",
+        "not SQL",
+    ],
+)
+def test_join_over_an_unmatched_aggregate_gets_no_hint(query: str) -> None:
+    aggregate = PlanNode(node_type="Aggregate", children=(scan("o", "orders", "Outer"),))
+
+    assert "HashJoin" not in build_hints(hash_join(scan("c", "customer"), aggregate), query)
+
+
+def test_not_in_subquery_is_not_pulled_up() -> None:
+    # The NOT IN stays a SubPlan, so EXPLAIN shows only o inside the kept subquery s.
+    plan = hash_join(scan("c", "customer"), scan("o", "orders", "Outer"))
+    query = (
+        "SELECT 1 FROM customer c JOIN (SELECT * FROM orders o WHERE o_custkey NOT IN "
+        "(SELECT n_nationkey FROM nation) OFFSET 0) s ON true"
+    )
+
+    assert "HashJoin(c s)" in build_hints(plan, query)
+
+
+def test_not_in_subquery_is_no_any_subquery() -> None:
+    aggregate = PlanNode(node_type="Aggregate", children=(scan("o", "orders", "Outer"),))
+    plan = hash_join(aggregate, scan("c", "customer", "Outer"))
+    query = (
+        f"SELECT 1 FROM customer c WHERE c_custkey IN {GROUPED} "
+        f"AND c_nationkey NOT IN {GROUPED.replace(' o ', ' o2 ')}"
+    )
+
+    assert 'HashJoin("ANY_subquery" c)' in build_hints(plan, query)
+
+
+def test_generated_name_with_the_same_scan_is_not_refused() -> None:
+    # min() and max() of one column read the table twice through the same index.
+    first = PlanNode(
+        node_type="Index Only Scan", alias="lineitem", relation="lineitem",
+        index_name="lineitem_pkey", parent_relationship="InitPlan",
+    )
+    second = first.model_copy(update={"alias": "lineitem_1"})
+    query = "SELECT min(l_orderkey), max(l_orderkey) FROM lineitem"
+
+    hints = build_hints(PlanNode(node_type="Result", children=(first, second)), query)
+
+    assert hints.count("IndexOnlyScan(lineitem lineitem_pkey)") == 1
+    assert "lineitem_1" not in hints
+    other = second.model_copy(update={"node_type": "Seq Scan", "index_name": None})
+    with pytest.raises(ValueError, match="lineitem_1"):
+        build_hints(PlanNode(node_type="Result", children=(first, other)), query)
+
+
+def test_join_over_a_second_values_list_gets_no_hint() -> None:
+    values = PlanNode(node_type="Values Scan", alias="*VALUES*", parent_relationship="Outer")
+    second = values.model_copy(update={"alias": "*VALUES*_1"})
+    plan = hash_join(hash_join(scan("c", "customer"), values), second)
+    query = (
+        "SELECT 1 FROM customer c WHERE c_nationkey IN (VALUES (1)) "
+        "AND c_custkey IN (VALUES (2))"
+    )
+
+    assert "*VALUES*_1" not in build_hints(plan, query)
+
+
 def test_scan_without_index_name_matches_any_index() -> None:
     named = PlanNode(node_type="Index Scan", alias="o", index_name="orders_pkey")
     unnamed = named.model_copy(update={"index_name": None})

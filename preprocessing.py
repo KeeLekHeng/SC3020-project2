@@ -19,6 +19,7 @@ names, so comparison.py works on one form for every source.
 
 import re
 import textwrap
+from collections import Counter
 from typing import Callable, Iterator
 
 import psycopg
@@ -333,19 +334,30 @@ SWITCH_OFFS: dict[str, Callable[[PlanNode], bool]] = {
     "enable_parallel_append": lambda n: n.node_type == "Append" and n.parallel_aware,
 }
 
-# Operators that pass rows through within one query level. Any other
-# operator without an alias, such as an Aggregate under a join, is the top of
-# a subquery whose alias EXPLAIN dropped; build_hints() recovers it from the query.
+# Operators that pass rows through within one query level. Any other operator without
+# an alias, such as an Aggregate under a join, heads a subquery whose alias EXPLAIN
+# dropped, or makes the rows of a pulled-up IN subquery unique; build_hints() tells
+# which from the query.
 PASS_THROUGH = {"Hash", "Sort", "Incremental Sort", "Materialize", "Memoize", *GATHER}
 
-# A join tree: an alias for one relation, or an (outer, inner) pair of trees.
+# A join tree: an alias for one relation, or (outer tree, inner tree, whether the join
+# is an outer join).
 JoinTree = str | tuple
+OUTER_JOINS = ("Left", "Right", "Full")
 
-# A query's FROM subqueries, each as (aliases of the relations inside, its alias).
-Subqueries = list[tuple[frozenset[str], str]]
+# A query's subqueries, each as (aliases of the relations inside, its name in hints or
+# None for a pulled-up IN or EXISTS, whether PostgreSQL keeps it whole with exactly
+# these relations); see _subqueries(). A FROM subquery or CTE is listed twice, without
+# and with the tables of the IN and EXISTS subqueries PostgreSQL pulls up into it,
+# because EXPLAIN shows those tables inside it; only the second can be kept whole.
+Subqueries = list[tuple[frozenset[str], str | None, bool]]
 
 # Where a subquery is a FROM item rather than an IN, EXISTS or scalar subquery.
 FROM_ITEM = (exp.From, exp.Join, exp.Lateral)
+
+# Clauses that make PostgreSQL plan a subquery whole instead of pulling it up into the
+# query around it.
+NOT_PULLED_UP = ("group", "having", "distinct", "order", "limit", "offset", "with_")
 
 # PostgreSQL cuts names to 63 bytes (NAMEDATALEN - 1), and EXPLAIN shows them cut.
 NAME_LIMIT = 63
@@ -357,27 +369,37 @@ def build_hints(
     """
     Return pg_hint_plan hints that ask PostgreSQL to use this plan.
 
-    query is the SQL the plan is for. From it, build_hints learns the aliases of FROM
-    subqueries, so joins over them get hints; which aliases the query writes, so c_1 is
-    not taken for a generated name; and which aliases exist, so a scan under a misnamed
-    alias is refused. If sqlglot cannot parse query, these steps are skipped.
+    query is the SQL the plan is for. From it, build_hints learns the names of
+    subqueries (see _subqueries()), so joins over them get hints; which aliases the
+    query writes, so c_1 is not taken for a generated name; and which aliases exist, so
+    a scan under a misnamed alias is refused. If sqlglot cannot parse query, these steps
+    are skipped.
 
     The hints fix:
 
     - the method and index of every Seq Scan, Index Scan, Index Only Scan and Bitmap
       Heap Scan
-    - the method of every Hash Join, Merge Join and Nested Loop
-    - unless leading=False, the join order and outer and inner sides, with one Leading
-      hint per query level;
-      a level's joins stop at named relations, at a FULL JOIN's inputs and at any
-      operator that is not a join or a pass-through operator, and what lies below gets
-      its own Leading hint
-    - for a join of more than COLLAPSE_LIMIT relations, join_collapse_limit and
-      from_collapse_limit high enough to plan it as one join, with GEQO off, so the
-      Leading hint applies
+    - the method of every Hash Join, Merge Join and Nested Loop, and NoMemoize for a
+      Nested Loop whose inner side has no Memoize
+    - unless leading=False, the join order and the outer and inner sides. A query
+      level is the joins PostgreSQL orders as one problem: they stop at named
+      relations, at a FULL JOIN's inputs and at any operator that is neither a join
+      nor a pass-through operator, and what lies below is a level of its own, though
+      it still appears nested in the hint above. pg_hint_plan follows only the last
+      Leading hint of a level, so each level's hint comes after those of the levels
+      below it. A level that pg_hint_plan cannot order whole gets a hint for each part
+      it can (see _orderable()), largest last, so the largest part is followed. A
+      level whose top join gets no join hint gets no Leading hint, because
+      pg_hint_plan disables every method for a join without one above a Leading hint.
+    - when the plan joins, or one SELECT of the query reads, more than COLLAPSE_LIMIT
+      relations, join_collapse_limit and from_collapse_limit high enough to plan it as
+      one join, with GEQO off, so the Leading hint applies
     - which scans run in parallel, and with how many workers; a plan without a Gather
       also gets Set(max_parallel_workers_per_gather 0), which turns parallelism off for
       the whole query
+    - for a plan with a Gather, parallel_setup_cost and parallel_tuple_cost of 0: a
+      Parallel hint zeroes them only while its own scan is planned, so a Gather right
+      above that scan would otherwise look cheaper than one above a join or aggregate
     - unless switch_offs=False, every operator in SWITCH_OFFS that the plan never uses
       is switched off for the whole query, such as hashed aggregation in a plan with
       only sorted aggregates
@@ -388,30 +410,41 @@ def build_hints(
     Limitations:
 
     - Not hinted per node, so left to the planner: other scan types (CTE, Function,
-      Subquery, Values), aggregate, sort, set operation, Materialize and Memoize
-      choices, and where a Gather is placed, such as a two-stage parallel aggregate. A
-      switch-off only removes an operator the plan never uses, so a plan with one hashed
-      and one sorted aggregate cannot fix which is which.
+      Subquery, Values), aggregate, sort, set operation and Materialize choices, a
+      Memoize the plan wants, which pg_hint_plan can allow but not demand, and where a
+      Gather is placed, such as a two-stage parallel aggregate. pg_hint_plan has no
+      hint for these, and a Set hint applies to the whole query: a switch-off only
+      removes an operator the plan never uses, so a plan with one hashed and one sorted
+      aggregate cannot fix which is which.
     - A switched-off operator the plan needs but does not show, such as a Materialize
       under a Nested Loop whose inner side is a join, adds PostgreSQL's cost for a
       disabled operator, 1e10, to every candidate plan. The planner then cannot compare
       their real costs and may break other hints; comparison.force_plan() then retries
       without switch-offs.
     - Hints name tables by alias. A node without an alias gets no scan hint. A join over
-      an unnamed operator, such as an Append over partitions or an IN subquery turned
-      into a join, gets no join or Leading hint; only the switch-offs limit its method.
+      an unnamed operator, such as an Append over partitions or one of two IN
+      subqueries that both group, gets no join or Leading hint; only the switch-offs
+      limit its method.
     - A name used twice, such as an unaliased lineitem in both the query and a subquery,
       appears in EXPLAIN as lineitem and lineitem_1. pg_hint_plan ignores the generated
       name and applies the lineitem hint to every use, so when a hint would need the
-      generated name, build_hints raises ValueError. Planning the query from
-      unique_aliases() avoids this, except for a NOT MATERIALIZED CTE used twice, whose
-      tables PostgreSQL copies.
+      generated name, build_hints raises ValueError: when a join reads it, or its scan
+      differs from the first use's. Planning the query from unique_aliases() avoids
+      this, except for a NOT MATERIALIZED CTE used twice, whose tables PostgreSQL
+      copies, and for a view that reads a table under an alias the query also uses.
     - A parallel scan with no Gather above it gets no Parallel hint, because its worker
-      count is unknown.
-    - pg_hint_plan honours one Leading hint per join problem. In nested FULL JOINs the
-      outer FULL JOINs' sides may not be forced, and a join between two outer-join
-      results, such as two LEFT JOINs joined together, falls back to a penalized Nested
-      Loop under any Leading hint; comparison.force_plan() then retries without them.
+      count is unknown. Under an Append, PostgreSQL sets the worker count itself and
+      ignores the one in the hint.
+    - pg_hint_plan follows one Leading hint per query level, and cannot fix the sides
+      of a join whose inner side contains a LEFT, RIGHT or FULL JOIN, such as the
+      outer of two nested FULL JOINs or a join of two LEFT JOIN results. That join and
+      the joins above it keep their method and relations, but the planner picks their
+      outer side; of the parts below, only the largest has its sides forced. EXPLAIN
+      does not tell an anti join made from a LEFT JOIN from one made from NOT EXISTS,
+      so the first is not detected and is penalized under a Leading hint;
+      comparison.force_plan() then retries without them.
+    - Forced plans' costs are not comparable with unforced ones: scan and Parallel hints
+      and the zero parallel costs all change them.
     - PostgreSQL cannot follow a plan it has no path for, for example an index or bitmap
       scan without a usable condition, a nested loop for a FULL JOIN, some outer and
       anti join side swaps, or a parallel scan inside a nested loop.
@@ -421,30 +454,32 @@ def build_hints(
     query lacks.
     """
     hints: list[str] = []
-    leading_hints: list[str] = []
-    leading_sizes: list[int] = []
+    levels: list[JoinTree] = []
     parsed = _parse(query)
     relations = {t.alias_or_name: t.name for t in _relations(parsed)} if parsed else {}
 
-    # Each FROM or LATERAL subquery, with the relations its own level reads; those in
-    # an IN, EXISTS or scalar subquery inside it belong to another level. A LATERAL
-    # subquery's alias sits on the Lateral around it.
-    subqueries: Subqueries = []
-    for sub in parsed.find_all(exp.Subquery) if parsed else ():
-        alias = sub.parent.alias if isinstance(sub.parent, exp.Lateral) else sub.alias
-        if alias and isinstance(sub.parent, FROM_ITEM):
-            inner = {
-                id(t)
-                for q in sub.find_all(exp.Subquery, exp.Exists)
-                if not isinstance(q.parent, FROM_ITEM)
-                for t in q.find_all(exp.Table)
-            }
-            own = (t.alias_or_name for t in _relations(sub) if id(t) not in inner)
-            subqueries.append((frozenset(own), alias))
+    subqueries = _subqueries(parsed) if parsed else []
     hinted: set[str] = set()
     nodes = list(plan.walk())
+
+    # EXPLAIN names the second use of a name lineitem_1, which hints cannot reach: the
+    # lineitem hints apply to every use. An alias the query writes itself, such as c_1,
+    # is not such a name.
+    aliases = {n.alias for n in nodes if n.alias}
+    written = set(relations) | {alias for _, alias, _ in subqueries if alias}
+    generated = {
+        alias: match.group(1)
+        for alias in aliases - written
+        if (match := re.fullmatch(r"(.+)_\d+", alias)) and match.group(1) in aliases
+    }
+    copies: list[tuple[str, list[str]]] = []
+    # A generated name of something other than a table, such as a second VALUES list,
+    # is no second use of anything: a join over it simply goes without hints.
+    unnamed = {n.alias for n in nodes if n.alias in generated and not n.relation}
     parallel = any(n.node_type in GATHER for n in nodes)
-    if not parallel:
+    if parallel:
+        hints += ["Set(parallel_setup_cost 0)", "Set(parallel_tuple_cost 0)"]
+    else:
         hints.append("Set(max_parallel_workers_per_gather 0)")
 
     if switch_offs:
@@ -458,9 +493,10 @@ def build_hints(
         """
         Add hints for node and its subtree.
 
-        ordered means an ancestor's Leading hint already fixes this node's join order
-        within the same query level. workers is the worker count of the nearest
-        Gather above node; subqueries start without one.
+        ordered is True below the top join of a query level, which alone decides the
+        level's Leading hint, even when it gets no join hint and the level gets none.
+        workers is the worker count of the nearest Gather above
+        node; subqueries start without one.
         """
         if node.node_type in GATHER:
             workers = node.workers_planned
@@ -471,29 +507,35 @@ def build_hints(
                 for n in node.walk(subplans=False)
                 if n.node_type == "Bitmap Index Scan" and n.index_name
             ]
-            hinted.add(node.alias)
-            names = " ".join(_hint_name(name) for name in [node.alias, *indexes])
-            hints.append(f"{SCAN_HINTS[node.node_type]}({names})")
+            alias = _hint_name(generated.get(node.alias, node.alias))
+            names = " ".join([alias, *map(_hint_name, indexes)])
+            scan = [f"{SCAN_HINTS[node.node_type]}({names})"]
 
             if node.parallel_aware:
                 # Without a Gather above, the worker count is unknown, so the
                 # planner decides.
                 if workers:
-                    hints.append(f"Parallel({_hint_name(node.alias)} {workers} hard)")
+                    scan.append(f"Parallel({alias} {workers} hard)")
             elif parallel:
                 # Otherwise PostgreSQL may also run this scan in parallel.
-                hints.append(f"Parallel({_hint_name(node.alias)} 0 hard)")
+                scan.append(f"Parallel({alias} 0 hard)")
+
+            if node.alias in generated:
+                copies.append((node.alias, scan))
+            else:
+                hints.extend(scan)
 
         tree = _join_tree(node, subqueries) if node.node_type in JOIN_HINTS else None
-        if tree:
-            flat = _flatten(tree)
+        if tree and unnamed.isdisjoint(flat := _flatten(tree)):
             hinted.update(flat)
-            aliases = " ".join(_hint_name(a) for a in flat)
-            hints.append(f"{JOIN_HINTS[node.node_type]}({aliases})")
+            joined = " ".join(_hint_name(a) for a in flat)
+            hints.append(f"{JOIN_HINTS[node.node_type]}({joined})")
+            # pg_hint_plan can forbid a Memoize under one join but cannot demand one.
+            if node.node_type == "Nested Loop" and node.inputs[1].node_type != "Memoize":
+                hints.append(f"NoMemoize({joined})")
 
             if not ordered:
-                leading_hints.append(f"Leading({_format_leading(tree)})")
-                leading_sizes.append(len(flat))
+                levels.append(tree)
 
         # Inputs of a join or pass-through operator stay in the same query
         # level, so a Leading hint above still covers them; anything else
@@ -503,7 +545,7 @@ def build_hints(
             node.node_type in JOIN_HINTS and node.join_type != "Full"
         )
         for child in node.inputs:
-            visit(child, (ordered or tree is not None) and same_level, workers)
+            visit(child, (ordered or node.node_type in JOIN_HINTS) and same_level, workers)
 
         # A subquery is planned on its own, so it starts without an order or
         # a Gather.
@@ -514,25 +556,26 @@ def build_hints(
 
     # pg_hint_plan reports all but one Leading hint of a join problem as duplicates,
     # yet the joins below a FULL JOIN keep their order only when their hint comes
-    # first, so emit the deepest scope first.
+    # first, so emit the deepest scope first. A level that cannot be ordered whole
+    # repeats the hints of the levels below it; keep the deepest copy.
     if leading:
-        hints += reversed(leading_hints)
+        parts = [f"Leading({_format_leading(t)})" for tree in levels for t in _orderable(tree)]
+        hints += dict.fromkeys(reversed(parts))
 
-    size = max(leading_sizes, default=0)
-    if size > COLLAPSE_LIMIT:
+    # PostgreSQL splits the join before it removes unneeded LEFT JOINs, so count the
+    # relations each query block reads as well as those the plan joins.
+    blocks = Counter(id(t.parent_select) for t in _relations(parsed)) if parsed else {}
+    size = max([0, *blocks.values(), *(len(_flatten(tree)) for tree in levels)])
+    if levels and size > COLLAPSE_LIMIT:
         limits = [f"Set({limit}_collapse_limit {size})" for limit in ("join", "from")]
         hints = [*limits, "Set(geqo off)", *hints]
 
-    # EXPLAIN names the second use of a name lineitem_1, which hints cannot reach. An
-    # alias the query writes itself, such as c_1, is not such a name.
-    aliases = {n.alias for n in nodes if n.alias}
-    written = set(relations) | {alias for _, alias in subqueries}
-    generated = {
-        alias
-        for alias in aliases - written
-        if (match := re.fullmatch(r"(.+)_\d+", alias)) and match.group(1) in aliases
-    }
-    blocked = sorted(hinted & generated)
+    # A generated name is harmless while no join names it and its scan wants the hints
+    # the first use already has, as in the two index scans of min() and max().
+    blocked = sorted(
+        (hinted & generated.keys())
+        | {alias for alias, scan in copies if not set(scan) <= set(hints)}
+    )
     if blocked:
         raise ValueError(
             f"Cannot force this plan: hints cannot reach {', '.join(blocked)}, a name "
@@ -547,6 +590,7 @@ def build_hints(
         if n.node_type in SCAN_HINTS
         and n.alias
         and n.alias not in relations
+        and n.alias not in generated
         and n.relation in tables
     )
     if unknown:
@@ -558,27 +602,141 @@ def build_hints(
     return " ".join(hints)
 
 
-def _join_tree(node: PlanNode, subqueries: Subqueries) -> JoinTree | None:
-    """Join tree of the relations under node, or None if one is unnamed."""
+def _join_tree(node: PlanNode, subqueries: Subqueries, top: bool = True) -> JoinTree | None:
+    """
+    Join tree of the relations under node, or None if one is unnamed.
+
+    top is True for the join the tree is built for, which is never named after a
+    subquery, though it may be all that subquery holds.
+    """
+    # A subquery PostgreSQL keeps whole is one relation under its own name, even when
+    # EXPLAIN shows only the scan or join inside it, as for OFFSET 0.
+    if not top and any(kept for _, _, kept in subqueries):
+        below = node.relations()
+        whole = {name for inside, name, kept in subqueries if kept and inside == below}
+        if len(whole) == 1:
+            return whole.pop()
+
     if node.alias:
         return node.alias
 
     inputs = node.inputs
 
     if node.node_type in JOIN_HINTS and len(inputs) == 2:
-        outer, inner = (_join_tree(child, subqueries) for child in inputs)
-        return (outer, inner) if outer and inner else None
+        outer, inner = (_join_tree(child, subqueries, False) for child in inputs)
+        return (outer, inner, node.join_type in OUTER_JOINS) if outer and inner else None
 
     if node.node_type in PASS_THROUGH and len(inputs) == 1:
-        return _join_tree(inputs[0], subqueries)
+        return _join_tree(inputs[0], subqueries, False)
 
     # Any other unnamed operator heads a subquery whose alias EXPLAIN dropped: name it
-    # after the one FROM subquery that reads exactly the relations below it.
+    # after the one subquery that reads exactly the relations below it. Over an IN or
+    # EXISTS subquery that PostgreSQL pulled up, an Aggregate or Unique only makes the
+    # rows unique, and the relations below join this level directly.
     below = node.relations()
-    names = [alias for inside, alias in subqueries if inside == below]
+    names = {name for inside, name, _ in subqueries if inside == below}
+    if names == {None} and node.node_type in ("Aggregate", "Unique") and len(inputs) == 1:
+        return _join_tree(inputs[0], subqueries, False)
 
-    return names[0] if below and len(names) == 1 else None
+    return names.pop() if below and len(names) == 1 else None
 
+
+def _subqueries(parsed: exp.Expr) -> Subqueries:
+    """
+    Return the subqueries of parsed that PostgreSQL may join as one relation.
+
+    A FROM or LATERAL subquery goes by its alias, and a CTE read once by the name it
+    is read under, because PostgreSQL plans it in place. An IN or = ANY subquery that
+    PostgreSQL keeps whole is named ANY_subquery; two of them share that name, so
+    neither is listed. Any other IN or EXISTS subquery that _pulled_up() is pulled up
+    into the query around it and has no name.
+    """
+    found: Subqueries = []
+    sublinks: Subqueries = []
+
+    for query in parsed.find_all(exp.Subquery, exp.Exists):
+        parent, kept = query.parent, _kept_whole(query.this)
+        if isinstance(parent, FROM_ITEM):
+            # A LATERAL subquery's alias sits on the Lateral around it.
+            alias = parent.alias if isinstance(parent, exp.Lateral) else query.alias
+            if alias:
+                found += [
+                    (_own_relations(query), alias, False),
+                    (_own_relations(query, True), alias, kept),
+                ]
+        elif not _pulled_up(query):
+            continue
+        elif not kept:
+            found.append((_own_relations(query, True), None, False))
+        elif isinstance(query, exp.Subquery):
+            sublinks.append((_own_relations(query), "ANY_subquery", True))
+
+    for cte in parsed.find_all(exp.CTE):
+        uses = [t for t in parsed.find_all(exp.Table) if t.name == cte.alias and not t.db]
+        if len(uses) == 1:
+            name, body = uses[0].alias_or_name, cte.this
+            found += [
+                (_own_relations(body), name, False),
+                (_own_relations(body, True), name, _kept_whole(body)),
+            ]
+
+    return found + sublinks if len(sublinks) == 1 else found
+
+
+def _kept_whole(query: exp.Expr) -> bool:
+    """Whether PostgreSQL plans query as a unit instead of pulling it up."""
+    return (
+        not isinstance(query, exp.Select)
+        or any(query.args.get(clause) for clause in NOT_PULLED_UP)
+        or any(f.parent_select is query for f in query.find_all(exp.AggFunc, exp.Window))
+    )
+
+
+def _pulled_up(sublink: exp.Expr) -> bool:
+    """
+    Whether PostgreSQL may join an IN, = ANY or EXISTS subquery into the query around it.
+
+    It does for an EXISTS, NOT EXISTS, IN or = ANY ANDed into a WHERE or ON condition.
+    A NOT IN, or one under OR, stays a SubPlan. So does an IN that refers to the query
+    around it, which is not detected here.
+    """
+    if isinstance(sublink, exp.Exists):
+        term = sublink.parent if isinstance(sublink.parent, exp.Not) else sublink
+    elif isinstance(sublink.parent, exp.In):
+        term = sublink.parent
+    elif isinstance(sublink.parent, exp.Any) and isinstance(sublink.parent.parent, exp.EQ):
+        term = sublink.parent.parent
+    else:
+        return False
+
+    while isinstance(term.parent, (exp.And, exp.Paren)):
+        term = term.parent
+
+    return isinstance(term.parent, (exp.Where, exp.Join))
+
+
+def _own_relations(query: exp.Expr, sublinks: bool = False) -> frozenset[str]:
+    """
+    Aliases of the relations query's own level reads, as EXPLAIN shows them.
+
+    Those in an IN, EXISTS or scalar subquery inside it belong to another level. With
+    sublinks=True, those of the IN and EXISTS subqueries that PostgreSQL can pull up
+    are counted too. A VALUES list is shown as *VALUES*.
+    """
+    inner = {
+        id(t)
+        for q in query.find_all(exp.Subquery, exp.Exists)
+        if q is not query
+        and not isinstance(q.parent, FROM_ITEM)
+        and not (sublinks and _pulled_up(q) and not _kept_whole(q.this))
+        for t in q.find_all(exp.Table, exp.Values)
+    }
+    values = [v for v in query.find_all(exp.Values) if isinstance(v.parent, (exp.From, exp.Join))]
+    return frozenset(
+        t.alias_or_name if isinstance(t, exp.Table) else "*VALUES*"
+        for t in [*_relations(query), *values]
+        if id(t) not in inner
+    )
 
 
 def _flatten(tree: JoinTree) -> list[str]:
@@ -586,8 +744,35 @@ def _flatten(tree: JoinTree) -> list[str]:
     if isinstance(tree, str):
         return [tree]
 
-    outer, inner = tree
+    outer, inner, _ = tree
     return _flatten(outer) + _flatten(inner)
+
+
+def _has_outer_join(tree: JoinTree) -> bool:
+    """Whether tree contains a LEFT, RIGHT or FULL JOIN."""
+    return not isinstance(tree, str) and (tree[2] or any(map(_has_outer_join, tree[:2])))
+
+
+def _orderable(tree: JoinTree) -> list[JoinTree]:
+    """
+    Return the join trees within tree that a Leading hint can order, largest first.
+
+    PostgreSQL 16 counts an outer join among the relations of the side that contains
+    it, and pg_hint_plan 1.6 compares a pair's inner side with base relations only. So
+    a pair whose inner side contains an outer join never matches, and pg_hint_plan
+    penalizes every way to join it. Such a pair, and the joins above it, are left out;
+    their join hints still fix which relations they join and how.
+    """
+    if isinstance(tree, str):
+        return []
+
+    outer, inner, _ = tree
+    parts = _orderable(outer) + _orderable(inner)
+    whole = [side for side in (outer, inner) if not isinstance(side, str)]
+    if _has_outer_join(inner) or parts != whole:
+        return sorted(parts, key=lambda part: -len(_flatten(part)))
+
+    return [tree]
 
 
 def _format_leading(tree: JoinTree) -> str:
@@ -595,7 +780,7 @@ def _format_leading(tree: JoinTree) -> str:
     if isinstance(tree, str):
         return _hint_name(tree)
 
-    outer, inner = tree
+    outer, inner, _ = tree
     return f"({_format_leading(outer)} {_format_leading(inner)})"
 
 

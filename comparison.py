@@ -178,11 +178,11 @@ def force_plan(
     """
     Force plan on PostgreSQL and return (hints used, plan chosen, realization gaps).
 
-    Some hints backfire: a switch-off when plan needs the operator but does not show
-    it, and a Leading hint over a join of two outer-join results (see build_hints()).
-    So while the forced plan has gaps, this tries again without switch-offs, then
-    without Leading hints, and returns the result with the fewest gaps; a tie keeps the
-    fuller hints.
+    Some hints backfire: a switch-off of an operator plan needs but does not show, and
+    a Leading hint over an anti join made from a LEFT JOIN, which build_hints() cannot
+    tell apart (see its limitations). So while the forced plan has gaps, this tries
+    again without switch-offs, then with switch-offs but without Leading hints, and
+    returns the result with the fewest gaps; a tie keeps the earlier try.
 
     Raises ValueError when build_hints() refuses the plan, and
     psycopg.errors.UndefinedFile or InsufficientPrivilege when pg_hint_plan cannot be
