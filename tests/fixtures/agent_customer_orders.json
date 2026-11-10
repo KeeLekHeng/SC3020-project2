@@ -1,0 +1,41 @@
+{
+ "summary": "Hash the filtered orders, probe with customer, then group per customer.",
+ "plan": {
+  "node_type": "Aggregate",
+  "strategy": "Hashed",
+  "group_keys": [
+   "c.c_custkey",
+   "c.c_name"
+  ],
+  "reason": "Counts each customer's orders in a hash table.",
+  "children": [
+   {
+    "node_type": "Hash Join",
+    "join_type": "Inner",
+    "join_condition": "c.c_custkey = o.o_custkey",
+    "reason": "Joins each customer to their orders.",
+    "children": [
+     {
+      "node_type": "Seq Scan",
+      "relation": "customer",
+      "alias": "c",
+      "reason": "Reads every customer to probe the hash table."
+     },
+     {
+      "node_type": "Hash",
+      "reason": "Builds the hash table from the filtered orders.",
+      "children": [
+       {
+        "node_type": "Seq Scan",
+        "relation": "orders",
+        "alias": "o",
+        "filter": "o.o_orderdate >= DATE '1995-01-01'",
+        "reason": "Most orders pass the date filter, so a full scan is cheapest."
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

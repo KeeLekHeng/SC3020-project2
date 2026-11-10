@@ -15,15 +15,20 @@ and three functions:
 
 A plan from another source, such as the AI agent, is built into PlanNode from field
 names, so comparison.py works on one form for every source.
+
+The AI agent answers in AgentAnswer, whose AgentPlanNode tree is the subset of
+PlanNode the agent decides. validate_agent_plan() checks an answer and lists every
+problem, so they can go back to the agent in one retry message.
 """
 
+import json
 import re
 import textwrap
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator, Literal, get_args
 
 import psycopg
 import sqlglot
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
@@ -911,3 +916,307 @@ def _hint_name(name: str) -> str:
         return name
 
     return '"' + name.replace('"', '""') + '"'
+
+# ---------------------------------------------------------------------------
+# The AI agent's plan
+# ---------------------------------------------------------------------------
+
+# Operators the agent may use. All are PostgreSQL names, so the agent's plan, the
+# PostgreSQL plan and the hinted plan share one vocabulary. Every scan and join here can
+# be forced by build_hints(); Gather and Gather Merge let the agent decide parallelism.
+AgentNodeType = Literal[
+    "Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Scan",
+    "Hash Join", "Merge Join", "Nested Loop",
+    "Gather", "Gather Merge",
+    "Hash", "Sort", "Aggregate", "Limit", "Materialize", "Unique",
+    "Subquery Scan", "CTE Scan", "Append", "SetOp", "WindowAgg", "Result",
+]
+AgentJoinType = Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Right Anti"]
+AgentStrategy = Literal["Plain", "Sorted", "Hashed", "Mixed"]
+
+AGENT_NODE_TYPES: tuple[str, ...] = get_args(AgentNodeType)
+AGENT_JOIN_TYPES: tuple[str, ...] = get_args(AgentJoinType)
+AGENT_AGGREGATE_STRATEGIES: tuple[str, ...] = get_args(AgentStrategy)
+
+# Scans that name an index.
+INDEXED = ("Index Scan", "Index Only Scan", "Bitmap Heap Scan")
+
+# Number of inputs, as (min, max), each agent operator takes; max None means no limit.
+# Subqueries marked InitPlan or SubPlan are not inputs, so they are not counted.
+AGENT_INPUT_COUNTS: dict[str, tuple[int, int | None]] = {
+    **{t: (0, 0) for t in SCAN_HINTS},
+    **{t: (2, 2) for t in JOIN_HINTS},
+    **{t: (1, 1) for t in GATHER},
+    "Hash": (1, 1), "Sort": (1, 1), "Aggregate": (1, 1), "Limit": (1, 1),
+    "Materialize": (1, 1), "Unique": (1, 1), "Subquery Scan": (1, 1),
+    "WindowAgg": (1, 1), "CTE Scan": (0, 0), "Append": (1, None), "SetOp": (1, None),
+    "Result": (0, 1),
+}
+
+# Fields only some operators may have, and fields some operators must have. Only
+# fields that hints or comparison read are policed.
+AGENT_FIELD_OWNERS: dict[str, tuple[str, ...]] = {
+    "relation": tuple(SCAN_HINTS),
+    "index_name": INDEXED,
+    "cte_name": ("CTE Scan",),
+    "join_type": tuple(JOIN_HINTS),
+    "strategy": ("Aggregate", "SetOp"),
+    "workers_planned": GATHER,
+}
+AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    **{t: ("relation", "alias") for t in SCAN_HINTS},
+    **{t: ("join_type",) for t in JOIN_HINTS},
+    "CTE Scan": ("cte_name", "alias"),
+    "Subquery Scan": ("alias",),
+    "Aggregate": ("strategy",),
+}
+
+
+class AgentPlanNode(BaseModel):
+    """
+    One operator in the AI agent's plan: the subset of PlanNode the agent decides.
+
+    Field names match PlanNode's, so to_plan_node() is a plain dump and validate.
+    Costs, row counts and timings are left out, because the agent is asked for its
+    choices, not for estimates. The field descriptions, and the description in
+    model_config instead of this docstring, are part of the JSON Schema in the agent's
+    prompt.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        json_schema_extra={"description": "One operator of the plan."},
+    )
+
+    node_type: AgentNodeType = Field(description="PostgreSQL operator name.")
+    children: tuple["AgentPlanNode", ...] = Field(
+        (),
+        description="Child operators. Inputs come first: a join has exactly two, the "
+        "outer input then the inner input. Subqueries this operator uses come after, "
+        "each marked with parent_relationship.",
+    )
+    parent_relationship: Literal["InitPlan", "SubPlan"] | None = Field(
+        None,
+        description='Only on a separately planned subquery: "InitPlan" if it runs once '
+        '(uncorrelated), "SubPlan" if it runs again for each row of the operator that '
+        "uses it (correlated). Leave it out on inputs.",
+    )
+    subplan_name: str | None = Field(
+        None,
+        description='Name of a separately planned subquery, e.g. "SubPlan 1", or '
+        '"CTE <name>" for a CTE.',
+    )
+    relation: str | None = Field(None, description="Table read. Scans only.")
+    alias: str | None = Field(
+        None,
+        description="The table's alias exactly as the query writes it, or the table "
+        "name if the query gives none. Scans, CTE Scan and Subquery Scan only.",
+    )
+    index_name: str | None = Field(
+        None,
+        description="One of the table's listed indexes. Index Scan, Index Only Scan "
+        "and Bitmap Heap Scan only.",
+    )
+    cte_name: str | None = Field(None, description="CTE read. CTE Scan only.")
+    join_type: AgentJoinType | None = Field(None, description="Joins only.")
+    strategy: AgentStrategy | None = Field(
+        None,
+        description="Aggregate (and SetOp) only: Plain without GROUP BY, Sorted for "
+        "input sorted by the group keys, Hashed for a hash table, Mixed for grouping "
+        "sets.",
+    )
+    parallel_aware: bool = Field(
+        False,
+        description="True when this operator splits its work across parallel workers. "
+        "Only below a Gather or Gather Merge.",
+    )
+    workers_planned: int | None = Field(
+        None, description="Gather and Gather Merge only: parallel workers to start."
+    )
+    join_condition: str | None = Field(
+        None, description="Hash Join or Merge Join condition."
+    )
+    index_condition: str | None = Field(
+        None, description="Condition the index is searched with."
+    )
+    join_filter: str | None = Field(
+        None, description="Nested Loop condition checked on each row pair."
+    )
+    filter: str | None = Field(
+        None, description="Condition that removes rows after they are read."
+    )
+    sort_keys: tuple[str, ...] = Field((), description="Sort only: sort columns.")
+    group_keys: tuple[str, ...] = Field((), description="Aggregate only: group columns.")
+    reason: str | None = Field(
+        None, description="One short sentence on why this operator was chosen."
+    )
+
+    def to_plan_node(self) -> PlanNode:
+        """Return this tree as a PlanNode tree, ready for build_hints() or comparison."""
+        return PlanNode.model_validate(self.model_dump(exclude_defaults=True))
+
+
+class AgentAnswer(BaseModel):
+    """The whole answer the agent must give: a summary of its strategy and its plan."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        json_schema_extra={"description": "The answer: a summary and the plan's root operator."},
+    )
+
+    summary: str = Field("", description="One or two sentences on the overall strategy.")
+    plan: AgentPlanNode = Field(description="The root operator of the plan.")
+
+
+class AgentPlanError(ValueError):
+    """
+    The agent's answer is unusable.
+
+    errors lists every problem found, worded so they can go back to the agent in one
+    retry message; answer is the agent's raw text.
+    """
+
+    def __init__(self, errors: list[str], answer: str = "") -> None:
+        self.errors = errors
+        self.answer = answer
+        problems = "\n".join(f"- {e}" for e in errors)
+        super().__init__(f"The agent's plan is invalid:\n{problems}")
+
+
+def validate_agent_plan(output: str | dict) -> AgentAnswer:
+    """
+    Check the agent's answer and return it as an AgentAnswer.
+
+    output is the agent's JSON, as text or already loaded. Raises AgentPlanError listing
+    every problem at once: JSON and schema errors, and the structural rules pydantic
+    cannot check (input counts, required and misplaced fields, reused aliases, parallel
+    operators outside a Gather).
+    """
+    raw = output if isinstance(output, str) else json.dumps(output)
+    data: Any = output
+    if isinstance(output, str):
+        try:
+            data = json.loads(_json_text(output))
+        except json.JSONDecodeError as error:
+            raise AgentPlanError(
+                [
+                    f"The answer is not valid JSON: {error}. Write it indented, one "
+                    "field per line, and check that every { and [ is closed in order."
+                ],
+                raw,
+            ) from None
+
+    errors: list[str] = []
+    answer = None
+    try:
+        answer = AgentAnswer.model_validate(data)
+    except ValidationError as error:
+        errors += [_format_error(e) for e in error.errors(include_url=False)]
+
+    root = data.get("plan") if isinstance(data, dict) else None
+    if isinstance(root, dict):
+        if root.get("parent_relationship"):
+            errors.append("plan: the root operator cannot be a subquery (parent_relationship).")
+
+        _check_agent_node(root, "plan", {}, False, errors)
+
+    if errors or answer is None:
+        raise AgentPlanError(errors, raw)
+
+    return answer
+
+
+def parse_agent_plan(output: str | dict) -> PlanNode:
+    """Validate the agent's answer (see validate_agent_plan()) and return its plan."""
+    return validate_agent_plan(output).plan.to_plan_node()
+
+
+def relation_mismatches(agent: PlanNode, postgres: PlanNode) -> tuple[set[str], set[str]]:
+    """
+    Return (missing, extra): aliases PostgreSQL's plan scans that the agent's does not,
+    and aliases the agent's plan scans that PostgreSQL's does not.
+
+    A mismatch means the agent misread the query, so its hints would not line up.
+    """
+
+    def scanned(plan: PlanNode) -> set[str]:
+        return {n.alias for n in plan.walk() if n.relation and n.alias}
+
+    return scanned(postgres) - scanned(agent), scanned(agent) - scanned(postgres)
+
+
+def _check_agent_node(
+    node: dict, path: str, aliases: dict[str, str], under_gather: bool, errors: list[str]
+) -> None:
+    """
+    Add the structural problems of the raw agent node at path and its subtree to errors.
+
+    aliases maps each alias seen so far to where it was seen; under_gather means a
+    Gather above node is in the same query level. This works on the raw JSON so it runs
+    even when pydantic rejects the answer, and it skips values of the wrong type, which
+    pydantic already reports.
+    """
+    node_type = node.get("node_type")
+    children = node.get("children")
+    children = [c for c in children if isinstance(c, dict)] if isinstance(children, list) else []
+    inputs = [c for c in children if c.get("parent_relationship") not in SEPARATE_PLANS]
+
+    if node_type in AGENT_INPUT_COUNTS:
+        low, high = AGENT_INPUT_COUNTS[node_type]
+        if len(inputs) < low or (high is not None and len(inputs) > high):
+            wanted = (
+                str(low) if low == high
+                else f"at least {low}" if high is None
+                else f"{low} to {high}"
+            )
+            message = f"{path}: a {node_type} takes {wanted} input(s), but has {len(inputs)}."
+            if high is not None and len(inputs) > high:
+                message += (
+                    ' If a child is a subquery, mark it with parent_relationship "SubPlan" '
+                    'or "InitPlan"; it is not an input.'
+                )
+            errors.append(message)
+
+    for field in AGENT_REQUIRED_FIELDS.get(node_type, ()):
+        if not node.get(field):
+            errors.append(f"{path}: a {node_type} needs {field}.")
+
+    for field, owners in AGENT_FIELD_OWNERS.items():
+        if node.get(field) is not None and node_type in AGENT_NODE_TYPES and node_type not in owners:
+            errors.append(
+                f"{path}: {field} only belongs on {', '.join(owners)}, not on a {node_type}."
+            )
+
+    alias = node.get("alias")
+    if isinstance(alias, str) and alias:
+        if alias in aliases:
+            errors.append(f"{path}: alias {alias!r} is already used at {aliases[alias]}.")
+        else:
+            aliases[alias] = path
+
+    if node.get("parallel_aware") is True and not under_gather:
+        errors.append(f"{path}: parallel_aware is only valid below a Gather or Gather Merge.")
+
+    if node_type in GATHER and under_gather:
+        errors.append(f"{path}: a {node_type} cannot sit below another Gather.")
+
+    for number, child in enumerate(children):
+        # A subquery is planned on its own, so it starts outside any Gather.
+        subquery = child.get("parent_relationship") in SEPARATE_PLANS
+        below = not subquery and (under_gather or node_type in GATHER)
+        _check_agent_node(child, f"{path}.children[{number}]", aliases, below, errors)
+
+
+def _format_error(error: Any) -> str:
+    """Word one pydantic error with its path, such as plan.children[1].node_type."""
+    path = "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in error["loc"])
+    message = "unknown field" if error["type"] == "extra_forbidden" else error["msg"]
+    return f"{path.lstrip('.') or 'answer'}: {message}."
+
+
+def _json_text(text: str) -> str:
+    """The JSON object in text, without any Markdown fence or prose around it."""
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1] if start != -1 and end > start else text
