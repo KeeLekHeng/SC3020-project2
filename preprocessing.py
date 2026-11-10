@@ -1362,16 +1362,6 @@ def agent_user_prompt(query: str, database: DatabaseDescription) -> str:
     return "\n".join(lines)
 
 
-def agent_retry_prompt(errors: list[str]) -> str:
-    """Return the message that sends the problems in the agent's last answer back."""
-    problems = "\n".join(f"- {error}" for error in errors)
-    return (
-        f"Your plan cannot be used yet:\n{problems}\n\n"
-        "Fix these and answer again with the complete plan as one JSON object in the "
-        "same format."
-    )
-
-
 def get_agent_plan(
     connection: psycopg.Connection,
     query: str,
@@ -1483,10 +1473,16 @@ def ask_agent(
             return AgentResult(plan, answer.summary, query, text, problems)
 
         problems.append(errors)
+        listed = "\n".join(f"- {error}" for error in errors)
+        retry = (
+            f"Your plan cannot be used yet:\n{listed}\n\n"
+            "Fix these and answer again with the complete plan as one JSON object in the "
+            "same format."
+        )
         # Send the whole reply back unchanged, thinking blocks included.
         messages += [
             {"role": "assistant", "content": response.content},
-            {"role": "user", "content": agent_retry_prompt(errors)},
+            {"role": "user", "content": retry},
         ]
 
     raise AgentPlanError(errors, text)
