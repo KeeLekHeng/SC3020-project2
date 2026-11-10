@@ -19,7 +19,6 @@ names, so comparison.py works on one form for every source.
 
 import re
 import textwrap
-from collections import Counter
 from typing import Callable, Iterator
 
 import psycopg
@@ -300,10 +299,12 @@ JOIN_HINTS = {
     "Nested Loop": "NestLoop",
 }
 GATHER = ("Gather", "Gather Merge")
-# PostgreSQL's default join_collapse_limit and from_collapse_limit. A join of more
-# relations is planned in pieces, and from geqo_threshold (12) relations by GEQO; either
-# way PostgreSQL ignores Leading hints. Assumes the server's default settings.
-COLLAPSE_LIMIT = 8
+# join_collapse_limit and from_collapse_limit for a forced plan, above the relations any
+# join here reads. At the default 8, a larger join is planned in pieces, and from
+# geqo_threshold (12) relations by GEQO; either way PostgreSQL ignores Leading hints.
+# PostgreSQL 18 and later would also need enable_self_join_elimination off, or the
+# merged join may lose relations the plan has.
+COLLAPSE_LIMIT = 100
 SORTED_INPUT = {
     "Sort", "Incremental Sort", "Merge Join", "Merge Append", "Unique", "Group",
     "WindowAgg", "Gather Merge",
@@ -391,9 +392,9 @@ def build_hints(
       it can (see _orderable()), largest last, so the largest part is followed. A
       level whose top join gets no join hint gets no Leading hint, because
       pg_hint_plan disables every method for a join without one above a Leading hint.
-    - when the plan joins, or one SELECT of the query reads, more than COLLAPSE_LIMIT
-      relations, join_collapse_limit and from_collapse_limit high enough to plan it as
-      one join, with GEQO off, so the Leading hint applies
+    - for a plan with joins, join_collapse_limit and from_collapse_limit of
+      COLLAPSE_LIMIT, with GEQO off, so PostgreSQL plans each join as one and the
+      Leading hint applies
     - which scans run in parallel, and with how many workers; a plan without a Gather
       also gets Set(max_parallel_workers_per_gather 0), which turns parallelism off for
       the whole query
@@ -562,12 +563,8 @@ def build_hints(
         parts = [f"Leading({_format_leading(t)})" for tree in levels for t in _orderable(tree)]
         hints += dict.fromkeys(reversed(parts))
 
-    # PostgreSQL splits the join before it removes unneeded LEFT JOINs, so count the
-    # relations each query block reads as well as those the plan joins.
-    blocks = Counter(id(t.parent_select) for t in _relations(parsed)) if parsed else {}
-    size = max([0, *blocks.values(), *(len(_flatten(tree)) for tree in levels)])
-    if levels and size > COLLAPSE_LIMIT:
-        limits = [f"Set({limit}_collapse_limit {size})" for limit in ("join", "from")]
+    if levels:
+        limits = [f"Set({limit}_collapse_limit {COLLAPSE_LIMIT})" for limit in ("join", "from")]
         hints = [*limits, "Set(geqo off)", *hints]
 
     # A generated name is harmless while no join names it and its scan wants the hints

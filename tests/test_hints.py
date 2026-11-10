@@ -71,14 +71,14 @@ def test_switch_offs_cover_only_unused_operators() -> None:
     assert "Leading" not in build_hints(plan, query, leading=False)
 
 
-@pytest.mark.parametrize(("tables", "lifted"), [(8, False), (9, True)])
-def test_joins_past_the_collapse_limit_lift_the_limits(tables: int, lifted: bool) -> None:
+@pytest.mark.parametrize(("tables", "lifted"), [(1, False), (2, True)])
+def test_joins_lift_the_collapse_limits(tables: int, lifted: bool) -> None:
     query = "SELECT 1 FROM " + ", ".join(f"t{n}" for n in range(1, tables + 1))
 
     hints = build_hints(chain(tables), query)
 
-    assert (f"Set(join_collapse_limit {tables})" in hints) is lifted
-    assert (f"Set(from_collapse_limit {tables})" in hints) is lifted
+    assert ("Set(join_collapse_limit 100)" in hints) is lifted
+    assert ("Set(from_collapse_limit 100)" in hints) is lifted
     assert ("Set(geqo off)" in hints) is lifted
 
 
@@ -253,20 +253,6 @@ def test_join_below_an_unhinted_join_gets_no_leading_hint() -> None:
 
     assert "HashJoin(s n)" in hints
     assert "Leading" not in hints
-
-
-def test_collapse_limits_count_the_relations_the_query_reads() -> None:
-    # PostgreSQL may remove LEFT JOINs from the plan after it has split the join.
-    query = "SELECT 1 FROM " + " LEFT JOIN ".join(f"t{n}" for n in range(1, 10))
-
-    assert "Set(join_collapse_limit 9)" in build_hints(chain(5), query)
-
-
-def test_collapse_limits_ignore_tables_of_other_query_levels() -> None:
-    joined = " JOIN ".join(f"t{n}" for n in range(1, 6))
-    scalar = "(SELECT count(*) FROM u1, u2, u3, u4)"
-
-    assert "collapse_limit" not in build_hints(chain(5), f"SELECT {scalar} FROM {joined}")
 
 
 @pytest.mark.parametrize(
