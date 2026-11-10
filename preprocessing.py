@@ -1510,7 +1510,16 @@ def _agent_database_errors(
             "table the query reads."
         )
 
+    tables = {n.alias: n.relation for n in postgres_plan.walk() if n.relation and n.alias}
     for node in plan.walk():
+        table = tables.get(node.alias or "")
+        if node.relation and table and node.relation != table:
+            errors.append(
+                f"Scan of {node.alias}: {node.alias} reads the table {table}, so relation "
+                f"must be {table!r}, not {node.relation!r}."
+            )
+            continue
+
         known = database.indexes.get(node.relation or "", set())
         if node.index_name and node.index_name not in known:
             listed = ", ".join(sorted(known)) or "none"

@@ -421,6 +421,20 @@ def test_unknown_index_goes_back_to_the_agent() -> None:
     assert "'customer_idx' is not an index on customer. Its indexes are: customer_pkey." in retry
 
 
+def test_relation_that_is_not_the_aliased_table_goes_back_to_the_agent() -> None:
+    bad = answer()
+    join_of(bad)["children"][0].update(
+        node_type="Index Scan", relation="c", index_name="customer_pkey"
+    )
+    client = FakeClient(json.dumps(bad), json.dumps(answer()))
+
+    ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
+
+    retry = client.requests[1]["messages"][2]["content"]
+    assert "Scan of c: c reads the table customer, so relation must be 'customer', not 'c'." in retry
+    assert "not an index" not in retry
+
+
 def test_agent_gives_up_after_max_attempts() -> None:
     client = FakeClient("no plan", "still no plan")
 
