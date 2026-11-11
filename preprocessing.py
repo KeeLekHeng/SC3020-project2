@@ -995,8 +995,14 @@ AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "Aggregate": ("strategy",),
 }
 
-# Planner settings shown to the agent, because they shape which plan is cheapest.
-AGENT_SETTINGS = ("max_parallel_workers_per_gather", "work_mem")
+# Planner settings shown to the agent, because they shape which plan is cheapest: what
+# memory and workers a plan may use, what a random page costs beside a sequential one,
+# and when going parallel pays.
+AGENT_SETTINGS = (
+    "max_parallel_workers_per_gather", "work_mem", "effective_cache_size",
+    "seq_page_cost", "random_page_cost",
+    "parallel_setup_cost", "parallel_tuple_cost", "min_parallel_table_scan_size",
+)
 
 # Column statistics shown to the agent, beyond row and distinct counts:
 # - common values only when skewed: the most common covers at least MIN_COMMON of the
@@ -1177,36 +1183,32 @@ class AgentResult(NamedTuple):
     problems: list[list[str]]
 
 
-def validate_agent_plan(output: str | dict) -> AgentAnswer:
+def validate_agent_plan(output: str) -> AgentAnswer:
     """
     Check the agent's answer and return it as an AgentAnswer.
 
-    output is the agent's JSON, as text or already loaded. In text, anything around the
-    first JSON object, such as a Markdown fence, is ignored. Raises AgentPlanError listing
-    the problems, one stage at a time: JSON and schema errors, then ids and parents that
-    do not form one tree, then the structural rules (input counts, required and
-    misplaced fields, reused aliases, parallel operators outside a Gather). Operators
-    are named by id, as in "node 3".
+    output is the agent's text. Anything around its first JSON object, such as a
+    Markdown fence, is ignored. Raises AgentPlanError listing the problems, one stage at
+    a time: JSON and schema errors, then ids and parents that do not form one tree, then
+    the structural rules (input counts, required and misplaced fields, reused aliases,
+    parallel operators outside a Gather). Operators are named by id, as in "node 3".
     """
-    raw = output if isinstance(output, str) else json.dumps(output)
-    data: Any = output
-    if isinstance(output, str):
-        try:
-            data, _ = json.JSONDecoder().raw_decode(output, max(output.find("{"), 0))
-        except json.JSONDecodeError as error:
-            raise AgentPlanError(
-                [
-                    f"The answer is not valid JSON: {error}. Write one operator per "
-                    "line, and check that every { and [ is closed in order."
-                ],
-                raw,
-            ) from None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(output, max(output.find("{"), 0))
+    except json.JSONDecodeError as error:
+        raise AgentPlanError(
+            [
+                f"The answer is not valid JSON: {error}. Write one operator per line, "
+                "and check that every { and [ is closed in order."
+            ],
+            output,
+        ) from None
 
     try:
         answer = AgentAnswer.model_validate(data)
     except ValidationError as error:
         raise AgentPlanError(
-            [_format_error(e) for e in error.errors(include_url=False)], raw
+            [_format_error(e) for e in error.errors(include_url=False)], output
         ) from None
 
     errors: list[str] = []
@@ -1224,7 +1226,7 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
             errors.append(f"node {number}: parent {node.parent} is not the id of an earlier operator.")
 
     if errors:
-        raise AgentPlanError(errors, raw)
+        raise AgentPlanError(errors, output)
 
     children: dict[int, list[AgentPlanNode]] = {node.id: [] for node in answer.nodes}
     for node in answer.nodes:
@@ -1237,7 +1239,7 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
 
     _check_agent_node(root, children, {}, False, errors)
     if errors:
-        raise AgentPlanError(errors, raw)
+        raise AgentPlanError(errors, output)
 
     return answer
 
@@ -1276,8 +1278,9 @@ def describe_database(
     Describe the database for the agent, read from the catalogs at run time.
 
     The text gives the PostgreSQL version and AGENT_SETTINGS, then for each table its
-    row and page counts, its columns with types and distinct counts, its indexes and its
-    foreign keys. No schema is hardcoded.
+    row and page counts and how much of it is all-visible, its columns with types and
+    statistics (see _column_stats()), its indexes with their sizes, and its foreign
+    keys. No schema is hardcoded.
 
     With a query, only the tables it reads are described, with only the columns it
     names, and foreign keys only between those tables. A query sqlglot cannot parse
@@ -1289,17 +1292,19 @@ def describe_database(
     ranged = _range_columns(parsed) if parsed else None
 
     settings = connection.execute(
-        "SELECT name, setting, unit FROM pg_settings WHERE name = ANY(%s) ORDER BY name",
+        "SELECT name, current_setting(name) FROM unnest(%s::text[]) AS name",
         (list(AGENT_SETTINGS),),
     ).fetchall()
-    shown = ", ".join(f"{name}={value}{unit or ''}" for name, value, unit in settings)
-    lines = [f"Settings: {shown}"]
+    shown = ", ".join(f"{name}={value}" for name, value in settings)
+    # server_version can end with a packaging note, as in "16.4 (Debian 16.4-1)".
+    version = (connection.info.parameter_status("server_version") or "").split(" ")[0]
+    lines = [f"PostgreSQL {version}", f"Settings: {shown}"]
 
     tables = [
         row
         for row in connection.execute(
             """
-            SELECT c.oid, n.nspname, c.relname, c.reltuples, c.relpages
+            SELECT c.oid, n.nspname, c.relname, c.reltuples, c.relpages, c.relallvisible
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relkind IN ('r', 'p')
               AND n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -1310,7 +1315,7 @@ def describe_database(
         if wanted is None or row[2] in wanted
     ]
     oids = [oid for oid, *_ in tables]
-    names = {table for _, _, table, _, _ in tables}
+    names = {table for _, _, table, *_ in tables}
 
     columns: dict[int, list[str]] = {}
     for oid, name, type_name, *stats in connection.execute(
@@ -1318,7 +1323,8 @@ def describe_database(
         SELECT a.attrelid, a.attname, format_type(a.atttypid, a.atttypmod),
                c.reltuples, s.n_distinct, s.null_frac, t.typcategory,
                s.most_common_vals::text::text[], s.most_common_freqs,
-               s.histogram_bounds::text::text[], s.correlation
+               s.histogram_bounds::text::text[], s.correlation,
+               CASE WHEN t.typlen < 0 THEN s.avg_width END
         FROM pg_attribute a
         JOIN pg_class c ON c.oid = a.attrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1338,10 +1344,10 @@ def describe_database(
 
     index_text: dict[int, list[str]] = {}
     indexes: dict[str, set[str]] = {}
-    for oid, table, index, unique, definition in connection.execute(
+    for oid, table, index, unique, definition, pages in connection.execute(
         """
         SELECT i.indrelid, t.relname, ic.relname, i.indisunique,
-               pg_get_indexdef(i.indexrelid)
+               pg_get_indexdef(i.indexrelid), ic.relpages
         FROM pg_index i
         JOIN pg_class ic ON ic.oid = i.indexrelid
         JOIN pg_class t ON t.oid = i.indrelid
@@ -1350,9 +1356,12 @@ def describe_database(
         """,
         (oids,),
     ):
-        # "CREATE UNIQUE INDEX x ON t USING btree (a, b)" becomes "x unique btree (a, b)".
+        # "CREATE UNIQUE INDEX x ON t USING btree (a, b)" becomes
+        # "x unique btree (a, b), 12 pages".
         method = definition.partition(" USING ")[2]
-        index_text.setdefault(oid, []).append(f"{index} {'unique ' if unique else ''}{method}")
+        index_text.setdefault(oid, []).append(
+            f"{index} {'unique ' if unique else ''}{method}, {pages:,} page{'' if pages == 1 else 's'}"
+        )
         indexes.setdefault(table, set()).add(index)
 
     foreign_keys: dict[int, list[str]] = {}
@@ -1370,10 +1379,14 @@ def describe_database(
             keys, _, reference = definition.removeprefix("FOREIGN KEY ").partition(" REFERENCES ")
             foreign_keys.setdefault(oid, []).append(f"{keys.strip('()')} references {reference}")
 
-    for oid, schema, table, rows, pages in tables:
+    for oid, schema, table, rows, pages, visible in tables:
         name = table if schema == "public" else f"{schema}.{table}"
         plural = "" if pages == 1 else "s"
         size = f"~{round(rows):,} rows, {pages:,} page{plural}" if rows >= 0 else "size unknown"
+        # An Index Only Scan skips the table for rows on all-visible pages.
+        if pages:
+            size += f", {visible / pages:.0%} all-visible"
+
         lines.append(f"{name}: {size}")
         for label, items in (
             ("columns used" if used is not None else "columns", columns.get(oid)),
@@ -1468,8 +1481,8 @@ def ask_agent(
 
     Each answer is checked by validate_agent_plan(), then against the query and the
     database: the plan must scan exactly the table aliases the query reads
-    (query_relations()), every index must exist, and build_hints() must accept the plan. All problems go back in one retry
-    message, up to max_attempts answers in all.
+    (query_relations()), every index must exist, and build_hints() must accept the
+    plan. All problems go back in one retry message, up to max_attempts answers in all.
 
     The first answer is asked for at low effort (how hard the model thinks), any retry
     at medium.
@@ -1673,12 +1686,14 @@ def _column_stats(
     common_freqs: list[float] | None,
     histogram: list[str] | None,
     correlation: float | None,
+    width: int | None,
     show_range: bool,
 ) -> list[str]:
     """
     A column's statistics from pg_stats, worded for the prompt, most important first:
-    distinct count, NULL fraction, skewed common values, range (when show_range) and
-    correlation. See SKEW for which are shown.
+    distinct count, NULL fraction, skewed common values, range (when show_range),
+    correlation and, for a type of variable length, the average width. See SKEW for
+    which are shown.
 
     Only raw statistics are given, never an estimate for a condition in the query, so
     the agent reasons from the same inputs as PostgreSQL's planner rather than from its
@@ -1709,6 +1724,9 @@ def _column_stats(
     if correlation is not None and abs(correlation) > CORRELATED and distinct >= 2:
         order = "in" if correlation > 0 else "in reverse"
         details.append(f"table stored {order} this column's order")
+
+    if width is not None:
+        details.append(f"~{width} bytes")
 
     return details
 

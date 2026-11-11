@@ -19,6 +19,7 @@ from preprocessing import (
     AgentNodeType,
     AgentPlanError,
     DatabaseDescription,
+    PlanNode,
     agent_system_prompt,
     agent_user_prompt,
     ask_agent,
@@ -47,10 +48,16 @@ def answer() -> dict[str, Any]:
     return json.loads((FIXTURES / "agent_customer_orders.json").read_text(encoding="utf-8"))
 
 
-def errors_of(output: Any) -> list[str]:
-    """The problems validate_agent_plan() reports for output."""
+def plan_of(data: dict[str, Any]) -> PlanNode:
+    """The PlanNode tree of an answer given as data."""
+    return validate_agent_plan(json.dumps(data)).to_plan_node()
+
+
+def errors_of(output: str | dict[str, Any]) -> list[str]:
+    """The problems validate_agent_plan() reports for output, as text or as data."""
+    text = output if isinstance(output, str) else json.dumps(output)
     with pytest.raises(AgentPlanError) as caught:
-        validate_agent_plan(output)
+        validate_agent_plan(text)
 
     return caught.value.errors
 
@@ -73,7 +80,7 @@ def test_vocabulary_covers_every_forceable_operator() -> None:
 
 
 def test_sample_answer_becomes_a_plan_node_tree() -> None:
-    plan = validate_agent_plan(json.dumps(answer())).to_plan_node()
+    plan = plan_of(answer())
 
     assert [n.node_type for n in plan.walk()] == [
         "Aggregate", "Hash Join", "Seq Scan", "Hash", "Seq Scan"
@@ -108,7 +115,7 @@ def test_node_type_that_is_not_a_string_is_reported() -> None:
 
 
 def test_parsed_plan_builds_hints() -> None:
-    hints = build_hints(validate_agent_plan(answer()).to_plan_node(), QUERY)
+    hints = build_hints(plan_of(answer()), QUERY)
 
     assert "HashJoin(c o)" in hints
     assert "Leading((c o))" in hints
@@ -161,7 +168,7 @@ def test_marked_subquery_child_is_not_an_input() -> None:
     )
     add(data, 6, node_type="Seq Scan", relation="orders", alias="orders2")
 
-    plan = validate_agent_plan(data).to_plan_node()
+    plan = plan_of(data)
 
     join = plan.children[0]
     assert len(join.inputs) == 2
@@ -216,7 +223,7 @@ def test_parallel_operator_below_a_gather_is_accepted() -> None:
         below["parent"] += 1
     data["nodes"].insert(1, {"id": 2, "parent": 1, "node_type": "Gather", "workers_planned": 2})
 
-    plan = validate_agent_plan(data).to_plan_node()
+    plan = plan_of(data)
 
     assert "Parallel(c 2 hard)" in build_hints(plan, QUERY)
 
@@ -280,7 +287,7 @@ def test_children_keep_list_order_under_their_parent() -> None:
         {"id": 5, "parent": 1, "node_type": "Result", "reason": "third"},
     ]
 
-    plan = validate_agent_plan(data).to_plan_node()
+    plan = plan_of(data)
 
     assert [child.reason for child in plan.children] == ["first", "second", "third"]
     assert plan.children[1].children[0].reason == "inside"
@@ -365,7 +372,7 @@ def stats(**overrides: Any) -> list[str]:
     """_column_stats() for a plain 1,000-row column with 100 distinct values."""
     values: dict[str, Any] = dict(
         rows=1000, n_distinct=100, null_frac=0, category="N", common_values=None,
-        common_freqs=None, histogram=None, correlation=0.0, show_range=True,
+        common_freqs=None, histogram=None, correlation=0.0, width=None, show_range=True,
     )
     return _column_stats(**{**values, **overrides})
 
@@ -403,6 +410,10 @@ def test_column_stats_mention_strong_correlation() -> None:
     assert stats(correlation=-0.9)[-1] == "table stored in reverse this column's order"
     assert stats(correlation=0.3) == ["~100 distinct"]
     assert stats(n_distinct=1, correlation=1.0) == ["~1 distinct"]
+
+
+def test_column_stats_give_the_width_of_variable_length_types() -> None:
+    assert stats(width=27) == ["~100 distinct", "~27 bytes"]
 
 
 def test_range_columns_are_those_compared_with_inequalities() -> None:
@@ -540,8 +551,12 @@ def test_database_description_reads_the_catalogs(connection: psycopg.Connection)
     assert database.indexes["customer"] >= {"customer_pkey"}
     assert "lineitem: ~" in database.text
     assert "customer_pkey unique btree (c_custkey)" in database.text
-    assert database.text.startswith("Settings: max_parallel_workers_per_gather=")
-    assert "random_page_cost" not in database.text
+    version, settings = database.text.splitlines()[:2]
+    assert version == f"PostgreSQL {connection.info.server_version // 10000}.{connection.info.server_version % 100}"
+    assert settings.startswith("Settings: max_parallel_workers_per_gather=")
+    assert "random_page_cost=" in settings and "effective_cache_size=" in settings
+    assert "% all-visible" in database.text
+    assert "customer_pkey unique btree (c_custkey), " in database.text
 
 
 def test_database_description_keeps_only_what_the_query_reads(
