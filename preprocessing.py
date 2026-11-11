@@ -910,8 +910,18 @@ def _truncate(name: str, limit: int = NAME_LIMIT) -> str:
 
 def _relations(parsed: exp.Expr) -> list[exp.Table]:
     """Relations read in FROM and JOIN clauses, outermost first."""
-    tables = parsed.find_all(exp.Table)
-    return [t for t in tables if isinstance(t.parent, (exp.From, exp.Join))]
+    found = []
+    for table in parsed.find_all(exp.Table):
+        # sqlglot wraps a parenthesised join, as in FROM (a JOIN b ON ...), in a
+        # Subquery around its first table, once per pair of parentheses.
+        parent = table.parent
+        while isinstance(parent, exp.Subquery):
+            parent = parent.parent
+
+        if isinstance(parent, (exp.From, exp.Join)):
+            found.append(table)
+
+    return found
 
 
 

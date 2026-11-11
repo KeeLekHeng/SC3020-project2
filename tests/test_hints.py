@@ -352,6 +352,17 @@ def test_unique_aliases_leaves_a_name_also_used_bare() -> None:
     assert unique_aliases(query) == query
 
 
+def test_unique_aliases_renames_a_name_reused_inside_a_parenthesised_join() -> None:
+    query = (
+        "SELECT count(*) FROM (nation LEFT JOIN supplier ON s_nationkey = n_nationkey) "
+        "WHERE EXISTS (SELECT 1 FROM (nation JOIN region ON nation.n_regionkey = r_regionkey))"
+    )
+
+    assert unique_aliases(query) == query.replace(
+        "(nation JOIN region ON nation.", "(nation nation2 JOIN region ON nation2."
+    )
+
+
 def test_unique_aliases_renames_a_name_that_is_also_an_output_column() -> None:
     # As in TPC-H Q9, nation is a column the subquery outputs, never the table's row.
     query = (

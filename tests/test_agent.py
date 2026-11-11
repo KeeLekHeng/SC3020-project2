@@ -362,6 +362,17 @@ def test_query_relations_lists_tables_ctes_and_subqueries() -> None:
     assert query_relations("not sql at all (") is None
 
 
+def test_query_relations_lists_tables_inside_parenthesised_joins() -> None:
+    query = (
+        "SELECT count(*) FROM (nation n LEFT JOIN supplier s ON s.s_nationkey = n.n_nationkey) "
+        "JOIN ((region r)) ON n.n_regionkey = r.r_regionkey"
+    )
+
+    assert query_relations(query) == [
+        ("n", "nation", "table"), ("r", "region", "table"), ("s", "supplier", "table")
+    ]
+
+
 def stats(**overrides: Any) -> list[str]:
     """_column_stats() for a plain 1,000-row column with 100 distinct values."""
     values: dict[str, Any] = dict(
