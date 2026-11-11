@@ -1112,10 +1112,14 @@ class AgentAnswer(BaseModel):
     children, each naming its parent by id.
     """
 
+    # A stray field beside summary and nodes, such as a note, carries no plan, so it is
+    # ignored. The schema in the prompt still tells the agent not to add one.
     model_config = ConfigDict(
-        extra="forbid",
         frozen=True,
-        json_schema_extra={"description": "The answer: a summary and the plan's operators."},
+        json_schema_extra={
+            "description": "The answer: a summary and the plan's operators.",
+            "additionalProperties": False,
+        },
     )
 
     summary: str = Field("", description="One or two sentences on the overall strategy.")
@@ -1188,11 +1192,12 @@ def validate_agent_plan(output: str) -> AgentAnswer:
     Check the agent's answer and return it as an AgentAnswer.
 
     output is the agent's text. Anything around its first JSON object, such as a
-    Markdown fence, is ignored. Raises AgentPlanError listing the problems, one stage at
-    a time: JSON and schema errors, then ids and parents that do not form one tree (ids
-    may skip numbers, but not repeat), then the structural rules (input counts, required
-    and misplaced fields, reused aliases, parallel operators outside a Gather). Operators
-    are named by id, as in "node 3".
+    Markdown fence, is ignored, and so is a field beside summary and nodes. Raises
+    AgentPlanError listing the problems, one stage at a time: JSON and schema errors,
+    then ids and parents that do not form one tree (ids may skip numbers, but not
+    repeat), then the structural rules (input counts, required and misplaced fields,
+    reused aliases, parallel operators outside a Gather). Operators are named by id, as
+    in "node 3".
     """
     try:
         data, _ = json.JSONDecoder().raw_decode(output, max(output.find("{"), 0))

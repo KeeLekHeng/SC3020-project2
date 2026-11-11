@@ -122,6 +122,14 @@ def test_parsed_plan_builds_hints() -> None:
     assert "Set(max_parallel_workers_per_gather 0)" in hints
 
 
+def test_unknown_field_beside_summary_and_nodes_is_ignored() -> None:
+    data = answer()
+    expected = plan_of(data)
+    data["_note"] = "The join order follows the filters."
+
+    assert plan_of(data) == expected
+
+
 def test_unknown_operator_and_field_are_reported() -> None:
     data = answer()
     node(data, 1)["node_type"] = "Hash Aggregate"
@@ -311,21 +319,21 @@ def test_children_keep_list_order_under_their_parent() -> None:
 
 def test_problems_are_reported_one_stage_at_a_time() -> None:
     data = answer()
-    data["extra"] = True
+    node(data, 1)["extra"] = True
     node(data, 2)["join_type"] = "Cross"
     node(data, 3)["alias"] = "o"
     node(data, 5)["parent"] = 9
 
     schema = errors_of(data)
-    del data["extra"]
+    del node(data, 1)["extra"]
     node(data, 2)["join_type"] = "Inner"
     tree = errors_of(data)
     node(data, 5)["parent"] = 4
     rules = errors_of(data)
 
     assert len(schema) == 2
-    assert schema[0].startswith("node 2.join_type: ")
-    assert schema[1] == "extra: unknown field."
+    assert schema[0] == "node 1.extra: unknown field."
+    assert schema[1].startswith("node 2.join_type: ")
     assert tree == ["node 5: parent 9 is not the id of an earlier operator."]
     assert rules == ["node 5: alias 'o' is already used at node 3."]
 

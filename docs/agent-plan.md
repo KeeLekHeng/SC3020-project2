@@ -62,7 +62,7 @@ The 21 operators are: Seq Scan, Index Scan, Index Only Scan, Bitmap Heap Scan, H
 
 `validate_agent_plan()` checks in three stages. It stops at the first stage that finds problems, and reports all the problems of that stage:
 
-1. The text holds valid JSON with the fields, types and allowed values above.
+1. The text holds valid JSON with the fields, types and allowed values above. An unknown field on an operator is an error. An unknown field beside `summary` and `nodes` is ignored, because it carries no part of the plan.
 2. The ids and parents form one tree.
 3. The plan rules hold: each operator has the right number of inputs, such as two for a join and none for a scan, not counting subqueries; it has its required fields, such as `alias` on a scan; no alias is used twice; and parallel operators sit below a Gather or Gather Merge.
 
@@ -118,7 +118,7 @@ The flat list was checked as the rules above describe, so ids could skip a numbe
 
 No single number proves the choice. In the first test, with 44 conversations per format, a difference of a few answers can be chance, and that applies to the 95% against 82% and 86% as much as to the format failures. In the second, the typed union was not measurably better. The flat list was chosen because no format was measurably more reliable, it needs no API feature, and it is the simplest to handle:
 
-- **Format failures are rare.** 2 in the 242 conversations of both tests, each a field the agent invented.
+- **Format failures are rare.** 2 in the 242 conversations of both tests, each an invented field beside `summary` and `nodes`. The check ignores such a field, so it no longer rejects answers like these.
 - **No brackets to balance.** Each entry closes before the next begins, however deep the plan is.
 - **SQL goes in as it is.** A condition is an ordinary JSON string.
 - **Little code.** Rebuilding the tree means attaching each entry to its parent. A JSON parser and pydantic, a Python validation library, do the rest.
