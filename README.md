@@ -57,7 +57,7 @@ Enter your PostgreSQL password when prompted. Change these settings in `project.
 2. **The agent's plan.** It asks the AI agent for its plan, prints the plan and the agent's strategy, and forces that plan the same way. This step needs the Anthropic API key and costs a fraction of a US cent per query.
 3. **The differences.** It lists every decision that PostgreSQL's plan and the agent's forced plan made differently, as `differences()` reports them.
 
-If `pg_hint_plan` cannot be loaded, no API key is set, or the agent gives no usable plan, it says so and stops there. It uses `EXPLAIN` without `ANALYZE`, so the query does not run.
+[docs/plan-forcing.md](docs/plan-forcing.md) describes the hints and what they cannot force. If `pg_hint_plan` cannot be loaded, no API key is set, or the agent gives no usable plan, the script says so and stops there. It uses `EXPLAIN` without `ANALYZE`, so the query does not run.
 
 ## Get the AI agent's plan
 
@@ -150,6 +150,7 @@ Tests that need the database are skipped when it is unavailable. All use `EXPLAI
 | `project.py` | Prompts for the password and runs the pipeline on `query.sql`: PostgreSQL's plan, the same plan forced back as a check, the agent's plan, that plan forced, and the decisions the two made differently. |
 | `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
+| `docs/plan-forcing.md` | The hints that force a plan, how a forced plan is checked, how well forcing works, and what cannot be forced. |
 | `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |
 | `tests/` | The tests above; `tests/fixtures/` holds a sample agent answer. |
 | `agent_runs/` | Not in git: raw agent answers and rendered prompts from local runs. |

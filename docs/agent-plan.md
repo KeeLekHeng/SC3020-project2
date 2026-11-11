@@ -142,7 +142,7 @@ Hints can only control certain things, and a plan that cannot be forced cannot b
 
 ## What forcing cannot guarantee
 
-A usable plan can be turned into hints. That does not mean PostgreSQL builds exactly that plan.
+A usable plan can be turned into hints. That does not mean PostgreSQL builds exactly that plan. [Forcing a plan: hints and limits](plan-forcing.md) has the full account; this section covers what matters for the agent's plans.
 
 - **What hints control.** How each alias is scanned and with which index, the join methods, the join order, and which scans run in parallel with how many workers.
 - **What they do not control.** How rows are grouped and sorted, operators such as Limit and Materialize, and where the Gather sits in the tree. PostgreSQL chooses these itself around the forced scans and joins. The agent's choices for them are not forced, but `differences()` still compares them with PostgreSQL's. The conditions and reasons the agent writes are not forced either: PostgreSQL works out the conditions from the query, and the agent's are for people reading the plan.
