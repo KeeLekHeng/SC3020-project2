@@ -63,9 +63,17 @@ def errors_of(output: Any) -> list[str]:
     return caught.value.errors
 
 
-def join_of(data: dict[str, Any]) -> dict[str, Any]:
-    """The Hash Join under the sample answer's Aggregate."""
-    return data["plan"]["children"][0]
+def node(data: dict[str, Any], number: int) -> dict[str, Any]:
+    """
+    The sample answer's operator with that id: 1 Aggregate, 2 Hash Join, 3 Seq Scan of
+    c, 4 Hash, 5 Seq Scan of o.
+    """
+    return data["nodes"][number - 1]
+
+
+def add(data: dict[str, Any], parent: int, **fields: Any) -> None:
+    """Append an operator under parent, with the next id."""
+    data["nodes"].append({"id": len(data["nodes"]) + 1, "parent": parent, **fields})
 
 
 def test_vocabulary_covers_every_forceable_operator() -> None:
@@ -73,7 +81,7 @@ def test_vocabulary_covers_every_forceable_operator() -> None:
 
 
 def test_sample_answer_becomes_a_plan_node_tree() -> None:
-    plan = validate_agent_plan(json.dumps(answer())).plan.to_plan_node()
+    plan = validate_agent_plan(json.dumps(answer())).to_plan_node()
 
     assert [n.node_type for n in plan.walk()] == [
         "Aggregate", "Hash Join", "Seq Scan", "Hash", "Seq Scan"
@@ -90,19 +98,25 @@ def test_answer_inside_a_markdown_fence_is_accepted() -> None:
     assert validate_agent_plan(text).summary.startswith("Hash the filtered orders")
 
 
+def test_text_after_the_answer_is_ignored() -> None:
+    text = json.dumps(answer()) + "\n}\nThe plan above uses {braces}."
+
+    assert len(validate_agent_plan(text).nodes) == 5
+
+
 def test_text_that_is_not_json_is_rejected() -> None:
     assert errors_of("I would scan customer first.")[0].startswith("The answer is not valid JSON")
 
 
 def test_node_type_that_is_not_a_string_is_reported() -> None:
     data = answer()
-    data["plan"]["node_type"] = ["Hash Join"]
+    node(data, 1)["node_type"] = ["Hash Join"]
 
-    assert any(e.startswith("plan.node_type: Input should be") for e in errors_of(data))
+    assert any(e.startswith("node 1.node_type: Input should be") for e in errors_of(data))
 
 
 def test_parsed_plan_builds_hints() -> None:
-    hints = build_hints(validate_agent_plan(answer()).plan.to_plan_node(), QUERY)
+    hints = build_hints(validate_agent_plan(answer()).to_plan_node(), QUERY)
 
     assert "HashJoin(c o)" in hints
     assert "Leading((c o))" in hints
@@ -111,33 +125,34 @@ def test_parsed_plan_builds_hints() -> None:
 
 def test_unknown_operator_and_field_are_reported() -> None:
     data = answer()
-    data["plan"]["node_type"] = "Hash Aggregate"
-    data["plan"]["cost"] = 12.5
+    node(data, 1)["node_type"] = "Hash Aggregate"
+    node(data, 1)["cost"] = 12.5
+    node(data, 2)["children"] = []
 
     errors = errors_of(data)
 
-    assert any(e.startswith("plan.node_type: Input should be") for e in errors)
-    assert "plan.cost: unknown field." in errors
+    assert any(e.startswith("node 1.node_type: Input should be") for e in errors)
+    assert "node 1.cost: unknown field." in errors
+    assert "node 2.children: unknown field." in errors
 
 
 def test_bad_join_type_is_reported() -> None:
     data = answer()
-    join_of(data)["join_type"] = "Cross"
+    node(data, 2)["join_type"] = "Cross"
 
-    assert any(e.startswith("plan.children[0].join_type:") for e in errors_of(data))
+    assert any(e.startswith("node 2.join_type:") for e in errors_of(data))
 
 
 def test_join_with_one_input_is_reported() -> None:
     data = answer()
-    join_of(data)["children"].pop()
+    del data["nodes"][3:]
 
-    assert "plan.children[0]: a Hash Join takes 2 input(s), but has 1." in errors_of(data)
+    assert errors_of(data) == ["node 2: a Hash Join takes 2 input(s), but has 1."]
 
 
 def test_unmarked_subquery_child_is_reported_as_an_extra_input() -> None:
     data = answer()
-    subquery = {"node_type": "Seq Scan", "relation": "orders", "alias": "orders2"}
-    join_of(data)["children"].append(subquery)
+    add(data, 2, node_type="Seq Scan", relation="orders", alias="orders2")
 
     errors = errors_of(data)
 
@@ -148,16 +163,13 @@ def test_unmarked_subquery_child_is_reported_as_an_extra_input() -> None:
 
 def test_marked_subquery_child_is_not_an_input() -> None:
     data = answer()
-    subquery = {
-        "node_type": "Aggregate",
-        "strategy": "Plain",
-        "parent_relationship": "SubPlan",
-        "subplan_name": "SubPlan 1",
-        "children": [{"node_type": "Seq Scan", "relation": "orders", "alias": "orders2"}],
-    }
-    join_of(data)["children"].append(subquery)
+    add(
+        data, 2, node_type="Aggregate", strategy="Plain",
+        parent_relationship="SubPlan", subplan_name="SubPlan 1",
+    )
+    add(data, 6, node_type="Seq Scan", relation="orders", alias="orders2")
 
-    plan = validate_agent_plan(data).plan.to_plan_node()
+    plan = validate_agent_plan(data).to_plan_node()
 
     join = plan.children[0]
     assert len(join.inputs) == 2
@@ -167,31 +179,25 @@ def test_marked_subquery_child_is_not_an_input() -> None:
 
 def test_scan_without_relation_or_alias_is_reported() -> None:
     data = answer()
-    scan = join_of(data)["children"][0]
-    del scan["relation"], scan["alias"]
+    del node(data, 3)["relation"], node(data, 3)["alias"]
 
     errors = errors_of(data)
 
-    assert "plan.children[0].children[0]: a Seq Scan needs relation." in errors
-    assert "plan.children[0].children[0]: a Seq Scan needs alias." in errors
+    assert "node 3: a Seq Scan needs relation." in errors
+    assert "node 3: a Seq Scan needs alias." in errors
 
 
 def test_reused_alias_is_reported() -> None:
     data = answer()
-    join_of(data)["children"][1]["children"][0]["alias"] = "c"
+    node(data, 5)["alias"] = "c"
 
-    errors = errors_of(data)
-
-    assert errors == [
-        "plan.children[0].children[1].children[0]: alias 'c' is already used at "
-        "plan.children[0].children[0]."
-    ]
+    assert errors_of(data) == ["node 5: alias 'c' is already used at node 3."]
 
 
 def test_misplaced_fields_are_reported() -> None:
     data = answer()
-    join_of(data)["children"][0]["index_name"] = "customer_pkey"
-    data["plan"]["join_type"] = "Inner"
+    node(data, 3)["index_name"] = "customer_pkey"
+    node(data, 1)["join_type"] = "Inner"
 
     errors = errors_of(data)
 
@@ -201,60 +207,122 @@ def test_misplaced_fields_are_reported() -> None:
 
 def test_parallel_operator_needs_a_gather_above() -> None:
     data = answer()
-    join_of(data)["children"][0]["parallel_aware"] = True
+    node(data, 3)["parallel_aware"] = True
 
     assert errors_of(data) == [
-        "plan.children[0].children[0]: parallel_aware is only valid below a Gather or "
-        "Gather Merge."
+        "node 3: parallel_aware is only valid below a Gather or Gather Merge."
     ]
 
 
 def test_parallel_operator_below_a_gather_is_accepted() -> None:
     data = answer()
-    join = join_of(data)
-    join["parallel_aware"] = True
-    join["children"][0]["parallel_aware"] = True
-    data["plan"]["children"] = [
-        {"node_type": "Gather", "workers_planned": 2, "children": [join]}
-    ]
+    node(data, 2)["parallel_aware"] = True
+    node(data, 3)["parallel_aware"] = True
+    # Put a Gather between the Aggregate and the Hash Join.
+    for below in data["nodes"][1:]:
+        below["id"] += 1
+        below["parent"] += 1
+    data["nodes"].insert(1, {"id": 2, "parent": 1, "node_type": "Gather", "workers_planned": 2})
 
-    plan = validate_agent_plan(data).plan.to_plan_node()
+    plan = validate_agent_plan(data).to_plan_node()
 
     assert "Parallel(c 2 hard)" in build_hints(plan, QUERY)
 
 
 def test_root_cannot_be_a_subquery() -> None:
     data = answer()
-    data["plan"]["parent_relationship"] = "InitPlan"
+    node(data, 1)["parent_relationship"] = "InitPlan"
 
-    assert "plan: the root operator cannot be a subquery (parent_relationship)." in errors_of(data)
+    assert "node 1: the root operator cannot be a subquery (parent_relationship)." in errors_of(data)
 
 
-def test_schema_problems_are_reported_before_structural_ones() -> None:
+def test_ids_must_count_from_one_in_list_order() -> None:
+    data = answer()
+    for entry in data["nodes"]:
+        entry["id"] -= 1
+
+    assert errors_of(data)[0] == (
+        "node 0: ids count 1, 2, 3, ... in list order, so this operator's id must be 1."
+    )
+
+
+def test_parent_must_be_an_earlier_operator() -> None:
+    data = answer()
+    node(data, 3)["parent"] = 4
+    node(data, 5)["parent"] = 5
+
+    assert errors_of(data) == [
+        "node 3: parent 4 is not the id of an earlier operator.",
+        "node 5: parent 5 is not the id of an earlier operator.",
+    ]
+
+
+def test_plan_has_exactly_one_root() -> None:
+    data = answer()
+    node(data, 1)["parent"] = 2
+    node(data, 4)["parent"] = None
+
+    assert errors_of(data) == [
+        "node 1: the first operator is the root, so its parent must be null.",
+        "node 4: only node 1 is the root, so this operator needs a parent.",
+    ]
+
+
+def test_answer_without_operators_is_reported() -> None:
+    assert errors_of({"summary": "Nothing to do.", "nodes": []})[0].startswith("nodes: ")
+
+
+def test_answer_with_too_many_operators_is_reported() -> None:
+    chain = [{"id": n, "parent": n - 1 or None, "node_type": "Limit"} for n in range(1, 5001)]
+
+    assert errors_of({"nodes": chain})[0].startswith("nodes: ")
+
+
+def test_children_keep_list_order_under_their_parent() -> None:
+    data = answer()
+    data["nodes"] = [
+        {"id": 1, "parent": None, "node_type": "Append"},
+        {"id": 2, "parent": 1, "node_type": "Result", "reason": "first"},
+        {"id": 3, "parent": 1, "node_type": "Limit", "reason": "second"},
+        {"id": 4, "parent": 3, "node_type": "Result", "reason": "inside"},
+        {"id": 5, "parent": 1, "node_type": "Result", "reason": "third"},
+    ]
+
+    plan = validate_agent_plan(data).to_plan_node()
+
+    assert [child.reason for child in plan.children] == ["first", "second", "third"]
+    assert plan.children[1].children[0].reason == "inside"
+
+
+def test_problems_are_reported_one_stage_at_a_time() -> None:
     data = answer()
     data["extra"] = True
-    join = join_of(data)
-    join["join_type"] = "Cross"
-    join["children"][0]["alias"] = "o"
+    node(data, 2)["join_type"] = "Cross"
+    node(data, 3)["alias"] = "o"
+    node(data, 5)["parent"] = 9
 
-    first = errors_of(data)
+    schema = errors_of(data)
     del data["extra"]
-    join["join_type"] = "Inner"
-    second = errors_of(data)
+    node(data, 2)["join_type"] = "Inner"
+    tree = errors_of(data)
+    node(data, 5)["parent"] = 4
+    rules = errors_of(data)
 
-    assert len(first) == 2
-    assert len(second) == 1
-    assert "alias 'o' is already used" in second[0]
+    assert len(schema) == 2
+    assert schema[0].startswith("node 2.join_type: ")
+    assert schema[1] == "extra: unknown field."
+    assert tree == ["node 5: parent 9 is not the id of an earlier operator."]
+    assert rules == ["node 5: alias 'o' is already used at node 3."]
 
 
 def test_relation_mismatches() -> None:
-    agent = validate_agent_plan(answer()).plan.to_plan_node()
+    agent = validate_agent_plan(answer()).to_plan_node()
 
     assert relation_mismatches(agent, postgres_plan()) == (set(), set())
 
     data = answer()
-    join_of(data)["children"][0]["alias"] = "customer"
-    missing, extra = relation_mismatches(validate_agent_plan(data).plan.to_plan_node(), postgres_plan())
+    node(data, 3)["alias"] = "customer"
+    missing, extra = relation_mismatches(validate_agent_plan(data).to_plan_node(), postgres_plan())
 
     assert (missing, extra) == ({"c"}, {"customer"})
 
@@ -264,13 +332,15 @@ def test_system_prompt_is_static_and_free_of_schema_noise() -> None:
 
     assert prompt == agent_system_prompt()
     assert '"AgentPlanNode"' in prompt
+    assert '"parent":{"description":"The id of the operator this one is a child of; null on the root.","type":["integer","null"]}' in prompt
+    assert '"children"' not in prompt
     assert '"title"' not in prompt
     assert '"anyOf"' not in prompt
     assert "customer" in prompt and "lineitem" not in prompt
 
 
 def test_prompt_example_is_a_valid_answer_without_aliases() -> None:
-    plan = validate_agent_plan(AGENT_EXAMPLE).plan.to_plan_node()
+    plan = validate_agent_plan(AGENT_EXAMPLE).to_plan_node()
 
     assert plan.relations() == {"customer", "orders"}
 
@@ -397,7 +467,7 @@ def test_good_first_answer_is_accepted() -> None:
 
 def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
     bad = answer()
-    join_of(bad)["children"][0]["alias"] = "customer"
+    node(bad, 3)["alias"] = "customer"
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
     result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
@@ -412,7 +482,7 @@ def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
 
 def test_unknown_index_goes_back_to_the_agent() -> None:
     bad = answer()
-    join_of(bad)["children"][0].update(node_type="Index Scan", index_name="customer_idx")
+    node(bad, 3).update(node_type="Index Scan", index_name="customer_idx")
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
     ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
@@ -423,9 +493,7 @@ def test_unknown_index_goes_back_to_the_agent() -> None:
 
 def test_relation_that_is_not_the_aliased_table_goes_back_to_the_agent() -> None:
     bad = answer()
-    join_of(bad)["children"][0].update(
-        node_type="Index Scan", relation="c", index_name="customer_pkey"
-    )
+    node(bad, 3).update(node_type="Index Scan", relation="c", index_name="customer_pkey")
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
     ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())

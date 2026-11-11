@@ -19,9 +19,10 @@ names, so comparison.py works on one form for every source.
 The AI agent's side:
 
 - get_agent_plan() asks an LLM for its plan for a query and returns it as a PlanNode.
-  The answer must match AgentAnswer, whose AgentPlanNode tree is the subset of PlanNode
-  the agent decides. validate_agent_plan() checks an answer, and every problem goes back
-  to the agent in a retry message.
+  The answer must match AgentAnswer: a flat list of AgentPlanNode operators, each
+  naming its parent, with the subset of PlanNode's fields the agent decides.
+  validate_agent_plan() checks an answer, and every problem goes back to the agent in a
+  retry message.
 - describe_database() reads the schema, statistics and indexes the agent plans with.
 """
 
@@ -946,6 +947,11 @@ AgentNodeType = Literal[
 AgentJoinType = Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Right Anti"]
 AgentStrategy = Literal["Plain", "Sorted", "Hashed", "Mixed"]
 
+# Operators allowed in one answer: far above any real plan, and few enough that the
+# deepest possible tree stays inside pydantic's nesting limit of 255 levels and
+# Python's recursion limit.
+AGENT_MAX_NODES = 200
+
 # Scans that name an index.
 INDEXED = ("Index Scan", "Index Only Scan", "Bitmap Heap Scan")
 
@@ -1001,13 +1007,15 @@ RANGE_CONDITIONS = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between)
 
 class AgentPlanNode(BaseModel):
     """
-    One operator in the AI agent's plan: the subset of PlanNode the agent decides.
+    One operator in the AI agent's plan: its place in the tree and the subset of
+    PlanNode the agent decides.
 
-    Field names match PlanNode's, so to_plan_node() is a plain dump and validate.
-    Costs, row counts and timings are left out, because the agent is asked for its
-    choices, not for estimates. The field descriptions, and the description in
-    model_config instead of this docstring, are part of the JSON Schema in the agent's
-    prompt.
+    The agent writes the tree as a flat list (see AgentAnswer), because in a nested
+    tree it loses count of the closing brackets. id and parent place the operator; the
+    other field names match PlanNode's. Costs, row counts and timings are left out,
+    because the agent is asked for its choices, not for estimates. The field
+    descriptions, and the description in model_config instead of this docstring, are
+    part of the JSON Schema in the agent's prompt.
     """
 
     model_config = ConfigDict(
@@ -1016,13 +1024,13 @@ class AgentPlanNode(BaseModel):
         json_schema_extra={"description": "One operator of the plan."},
     )
 
-    node_type: AgentNodeType = Field(description="PostgreSQL operator name.")
-    children: tuple["AgentPlanNode", ...] = Field(
-        (),
-        description="Child operators. Inputs come first: a join has exactly two, the "
-        "outer input then the inner input. Subqueries this operator uses come after, "
-        "each marked with parent_relationship.",
+    id: int = Field(description="This operator's number: 1, 2, 3, ... in list order.")
+    parent: int | None = Field(
+        description="The id of the operator this one is a child of; null on the root.",
+        # _LeanSchema drops the null of optional fields, but this one is required.
+        json_schema_extra={"type": ["integer", "null"]},
     )
+    node_type: AgentNodeType = Field(description="PostgreSQL operator name.")
     parent_relationship: Literal["InitPlan", "SubPlan"] | None = Field(
         None,
         description='Only on a separately planned subquery: "InitPlan" if it runs once '
@@ -1079,22 +1087,44 @@ class AgentPlanNode(BaseModel):
         None, description="One short sentence on why this operator was chosen."
     )
 
-    def to_plan_node(self) -> PlanNode:
-        """Return this tree as a PlanNode tree, ready for build_hints() or comparison."""
-        return PlanNode.model_validate(self.model_dump(exclude_defaults=True))
-
 
 class AgentAnswer(BaseModel):
-    """The whole answer the agent must give: a summary of its strategy and its plan."""
+    """
+    The whole answer the agent must give: a summary of its strategy and its plan.
+
+    The plan is a tree written as a list: the root first, every operator before its
+    children, each naming its parent by id.
+    """
 
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
-        json_schema_extra={"description": "The answer: a summary and the plan's root operator."},
+        json_schema_extra={"description": "The answer: a summary and the plan's operators."},
     )
 
     summary: str = Field("", description="One or two sentences on the overall strategy.")
-    plan: AgentPlanNode = Field(description="The root operator of the plan.")
+    nodes: tuple[AgentPlanNode, ...] = Field(
+        min_length=1,
+        max_length=AGENT_MAX_NODES,
+        description="The plan's operators, the root first, each before its children.",
+    )
+
+    def to_plan_node(self) -> PlanNode:
+        """
+        Return the plan as a PlanNode tree, ready for build_hints() or comparison.
+
+        The answer must come from validate_agent_plan(), which checks the ids and
+        parents this relies on.
+        """
+        nodes = {
+            node.id: node.model_dump(exclude={"id", "parent"}, exclude_defaults=True)
+            for node in self.nodes
+        }
+        for node in self.nodes:
+            if node.parent:
+                nodes[node.parent].setdefault("children", []).append(nodes[node.id])
+
+        return PlanNode.model_validate(nodes[1])
 
 
 class AgentPlanError(ValueError):
@@ -1141,21 +1171,23 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
     """
     Check the agent's answer and return it as an AgentAnswer.
 
-    output is the agent's JSON, as text or already loaded. Raises AgentPlanError listing
-    the problems: JSON and schema errors first, then, once the schema holds, the
-    structural rules (input counts, required and misplaced fields, reused aliases,
-    parallel operators outside a Gather).
+    output is the agent's JSON, as text or already loaded. In text, anything around the
+    first JSON object, such as a Markdown fence, is ignored. Raises AgentPlanError listing
+    the problems, one stage at a time: JSON and schema errors, then ids and parents that
+    do not form one tree, then the structural rules (input counts, required and
+    misplaced fields, reused aliases, parallel operators outside a Gather). Operators
+    are named by id, as in "node 3".
     """
     raw = output if isinstance(output, str) else json.dumps(output)
     data: Any = output
     if isinstance(output, str):
         try:
-            data = json.loads(_json_text(output))
+            data, _ = json.JSONDecoder().raw_decode(output, max(output.find("{"), 0))
         except json.JSONDecodeError as error:
             raise AgentPlanError(
                 [
-                    f"The answer is not valid JSON: {error}. Write it indented, one "
-                    "field per line, and check that every { and [ is closed in order."
+                    f"The answer is not valid JSON: {error}. Write one operator per "
+                    "line, and check that every { and [ is closed in order."
                 ],
                 raw,
             ) from None
@@ -1168,10 +1200,32 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
         ) from None
 
     errors: list[str] = []
-    if answer.plan.parent_relationship:
-        errors.append("plan: the root operator cannot be a subquery (parent_relationship).")
+    for number, node in enumerate(answer.nodes, 1):
+        if node.id != number:
+            errors.append(
+                f"node {node.id}: ids count 1, 2, 3, ... in list order, so this operator's "
+                f"id must be {number}."
+            )
+        elif number == 1 and node.parent is not None:
+            errors.append("node 1: the first operator is the root, so its parent must be null.")
+        elif number > 1 and node.parent is None:
+            errors.append(f"node {number}: only node 1 is the root, so this operator needs a parent.")
+        elif node.parent is not None and not 1 <= node.parent < number:
+            errors.append(f"node {number}: parent {node.parent} is not the id of an earlier operator.")
 
-    _check_agent_node(answer.plan, "plan", {}, False, errors)
+    if errors:
+        raise AgentPlanError(errors, raw)
+
+    children: dict[int, list[AgentPlanNode]] = {node.id: [] for node in answer.nodes}
+    for node in answer.nodes:
+        if node.parent:
+            children[node.parent].append(node)
+
+    root = answer.nodes[0]
+    if root.parent_relationship:
+        errors.append("node 1: the root operator cannot be a subquery (parent_relationship).")
+
+    _check_agent_node(root, children, {}, False, errors)
     if errors:
         raise AgentPlanError(errors, raw)
 
@@ -1464,7 +1518,7 @@ def ask_agent(
         )
         try:
             answer = validate_agent_plan(text)
-            plan = answer.plan.to_plan_node()
+            plan = answer.to_plan_node()
             errors = _agent_database_errors(plan, postgres_plan, query, database)
         except AgentPlanError as error:
             errors = error.errors
@@ -1534,16 +1588,22 @@ def _agent_database_errors(
 
 
 def _check_agent_node(
-    node: AgentPlanNode, path: str, aliases: dict[str, str], under_gather: bool, errors: list[str]
+    node: AgentPlanNode,
+    children: dict[int, list[AgentPlanNode]],
+    aliases: dict[str, str],
+    under_gather: bool,
+    errors: list[str],
 ) -> None:
     """
-    Add the structural problems of the agent node at path and its subtree to errors.
+    Add the structural problems of the agent node and its subtree to errors.
 
-    aliases maps each alias seen so far to where it was seen; under_gather means a
-    Gather above node is in the same query level.
+    children holds each operator's children by its id; aliases maps each alias seen so
+    far to the operator that has it; under_gather means a Gather above node is in the
+    same query level.
     """
+    path = f"node {node.id}"
     node_type = node.node_type
-    inputs = [c for c in node.children if c.parent_relationship not in SEPARATE_PLANS]
+    inputs = [c for c in children[node.id] if c.parent_relationship not in SEPARATE_PLANS]
 
     if node_type in AGENT_INPUT_COUNTS:
         low, high = AGENT_INPUT_COUNTS[node_type]
@@ -1584,24 +1644,22 @@ def _check_agent_node(
     if node_type in GATHER and under_gather:
         errors.append(f"{path}: a {node_type} cannot sit below another Gather.")
 
-    for number, child in enumerate(node.children):
+    for child in children[node.id]:
         # A subquery is planned on its own, so it starts outside any Gather.
         subquery = child.parent_relationship in SEPARATE_PLANS
         below = not subquery and (under_gather or node_type in GATHER)
-        _check_agent_node(child, f"{path}.children[{number}]", aliases, below, errors)
+        _check_agent_node(child, children, aliases, below, errors)
 
 
 def _format_error(error: Any) -> str:
-    """Word one pydantic error with its path, such as plan.children[1].node_type."""
-    path = "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in error["loc"])
+    """Word one pydantic error with where it is, such as node 3.join_type."""
+    place = error["loc"]
+    if place[:1] == ("nodes",) and len(place) > 1:
+        # Ids count from 1 in list order, so the operator at index 2 is node 3.
+        place = (f"node {place[1] + 1}", *place[2:])
+
     message = "unknown field" if error["type"] == "extra_forbidden" else error["msg"]
-    return f"{path.lstrip('.') or 'answer'}: {message}."
-
-
-def _json_text(text: str) -> str:
-    """The JSON object in text, without any Markdown fence or prose around it."""
-    start, end = text.find("{"), text.rfind("}")
-    return text[start:end + 1] if start != -1 and end > start else text
+    return f"{'.'.join(str(p) for p in place) or 'answer'}: {message}."
 
 
 def _column_stats(
@@ -1698,10 +1756,18 @@ The plan is forced on PostgreSQL with pg_hint_plan hints, which name tables by a
 indexes by name. So use PostgreSQL's operator names, exactly the aliases listed with \
 the query, and only listed indexes.
 
-Answer with one JSON object and nothing else, indented with one field per line, \
-matching this JSON Schema. Leave out fields that do not apply.
+Answer with one JSON object and nothing else, matching this JSON Schema. Leave out \
+fields that do not apply.
 
 {schema}
+
+The plan is a tree written as a flat list. "nodes" holds one entry per operator, on one \
+line each, the root first and every operator before its children, in the order EXPLAIN \
+prints them. Each entry has its own id (1, 2, 3, ...) and parent, the id of the operator \
+it is a child of; the root's parent is null. An operator's children are the entries that \
+name it as parent, in list order: its inputs first (a join has exactly two, the outer \
+input then the inner input), then the subqueries it uses, each marked with \
+parent_relationship.
 
 Conventions:
 - Scan each listed table alias exactly once, setting relation and alias.
@@ -1726,41 +1792,12 @@ Answer:
 {example}
 """
 
-AGENT_EXAMPLE = json.dumps(
-    {
-        "summary": "Hash the filtered orders, probe with customer, group per customer.",
-        "plan": {
-            "node_type": "Aggregate",
-            "strategy": "Hashed",
-            "group_keys": ["customer.c_custkey", "customer.c_name"],
-            "reason": "A hash table groups without sorting.",
-            "children": [{
-                "node_type": "Hash Join",
-                "join_type": "Inner",
-                "join_condition": "customer.c_custkey = orders.o_custkey",
-                "reason": "Both inputs are large and unsorted.",
-                "children": [
-                    {
-                        "node_type": "Seq Scan",
-                        "relation": "customer",
-                        "alias": "customer",
-                        "reason": "Every customer is read.",
-                    },
-                    {
-                        "node_type": "Hash",
-                        "children": [{
-                            "node_type": "Seq Scan",
-                            "relation": "orders",
-                            "alias": "orders",
-                            "filter": "orders.o_orderdate >= DATE '1995-01-01'",
-                            "reason": "Most orders pass the filter, which has no index.",
-                        }],
-                    },
-                ],
-            }],
-        },
-    },
-    # Indented, because the agent copies the example's layout, and in one-line JSON it
-    # loses count of the closing brackets of a deep tree.
-    indent=1,
-)
+AGENT_EXAMPLE = """\
+{"summary": "Hash the filtered orders, probe with customer, group per customer.",
+ "nodes": [
+  {"id": 1, "parent": null, "node_type": "Aggregate", "strategy": "Hashed", "group_keys": ["customer.c_custkey", "customer.c_name"], "reason": "A hash table groups without sorting."},
+  {"id": 2, "parent": 1, "node_type": "Hash Join", "join_type": "Inner", "join_condition": "customer.c_custkey = orders.o_custkey", "reason": "Both inputs are large and unsorted."},
+  {"id": 3, "parent": 2, "node_type": "Seq Scan", "relation": "customer", "alias": "customer", "reason": "Every customer is read."},
+  {"id": 4, "parent": 2, "node_type": "Hash"},
+  {"id": 5, "parent": 4, "node_type": "Seq Scan", "relation": "orders", "alias": "orders", "filter": "orders.o_orderdate >= DATE '1995-01-01'", "reason": "Most orders pass the filter, which has no index."}
+ ]}"""

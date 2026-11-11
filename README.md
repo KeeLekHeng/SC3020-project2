@@ -81,25 +81,25 @@ Always plan and force with `result.query`, the query after `unique_aliases()`, b
 How it works:
 
 1. `describe_database()` reads from the catalogs only the tables and columns the query uses: row and page counts, distinct counts, the range and quartiles of each column the query compares with `<`, `>` or `BETWEEN`, common values when they are skewed, strong correlation with the table's order, indexes, and foreign keys between those tables. It also gives `max_parallel_workers_per_gather` and `work_mem`. No schema is hardcoded, and the agent only gets raw statistics, never PostgreSQL's estimates or plan.
-2. The system prompt gives the task, the plan conventions, the answer's JSON Schema (from the pydantic model `AgentAnswer`) and a worked example. It is the same for every query, so it is cached. The user message gives the database description, the aliases the plan must use and the query. The rendered prompt is about 6K characters of system prompt plus 1–3K of user message.
-3. Each answer is validated by `validate_agent_plan()`, then checked against the database: the plan must scan the same aliases as PostgreSQL's plan, every index must exist, and `build_hints()` must accept it. All problems go back to the agent in one message, at `low` effort first and `medium` after, up to three answers.
+2. The system prompt gives the task, the answer's JSON Schema (from the pydantic model `AgentAnswer`), the plan conventions and a worked example. The answer is a flat list: one entry per operator, the root first, each with an `id` and the `id` of its `parent`. The agent writes this more reliably than a nested tree, where it lost count of the closing brackets. The prompt is the same for every query, so it is cached. The user message gives the database description, the aliases the plan must use and the query. The rendered prompt is about 6.5K characters of system prompt plus 1–3K of user message.
+3. Each answer is validated by `validate_agent_plan()`, which names operators by `id` in its errors (`node 3: a Seq Scan needs alias.`), then checked against the database: the plan must scan the same aliases as PostgreSQL's plan, every index must exist, and `build_hints()` must accept it. All problems go back to the agent in one message, at `low` effort first and `medium` after, up to three answers.
 
 It raises `AgentPlanError` (with `.errors` and the raw `.answer`) when no answer is usable, and `RuntimeError` when the model declines or its answer is cut off. Without an API key, the Anthropic SDK raises an authentication error on the first request. Answers vary from call to call, so save `result.answer` when a run must be repeatable.
 
 ### Results on TPC-H Q1–Q22
 
-Measured on 2026-11-10 with the Docker database, one run per prompt version:
+Measured with the Docker database, one run per prompt version. The first two, on 2026-11-10, asked for the plan as a nested tree; the current one, on 2026-11-11, asks for the flat list:
 
-| | First prompt | Current prompt |
-| --- | --- | --- |
-| Plans accepted | 22/22 | 22/22 |
-| Accepted on the first answer | 9/22 | 19/22 |
-| Answers in total | 37 | 25 |
-| Input tokens per request (cached part) | 7,775 (6,386) | 3,421 (2,276) |
-| Output tokens per request, thinking included | 1,820 | 1,996 |
-| Input and output tokens per query | 13,076 and 3,061 | 3,888 and 2,269 |
+| | First prompt | Nested tree | Current prompt |
+| --- | --- | --- | --- |
+| Plans accepted | 22/22 | 22/22 | 22/22 |
+| Accepted on the first answer | 9/22 | 19/22 | 21/22 |
+| Answers in total | 37 | 25 | 23 |
+| Input tokens per request (cached part) | 7,775 (6,386) | 3,421 (2,276) | 3,398 (2,541) |
+| Output tokens per request, thinking included | 1,820 | 1,996 | 2,351 |
+| Input and output tokens per query | 13,076 and 3,061 | 3,888 and 2,269 | 3,553 and 2,458 |
 
-A run over all 22 queries costs about 3 US cents. Listing the query's aliases in the prompt ended the agent's alias mistakes, which were most rejections in the first run. Across five runs, the retry loop fixed every rejected answer except in one run, with an earlier prompt, where two queries ran out of answers.
+A run over all 22 queries costs about 3 US cents. Listing the query's aliases in the prompt ended the agent's alias mistakes, which were most rejections in the first run. Across six runs, the retry loop fixed every rejected answer except in one run, with an earlier prompt, where two queries ran out of answers.
 
 ### Notes for the comparison and GUI work
 
