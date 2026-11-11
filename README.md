@@ -1,10 +1,10 @@
 # SC3020-project2
 
-Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent. The code loads TPC-H data, prints PostgreSQL's plan for a query, forces a plan onto PostgreSQL with `pg_hint_plan` hints, and asks an AI agent (Claude Haiku 5.5) for its own plan as a `PlanNode` tree that can be forced the same way. The GUI and the difference rate are not built yet.
+Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For one query, `project.py` prints PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, and lists the decisions the two plans made differently. The data is TPC-H. The GUI and the difference rate are not built yet.
 
 ## Requirements
 
-- Python 3 with the Windows `py` launcher.
+- Python 3. The commands below use the Windows `py` launcher; on macOS or Linux, use `python3` in its place.
 - A running PostgreSQL server and a database named `tpch`. The `Dockerfile` provides PostgreSQL 16 with `pg_hint_plan`:
 
   ```bash
@@ -23,7 +23,7 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
 
 ## Load the database
 
-`data/` holds the eight generated TPC-H `.tbl` files. Create an empty `tpch` database (the Docker command above already does), then from the project root run:
+`data/` holds the eight generated TPC-H `.tbl` files. The Docker command above creates the empty `tpch` database; without Docker, create it yourself. Then from the project root run:
 
 ```powershell
 py prepare_data.py
@@ -33,7 +33,7 @@ Enter your PostgreSQL password when prompted. The script requires exactly eight 
 
 The load is one transaction, so a failure leaves no tables behind. If the tables already exist, the script stops; drop them or recreate the database first.
 
-## Explain and force a query
+## Run the pipeline on a query
 
 Save one SQL query in `query.sql`, without an `EXPLAIN` prefix. The current one counts each customer's orders from `1995-01-01` onward. From the project root, run:
 
@@ -51,11 +51,17 @@ Enter your PostgreSQL password when prompted. Change these settings in `project.
 | User | `postgres` |
 | Connection timeout | 10 seconds |
 
-`project.py` reads `query.sql` over a read-only connection and prints PostgreSQL's plan as an indented tree. Hints cannot tell two uses of one table name apart, so if the query reads a name more than once, it first gives each later use its own alias, such as `lineitem2`, and prints the rewritten query. It then forces that plan with `pg_hint_plan` hints, prints the hints and the plan PostgreSQL chose with them, and reports any forced decision PostgreSQL did not follow. If `pg_hint_plan` cannot be loaded, it says so and stops. It uses `EXPLAIN` without `ANALYZE`, so the query does not run.
+`project.py` reads `query.sql` over a read-only connection and prints PostgreSQL's plan as an indented tree. Hints cannot tell two uses of one table name apart, so if the query reads a name more than once, it first gives each later use its own alias, such as `lineitem2`, and prints the rewritten query. It then runs three steps:
+
+1. **Round-trip check.** It forces PostgreSQL's own plan with `pg_hint_plan` hints, prints the hints and the plan PostgreSQL chose with them, and reports any forced decision PostgreSQL did not follow.
+2. **The agent's plan.** It asks the AI agent for its plan, prints the plan and the agent's strategy, and forces that plan the same way. This step needs the Anthropic API key and costs a fraction of a US cent per query.
+3. **The differences.** It lists every decision that PostgreSQL's plan and the agent's forced plan made differently, as `differences()` reports them.
+
+If `pg_hint_plan` cannot be loaded, no API key is set, or the agent gives no usable plan, it says so and stops there. It uses `EXPLAIN` without `ANALYZE`, so the query does not run.
 
 ## Get the AI agent's plan
 
-`preprocessing.get_agent_plan()` asks the agent for its plan for a query and returns it as a `PlanNode` tree, ready for `force_plan()` and `differences()`. `project.py` does not call it yet. From code:
+`preprocessing.get_agent_plan()` asks the agent for its plan for a query and returns it as a `PlanNode` tree, ready for `force_plan()` and `differences()`. To use it from your own code:
 
 ```python
 from comparison import differences, force_plan
@@ -84,7 +90,7 @@ It raises `AgentPlanError`, with `.errors` and the raw `.answer`, when no answer
 The agent never sees PostgreSQL's plan or estimates, and its answer is not checked against them.
 
 1. **What the agent is told.** `describe_database()` reads the catalogs for the tables and columns the query uses; no schema is hardcoded.
-   - Server: the PostgreSQL version and the planner settings in `AGENT_SETTINGS` (memory, parallel workers, page and parallel costs).
+   - Server: the PostgreSQL version and the planner settings in `AGENT_SETTINGS`: memory, parallel workers, and page and parallel costs.
    - Tables: row and page counts, the share of all-visible pages, and foreign keys between the tables read.
    - Columns: distinct counts, NULL fraction, common values when they are skewed, strong correlation with the table's order, and the average width of variable-length types. A column compared with `<`, `>` or `BETWEEN` also gets its range and quartiles.
    - Indexes: name, uniqueness, method, columns and size.
@@ -113,7 +119,7 @@ A run over all 22 queries costs 3 to 4 US cents.
 - PostgreSQL plans 14 of the 22 queries in parallel; the agent chose parallel plans for 2 to 7, depending on the run. `parallel` and `gather` differences will dominate, so consider reporting the difference rate with and without them.
 - PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; count only followed decisions as the agent's. [What forcing cannot guarantee](docs/agent-plan.md#what-forcing-cannot-guarantee) says what hints control and where gaps come from.
 - The agent can only write plans that hints can force, and the comparison is uneven in several ways. [docs/agent-plan.md](docs/agent-plan.md) lists what the agent cannot express and how fair the comparison is.
-- When `get_agent_plan()` raises, show it as a failed agent plan. The retry loop has run out of answers before.
+- When `get_agent_plan()` raises, show it as a failed agent plan, as `project.py` does. The retry loop can run out of answers.
 
 ## Run the tests
 
@@ -140,8 +146,8 @@ Tests that need the database are skipped when it is unavailable. All use `EXPLAI
 | `data/*.tbl` | Source TPC-H table data. |
 | `prepare_data.py` | Converts the source data to CSV files in `data_clean/` and loads the database. |
 | `schema.sql` | Creates the eight database tables. |
-| `query.sql` | Query to explain; edit this file to change the input. |
-| `project.py` | Prompts for the password, prints PostgreSQL's plan, then forces the same plan with hints, prints it and reports any decision not followed. |
+| `query.sql` | The query the pipeline runs on; edit this file to change the input. |
+| `project.py` | Prompts for the password and runs the pipeline on `query.sql`: PostgreSQL's plan, the same plan forced back as a check, the agent's plan, that plan forced, and the decisions the two made differently. |
 | `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
 | `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |
