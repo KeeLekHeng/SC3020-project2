@@ -89,8 +89,8 @@ The agent never sees PostgreSQL's plan or estimates, and its answer is not check
    - Columns: distinct counts, NULL fraction, common values when they are skewed, strong correlation with the table's order, and the average width of variable-length types. A column compared with `<`, `>` or `BETWEEN` also gets its range and quartiles.
    - Indexes: name, uniqueness, method, columns and size.
 2. **The prompt.** The system prompt gives the task, the answer's JSON Schema from the pydantic model `AgentAnswer`, the plan conventions and a worked example. It is the same for every query, so it is cached. The example reads tables that are not in the TPC-H database, so no query there comes with its answer. The user message gives the database description, the aliases the plan must use and the query. The system prompt is about 6.6K characters and the user message 1–3.6K.
-3. **The answer.** A flat list with one entry per operator, the root first, each with an `id` and the `id` of its `parent`. The agent writes this more reliably than a nested tree, where it loses count of the closing brackets.
-4. **The checks.** `validate_agent_plan()` checks the answer's JSON, schema, tree and plan rules, and names operators by `id` in its errors, as in `node 3: a Seq Scan needs alias.` The plan must then scan exactly the table aliases the query reads, name only existing indexes, and be accepted by `build_hints()`.
+3. **The answer.** A flat list with one entry per operator, the root first, each with an `id` and the `id` of its `parent`. [docs/agent-plan.md](docs/agent-plan.md) describes the format, the others that were tried and why this one was chosen.
+4. **The checks.** `validate_agent_plan()` checks the answer, then `ask_agent()` checks it against the query and the database. [The format document](docs/agent-plan.md#how-an-answer-is-checked) lists the checks.
 5. **Retries.** All problems go back to the agent in one message, for up to three answers: the first at `low` effort, the rest at `medium`.
 
 ### Results on TPC-H Q1–Q22
@@ -110,10 +110,9 @@ A run over all 22 queries costs about 4 US cents.
 
 ### Notes for the comparison and GUI work
 
-- PostgreSQL plans 14 of the 22 queries in parallel; the agent chose parallel plans for 2 to 7, depending on the run. `parallel` and `gather` differences will dominate, so consider reporting the difference rate with and without them. The hints force which scans run in parallel and with how many workers, but not where the Gather sits.
-- PostgreSQL cannot follow every agent decision. In each run it left some in 1 to 3 queries, mostly a subquery the agent planned as a join: the `NOT IN` of Q16, which NULLs prevent, and the correlated subqueries of Q17 and Q20. `force_plan()` reports these as gaps; count only followed decisions as the agent's.
-- The retry loop checks that a plan is well formed and can be forced, not that it is good. Gaps are not sent back to the agent, since they are its own decisions.
-- The agent gets a summary of the planner's statistics, not its full histograms and common-value lists, so it estimates with less detail.
+- PostgreSQL plans 14 of the 22 queries in parallel; the agent chose parallel plans for 2 to 7, depending on the run. `parallel` and `gather` differences will dominate, so consider reporting the difference rate with and without them.
+- PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; count only followed decisions as the agent's. [What forcing cannot guarantee](docs/agent-plan.md#what-forcing-cannot-guarantee) says what hints control and where gaps come from.
+- The agent can only write plans that hints can force, and the comparison is uneven in several ways. [docs/agent-plan.md](docs/agent-plan.md) lists what the agent cannot express and how fair the comparison is.
 - When `get_agent_plan()` raises, show it as a failed agent plan. The retry loop has run out of answers before.
 
 ## Run the tests
@@ -145,5 +144,6 @@ Tests that need the database are skipped when it is unavailable. All use `EXPLAI
 | `project.py` | Prompts for the password, prints PostgreSQL's plan, then forces the same plan with hints, prints it and reports any decision not followed. |
 | `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
+| `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |
 | `tests/` | The tests above; `tests/fixtures/` holds a sample agent answer. |
 | `agent_runs/` | Not in git: raw agent answers and rendered prompts from local runs. |

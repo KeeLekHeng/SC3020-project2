@@ -1555,8 +1555,11 @@ def _agent_database_errors(
     Problems that only show against the query and database; see ask_agent().
 
     The aliases come from the query's text, the list the prompt gives the agent, and not
-    from PostgreSQL's plan, which can drop a join or read a table twice. A query sqlglot
-    cannot parse has no such list, so its aliases are left to build_hints().
+    from PostgreSQL's plan, which can drop a join or read a table twice. So the agent
+    cannot write a plan that reads one table twice, as PostgreSQL does for min() and
+    max() of one column; hints could not force its second scan anyway (see
+    build_hints()). A query sqlglot cannot parse has no such list, so its aliases are
+    left to build_hints().
     """
     errors: list[str] = []
     relations = query_relations(query)
