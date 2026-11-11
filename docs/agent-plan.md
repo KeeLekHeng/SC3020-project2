@@ -1,6 +1,6 @@
 # The agent's plan: format and limits
 
-The project asks an AI agent for a query plan, forces it onto PostgreSQL, and compares the result with PostgreSQL's own plan. Forcing means planning the query with `pg_hint_plan` hints that name the agent's scans, joins and join order. The [README](../README.md) describes the project and how to run it.
+The project asks an AI agent for a query plan, forces it onto PostgreSQL, and compares the result with PostgreSQL's own plan. Forcing means planning the query with `pg_hint_plan` hints that name the agent's scans, joins and join order. Comparing means listing every decision the two plans made differently, with `differences()`: how each alias is scanned, the method and outer side of each join, what runs in parallel, how rows are grouped, and where a Sort, a Gather or another operator appears. The [README](../README.md) describes the project and how to run it.
 
 This document covers how the agent writes its plan, which other formats were tried, why this one was chosen, and what the format and the comparison with PostgreSQL cannot do. The code is in `preprocessing.py` (`AgentAnswer`, `AgentPlanNode`, `validate_agent_plan()`, `ask_agent()`, `build_hints()`) and `comparison.py` (`force_plan()`, `differences()`).
 
@@ -32,10 +32,10 @@ Aggregate
 ### Rules of the list
 
 - The root comes first, and every operator comes before its children. This is the order `EXPLAIN` prints.
-- `id` counts 1, 2, 3 in list order.
-- `parent` is the `id` of the operator this one passes its rows to. Only the root has `null`.
+- `id` is a number no other entry has. The agent is asked to count 1, 2, 3 in list order, but a skipped number is accepted.
+- `parent` is the `id` of an earlier entry: the operator this one passes its rows to. Only the root has `null`.
 - An operator's children are the entries that name it as parent, in list order. For a join, the outer input comes first, then the inner input.
-- A separately planned subquery is an ordinary entry. Its `parent` is the operator that uses its value, and `parent_relationship` is `InitPlan` or `SubPlan`.
+- A separately planned subquery is an ordinary entry. Its `parent` is the operator that uses its value, and `parent_relationship` is `InitPlan` or `SubPlan`. It is not one of that operator's inputs, and it comes after them in the list. A `WITH` query that is used more than once is written this way: an `InitPlan` named `CTE <name>` under the top operator, read by CTE Scans.
 - Fields that do not apply are left out. Only `id`, `parent` and `node_type` are required.
 
 ### Fields of one operator
@@ -52,7 +52,7 @@ Aggregate
 | `workers_planned` | How many parallel workers start. | Gather, Gather Merge |
 | `parallel_aware` | True when the operator splits its work across the workers. | Operators below a Gather or Gather Merge |
 | `parent_relationship`, `subplan_name` | `InitPlan` or `SubPlan`, and the subquery's name, such as `SubPlan 1` or `CTE revenue`. | Separately planned subqueries |
-| `join_condition`, `join_filter`, `index_condition`, `filter` | Conditions, written as SQL, under the names `EXPLAIN` uses. | Joins and scans |
+| `join_condition`, `join_filter`, `index_condition`, `filter` | Conditions, written as SQL. `join_condition` is what `EXPLAIN` prints as Hash Cond or Merge Cond, `join_filter` its Join Filter, `index_condition` its Index Cond or Recheck Cond, and `filter` its Filter. | Joins and scans |
 | `sort_keys`, `group_keys` | The columns sorted on, and the columns grouped on. | Sort; Aggregate |
 | `reason` | One sentence on why the agent chose this operator. Optional. | Any operator |
 
@@ -64,7 +64,7 @@ The 21 operators are: Seq Scan, Index Scan, Index Only Scan, Bitmap Heap Scan, H
 
 1. The text holds valid JSON with the fields, types and allowed values above.
 2. The ids and parents form one tree.
-3. The plan rules hold: each operator has the right number of children, such as two for a join and none for a scan; it has its required fields, such as `alias` on a scan; no alias is used twice; and parallel operators sit below a Gather or Gather Merge.
+3. The plan rules hold: each operator has the right number of inputs, such as two for a join and none for a scan, not counting subqueries; it has its required fields, such as `alias` on a scan; no alias is used twice; and parallel operators sit below a Gather or Gather Merge.
 
 `ask_agent()` then checks the plan against the query and the database. The plan must scan each table alias the query names, use only indexes that exist, and be something `build_hints()` can turn into hints.
 
@@ -72,7 +72,11 @@ A plan that passes all of these is called **usable**. One that does not is sent 
 
 ## What was tried
 
-Four formats were tested on TPC-H Q1–Q22. Each query was asked twice per format, with Claude Haiku 5.5 at low effort, the API setting for how much the model thinks before it answers. That is 44 conversations per format, each allowed up to three answers.
+Two tests were run on TPC-H Q1–Q22, on 2026-11-11, with local scripts that are not in the repository.
+
+### Four formats
+
+Each query was asked twice per format, with Claude Haiku 5.5 at low effort, the API setting for how much the model thinks before it answers. That is 44 conversations per format, each allowed up to three answers.
 
 The table counts first answers only. A format failure is a first answer that could not be read, or that used an unknown operator, field or value. The other unusable first answers were plan mistakes, such as a join with one child or a wrong table name, which no format prevents.
 
@@ -83,33 +87,55 @@ The table counts first answers only. A format failure is a first answer that cou
 | Flat JSON list, the current design | 95% | 0 | 2 | 2,405 |
 | Flat JSON list enforced by the API's structured outputs | 95% | 0 | 2 | 3,804 |
 
-Every conversation reached a usable plan within its three answers. The test was run on 2026-11-11 with a local script that is not in the repository.
+Every conversation reached a usable plan within its three answers.
 
 **Nested JSON tree.** Each operator held its children inside it. In a deep plan the agent lost count of the closing brackets: all 5 failures were JSON that could not be parsed.
 
 **XML.** Named closing tags fix the bracket problem. But SQL conditions contain `<` and `&`, which XML reserves, so reading the answer needed escaping rules and its own parser. The agent also invented operator tags, such as `<HashRightAnti>`.
 
-**Structured outputs.** This API feature makes the model's answer match a JSON schema. It refused the natural schema with "Schema is too complex", because each operator has 17 optional fields. The schema that worked requires all 17 on every operator, with empty values where they do not apply. Answers grew by more than half and took about 40% longer, and no more first answers were usable. The feature also rejects recursive schemas, so it could not have rescued the nested tree.
+**Structured outputs.** This API feature makes the model's answer match a JSON schema. It refused the natural schema with "Schema is too complex", because each operator has 17 optional fields. The schema that worked requires all 17 on every operator, with empty values where they do not apply. Answers grew by more than half and took about 40% longer (14.2 against 10.1 seconds), and no more first answers were usable. The feature also rejects recursive schemas, so it could not have rescued the nested tree.
+
+### The flat list against a typed union
+
+The second test gave structured outputs a schema built for them: nine entry types, one per kind of operator, each with only the fields of that kind, all required. Each query was asked nine times per format, again with Claude Haiku 5.5 at low effort. Both formats got the same instructions, apart from the description of the format. The instructions and the database description are newer than in the first test, so the flat list's numbers differ between the two tables.
+
+| Format | First answer usable | Format failures | Plan mistakes | Answer length in tokens |
+| --- | --- | --- | --- | --- |
+| Flat JSON list, the current design | 193 of 198 (97%) | 2 | 3 | 2,603 |
+| Typed union enforced by structured outputs | 196 of 198 (99%) | 0 | 2 | 2,985 |
+
+Every conversation again reached a usable plan within its three answers. A difference of 3 in 198 can be chance (p = 0.45, Fisher's exact test).
+
+The schema prevented the flat list's 2 format failures, each a field the agent invented. Against that, the union's answers were 15% longer, and it needs more code and more care:
+
+- A conversion step turns its entries back into the tree.
+- The root's `parent` is `0` and a subquery sits under a wrapper entry, because a `parent` that can be `null` and a subquery field on every type each made the schema too large for the API.
+- The schema is close to that size limit, so a new operator or field could make the API refuse it.
+
+The flat list was checked as the rules above describe, so ids could skip a number. In a run with a stricter check, which required ids to count 1, 2, 3 without a gap, 4 of 198 first answers failed for that reason alone.
 
 ## Why the flat list
 
-No single number proves the choice. With 44 conversations per format, a difference of a few answers can be chance, and that applies to the 95% against 86% as much as to the 0 against 3 format failures. The flat list was chosen because it did at least as well on every measure and is the simplest to handle:
+No single number proves the choice. In the first test, with 44 conversations per format, a difference of a few answers can be chance, and that applies to the 95% against 82% and 86% as much as to the format failures. In the second, the typed union was not measurably better. The flat list was chosen because no format was measurably more reliable, it needs no API feature, and it is the simplest to handle:
 
-- **No format failures.** Of the three formats that do not need structured outputs, it was the only one with none.
+- **Format failures are rare.** 2 in the 242 conversations of both tests, each a field the agent invented.
 - **No brackets to balance.** Each entry closes before the next begins, however deep the plan is.
 - **SQL goes in as it is.** A condition is an ordinary JSON string.
 - **Little code.** Rebuilding the tree means attaching each entry to its parent. A JSON parser and pydantic, a Python validation library, do the rest.
 - **Errors are easy to act on.** They name the operator by id, as in `node 3: a Seq Scan needs alias.`
 
-Its cost: the agent does not see the tree's shape while it writes, and must keep track of ids. A wrong `parent` is a new kind of mistake, which the second check stage catches.
+Its costs:
+
+- The agent does not see the tree's shape while it writes, and must keep track of ids. A wrong `parent` is a new kind of mistake. The second check stage catches a `parent` that names no earlier entry. One that names the wrong operator usually leaves some operator with the wrong number of children, which the third stage catches.
+- Its answers were 13% longer than the nested tree's and 22% longer than the XML's.
 
 ## What the agent cannot express
 
 Hints can only control certain things, and a plan that cannot be forced cannot be compared. So the format allows only plans that hints can describe.
 
 - **Each table alias is read exactly once.** The plan has one scan for each alias in the query; a table joined to itself has two aliases and so two scans. PostgreSQL sometimes breaks this rule in its own plans, and the agent cannot follow it there:
-  - It can read one alias twice. For `SELECT min(x), max(x) FROM t` it uses two index scans, one for each end of the index.
-  - It can skip an alias. It drops a `LEFT JOIN` whose columns the query never uses.
+  - PostgreSQL can read one alias twice. For `SELECT min(x), max(x) FROM t` it uses two index scans, one for each end of the index.
+  - PostgreSQL can skip an alias. It drops a `LEFT JOIN` whose columns the query never uses.
 - **Only the 21 operators.** Others, such as Memoize and Incremental Sort, cannot be chosen. None appears in PostgreSQL's plans for TPC-H Q1–Q22 on the project's database.
 - **Tables only.** A function in `FROM`, such as `generate_series()`, and a `VALUES` list have no operator in the list. A view is shown to the agent as if it were a table, but hints for a view have no effect.
 - **At most 200 operators.** This keeps the deepest possible tree inside the limits of pydantic and of Python's recursion. The TPC-H plans seen so far have at most 27.
@@ -119,8 +145,8 @@ Hints can only control certain things, and a plan that cannot be forced cannot b
 A usable plan can be turned into hints. That does not mean PostgreSQL builds exactly that plan.
 
 - **What hints control.** How each alias is scanned and with which index, the join methods, the join order, and which scans run in parallel with how many workers.
-- **What they do not control.** Where the Gather sits in the tree. The conditions and reasons the agent writes are not forced either: PostgreSQL works out the conditions from the query, and the agent's are for people reading the plan.
-- **Gaps.** PostgreSQL ignores a hint when it cannot build that plan. `force_plan()` reports each decision that was not followed as a gap. In each TPC-H run this happened in 1 to 3 of the 22 queries, mostly where the agent planned a subquery as a join: the `NOT IN` of Q16, which `NULL`s prevent, and the correlated subqueries of Q17 and Q20. Gaps are not sent back to the agent, since they are its own decisions.
+- **What they do not control.** How rows are grouped and sorted, operators such as Limit and Materialize, and where the Gather sits in the tree. PostgreSQL chooses these itself around the forced scans and joins. The agent's choices for them are not forced, but `differences()` still compares them with PostgreSQL's. The conditions and reasons the agent writes are not forced either: PostgreSQL works out the conditions from the query, and the agent's are for people reading the plan.
+- **Gaps.** PostgreSQL ignores a hint when it cannot build that plan. `force_plan()` reports each forced decision that was not followed as a gap. Only scan, join, outer-side and parallel decisions can be gaps, since only those are forced. In each run over the 22 TPC-H queries, 1 to 3 queries had gaps, mostly where the agent planned a subquery as a join: the `NOT IN` of Q16, which cannot become a join because of `NULL`s, and the correlated subqueries of Q17 and Q20. Gaps are not sent back to the agent. A gap is a choice the agent made that PostgreSQL could not build, not a fault in the answer's format, so it belongs in the result.
 
 ## How fair the comparison with PostgreSQL is
 
@@ -138,4 +164,4 @@ Where it is still uneven:
 - **The agent is a small model thinking briefly.** A larger model or more effort may plan better.
 - **Answers vary.** The same query can get a different plan on the next call.
 - **The forced plan is partly PostgreSQL's.** When a plan is forced, PostgreSQL still applies its own changes, such as the two index scans for `min()` and `max()`. A decision counts as the agent's only if `force_plan()` does not report it as a gap.
-- **Plan quality is not measured yet.** The checks show that a plan is well formed and can be turned into hints. They do not show that it is fast. That needs the run times of both plans from `EXPLAIN ANALYZE`, and this comparison is not built.
+- **Plan quality is not measured yet.** The checks show that a plan is well formed and can be turned into hints. They do not show that it is fast. That needs the run times of both plans from `EXPLAIN ANALYZE`, and that timing comparison is not built.
