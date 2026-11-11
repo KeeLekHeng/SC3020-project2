@@ -235,14 +235,30 @@ def test_root_cannot_be_a_subquery() -> None:
     assert "node 1: the root operator cannot be a subquery (parent_relationship)." in errors_of(data)
 
 
-def test_ids_must_count_from_one_in_list_order() -> None:
+def test_ids_may_skip_numbers() -> None:
     data = answer()
+    expected = plan_of(data)
     for entry in data["nodes"]:
-        entry["id"] -= 1
+        entry["id"] = entry["id"] * 3 - 3
+        if entry["parent"] is not None:
+            entry["parent"] = entry["parent"] * 3 - 3
 
-    assert errors_of(data)[0] == (
-        "node 0: ids count 1, 2, 3, ... in list order, so this operator's id must be 1."
-    )
+    assert plan_of(data) == expected
+
+
+def test_an_id_cannot_be_used_twice() -> None:
+    data = answer()
+    node(data, 4)["id"] = 2
+
+    assert errors_of(data)[0] == "node 2: an earlier operator already has this id."
+
+
+def test_schema_errors_name_the_operator_by_its_id() -> None:
+    data = answer()
+    node(data, 3)["id"] = 7
+    node(data, 3)["cost"] = 1.0
+
+    assert errors_of(data) == ["node 7.cost: unknown field."]
 
 
 def test_parent_must_be_an_earlier_operator() -> None:
@@ -263,7 +279,7 @@ def test_plan_has_exactly_one_root() -> None:
 
     assert errors_of(data) == [
         "node 1: the first operator is the root, so its parent must be null.",
-        "node 4: only node 1 is the root, so this operator needs a parent.",
+        "node 4: only the first operator is the root, so this one needs a parent.",
     ]
 
 

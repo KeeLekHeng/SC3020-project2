@@ -1137,10 +1137,10 @@ class AgentAnswer(BaseModel):
             for node in self.nodes
         }
         for node in self.nodes:
-            if node.parent:
+            if node.parent is not None:
                 nodes[node.parent].setdefault("children", []).append(nodes[node.id])
 
-        return PlanNode.model_validate(nodes[1])
+        return PlanNode.model_validate(nodes[self.nodes[0].id])
 
 
 class AgentPlanError(ValueError):
@@ -1189,9 +1189,10 @@ def validate_agent_plan(output: str) -> AgentAnswer:
 
     output is the agent's text. Anything around its first JSON object, such as a
     Markdown fence, is ignored. Raises AgentPlanError listing the problems, one stage at
-    a time: JSON and schema errors, then ids and parents that do not form one tree, then
-    the structural rules (input counts, required and misplaced fields, reused aliases,
-    parallel operators outside a Gather). Operators are named by id, as in "node 3".
+    a time: JSON and schema errors, then ids and parents that do not form one tree (ids
+    may skip numbers, but not repeat), then the structural rules (input counts, required
+    and misplaced fields, reused aliases, parallel operators outside a Gather). Operators
+    are named by id, as in "node 3".
     """
     try:
         data, _ = json.JSONDecoder().raw_decode(output, max(output.find("{"), 0))
@@ -1208,34 +1209,41 @@ def validate_agent_plan(output: str) -> AgentAnswer:
         answer = AgentAnswer.model_validate(data)
     except ValidationError as error:
         raise AgentPlanError(
-            [_format_error(e) for e in error.errors(include_url=False)], output
+            [_format_error(e, data) for e in error.errors(include_url=False)], output
         ) from None
 
     errors: list[str] = []
-    for number, node in enumerate(answer.nodes, 1):
-        if node.id != number:
+    earlier: set[int] = set()
+    for node in answer.nodes:
+        if node.id in earlier:
+            errors.append(f"node {node.id}: an earlier operator already has this id.")
+        elif not earlier and node.parent is not None:
             errors.append(
-                f"node {node.id}: ids count 1, 2, 3, ... in list order, so this operator's "
-                f"id must be {number}."
+                f"node {node.id}: the first operator is the root, so its parent must be null."
             )
-        elif number == 1 and node.parent is not None:
-            errors.append("node 1: the first operator is the root, so its parent must be null.")
-        elif number > 1 and node.parent is None:
-            errors.append(f"node {number}: only node 1 is the root, so this operator needs a parent.")
-        elif node.parent is not None and not 1 <= node.parent < number:
-            errors.append(f"node {number}: parent {node.parent} is not the id of an earlier operator.")
+        elif earlier and node.parent is None:
+            errors.append(
+                f"node {node.id}: only the first operator is the root, so this one needs a parent."
+            )
+        elif node.parent is not None and node.parent not in earlier:
+            errors.append(
+                f"node {node.id}: parent {node.parent} is not the id of an earlier operator."
+            )
+        earlier.add(node.id)
 
     if errors:
         raise AgentPlanError(errors, output)
 
     children: dict[int, list[AgentPlanNode]] = {node.id: [] for node in answer.nodes}
     for node in answer.nodes:
-        if node.parent:
+        if node.parent is not None:
             children[node.parent].append(node)
 
     root = answer.nodes[0]
     if root.parent_relationship:
-        errors.append("node 1: the root operator cannot be a subquery (parent_relationship).")
+        errors.append(
+            f"node {root.id}: the root operator cannot be a subquery (parent_relationship)."
+        )
 
     _check_agent_node(root, children, {}, False, errors)
     if errors:
@@ -1669,12 +1677,14 @@ def _check_agent_node(
         _check_agent_node(child, children, aliases, below, errors)
 
 
-def _format_error(error: Any) -> str:
-    """Word one pydantic error with where it is, such as node 3.join_type."""
+def _format_error(error: Any, data: Any) -> str:
+    """Word one pydantic error of the answer data with where it is, such as node 3.join_type."""
     place = error["loc"]
     if place[:1] == ("nodes",) and len(place) > 1:
-        # Ids count from 1 in list order, so the operator at index 2 is node 3.
-        place = (f"node {place[1] + 1}", *place[2:])
+        entry = data["nodes"][place[1]]
+        # An entry without a usable id is named by its position in the list.
+        number = entry.get("id") if isinstance(entry, dict) else None
+        place = (f"node {number if isinstance(number, int) else place[1] + 1}", *place[2:])
 
     message = "unknown field" if error["type"] == "extra_forbidden" else error["msg"]
     return f"{'.'.join(str(p) for p in place) or 'answer'}: {message}."
