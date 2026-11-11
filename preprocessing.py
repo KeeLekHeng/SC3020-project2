@@ -1795,19 +1795,21 @@ use is a CTE Scan.
 workers_planned, and set parallel_aware on the operators inside that split their work. \
 A parallel aggregate is an Aggregate under the Gather and another above it.
 
-Example. Aliases: customer (table customer), orders (table orders). Query:
-SELECT c_name, COUNT(*) FROM customer JOIN orders ON c_custkey = o_custkey \
-WHERE o_orderdate >= DATE '1995-01-01' GROUP BY c_custkey, c_name;
+Example. Aliases: department (table department), employee (table employee). Query:
+SELECT d_name, COUNT(*) FROM department JOIN employee ON d_id = e_department \
+WHERE e_hired >= DATE '2020-01-01' GROUP BY d_id, d_name;
 Answer:
 {example}
 """
 
+# The example reads tables that are not in the TPC-H database, so that no query the
+# agent is asked to plan there comes with its answer.
 AGENT_EXAMPLE = """\
-{"summary": "Hash the filtered orders, probe with customer, group per customer.",
+{"summary": "Hash the small department table, probe with the filtered employees, group per department.",
  "nodes": [
-  {"id": 1, "parent": null, "node_type": "Aggregate", "strategy": "Hashed", "group_keys": ["customer.c_custkey", "customer.c_name"], "reason": "A hash table groups without sorting."},
-  {"id": 2, "parent": 1, "node_type": "Hash Join", "join_type": "Inner", "join_condition": "customer.c_custkey = orders.o_custkey", "reason": "Both inputs are large and unsorted."},
-  {"id": 3, "parent": 2, "node_type": "Seq Scan", "relation": "customer", "alias": "customer", "reason": "Every customer is read."},
+  {"id": 1, "parent": null, "node_type": "Aggregate", "strategy": "Hashed", "group_keys": ["department.d_id", "department.d_name"], "reason": "A hash table groups without sorting."},
+  {"id": 2, "parent": 1, "node_type": "Hash Join", "join_type": "Inner", "join_condition": "employee.e_department = department.d_id", "reason": "The small table fits in a hash table."},
+  {"id": 3, "parent": 2, "node_type": "Seq Scan", "relation": "employee", "alias": "employee", "filter": "employee.e_hired >= DATE '2020-01-01'", "reason": "Many employees pass the filter, which has no index."},
   {"id": 4, "parent": 2, "node_type": "Hash"},
-  {"id": 5, "parent": 4, "node_type": "Seq Scan", "relation": "orders", "alias": "orders", "filter": "orders.o_orderdate >= DATE '1995-01-01'", "reason": "Most orders pass the filter, which has no index."}
+  {"id": 5, "parent": 4, "node_type": "Seq Scan", "relation": "department", "alias": "department", "reason": "Every department is read."}
  ]}"""

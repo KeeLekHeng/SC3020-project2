@@ -336,13 +336,18 @@ def test_system_prompt_is_static_and_free_of_schema_noise() -> None:
     assert '"children"' not in prompt
     assert '"title"' not in prompt
     assert '"anyOf"' not in prompt
-    assert "customer" in prompt and "lineitem" not in prompt
+
+
+def test_prompt_example_reads_no_table_of_the_database(connection: psycopg.Connection) -> None:
+    example = validate_agent_plan(AGENT_EXAMPLE).to_plan_node()
+
+    assert not example.relations() & set(describe_database(connection).indexes)
 
 
 def test_prompt_example_is_a_valid_answer_without_aliases() -> None:
     plan = validate_agent_plan(AGENT_EXAMPLE).to_plan_node()
 
-    assert plan.relations() == {"customer", "orders"}
+    assert plan.relations() == {"department", "employee"}
 
 
 def test_query_relations_lists_tables_ctes_and_subqueries() -> None:
