@@ -112,13 +112,13 @@ The schema prevented the flat list's 2 format failures, each a field the agent i
 - The root's `parent` is `0` and a subquery sits under a wrapper entry, because a `parent` that can be `null` and a subquery field on every type each made the schema too large for the API.
 - The schema is close to that size limit, so a new operator or field could make the API refuse it.
 
-The flat list was checked as the rules above describe, so ids could skip a number. In a run with a stricter check, which required ids to count 1, 2, 3 without a gap, 4 of 198 first answers failed for that reason alone.
+The flat list was checked as the rules above describe, so ids could skip a number. In a run with a stricter check, which required ids to count 1, 2, 3 without skipping a number, 4 of 198 first answers failed for that reason alone.
 
 ## Why the flat list
 
 No single number proves the choice. In the first test, with 44 conversations per format, a difference of a few answers can be chance, and that applies to the 95% against 82% and 86% as much as to the format failures. In the second, the typed union was not measurably better. The flat list was chosen because no format was measurably more reliable, it needs no API feature, and it is the simplest to handle:
 
-- **Format failures are rare.** 2 in the 242 conversations of both tests, each an invented field beside `summary` and `nodes`. The check ignores such a field, so it no longer rejects answers like these.
+- **Format failures are rare.** 2 in the 242 conversations of both tests, each an invented field beside `summary` and `nodes`. The check began to ignore such a field only after these tests.
 - **No brackets to balance.** Each entry closes before the next begins, however deep the plan is.
 - **SQL goes in as it is.** A condition is an ordinary JSON string.
 - **Little code.** Rebuilding the tree means attaching each entry to its parent. A JSON parser and pydantic, a Python validation library, do the rest.
@@ -131,7 +131,7 @@ Its costs:
 
 ## What the agent cannot express
 
-Hints can only control certain things, and a plan that cannot be forced cannot be compared. So the format allows only plans that hints can describe.
+Hints can only control certain things, and a plan that cannot be forced cannot be compared. So the format allows only plans that hints can describe. The `AgentPlanNode` docstring in `preprocessing.py` lists the same limits next to the code.
 
 - **Each table alias is read exactly once.** The plan has one scan for each alias in the query; a table joined to itself has two aliases and so two scans. PostgreSQL sometimes breaks this rule in its own plans, and the agent cannot follow it there:
   - PostgreSQL can read one alias twice. For `SELECT min(x), max(x) FROM t` it uses two index scans, one for each end of the index.
@@ -142,11 +142,12 @@ Hints can only control certain things, and a plan that cannot be forced cannot b
 
 ## What forcing cannot guarantee
 
-A usable plan can be turned into hints. That does not mean PostgreSQL builds exactly that plan. [Forcing a plan: hints and limits](plan-forcing.md) has the full account; this section covers what matters for the agent's plans.
+A usable plan can be turned into hints. That does not mean PostgreSQL builds exactly that plan. [Forcing a plan: hints and limits](plan-forcing.md) says what hints fix, what they cannot, and how a forced plan is checked. For the agent's plans this means:
 
-- **What hints control.** How each alias is scanned and with which index, the join methods, the join order, and which scans run in parallel with how many workers.
-- **What they do not control.** How rows are grouped and sorted, operators such as Limit and Materialize, and where the Gather sits in the tree. PostgreSQL chooses these itself around the forced scans and joins. The agent's choices for them are not forced, but `differences()` still compares them with PostgreSQL's. The conditions and reasons the agent writes are not forced either: PostgreSQL works out the conditions from the query, and the agent's are for people reading the plan.
-- **Gaps.** PostgreSQL ignores a hint when it cannot build that plan. `force_plan()` reports each forced decision that was not followed as a gap. Only scan, join, outer-side and parallel decisions can be gaps, since only those are forced. In each run over the 22 TPC-H queries, 1 to 3 queries had gaps, mostly where the agent planned a subquery as a join: the `NOT IN` of Q16, which cannot become a join because of `NULL`s, and the correlated subqueries of Q17 and Q20. Gaps are not sent back to the agent. A gap is a choice the agent made that PostgreSQL could not build, not a fault in the answer's format, so it belongs in the result.
+- **Only some of the agent's choices are forced.** Its scans, join methods, join order and parallel scans are. Its grouping, its sorting and the place of its Gather are not: in the forced plan, those are PostgreSQL's choices.
+- **Its conditions and reasons are not forced.** PostgreSQL works out the conditions from the query, and the agent's are for people reading the plan.
+- **Some of its plans have gaps**, which are forced decisions that PostgreSQL did not follow. In each run over the 22 TPC-H queries, 1 to 3 queries had gaps, mostly where the agent planned a subquery as a join: the `NOT IN` of Q16, which cannot become a join because of `NULL`s, and the correlated subqueries of Q17 and Q20.
+- **Gaps are not sent back to the agent.** A gap concerns the plan the agent chose, not the format of its answer, so it is reported with the comparison and not corrected.
 
 ## How fair the comparison with PostgreSQL is
 
@@ -163,5 +164,5 @@ Where it is still uneven:
 - **The agent may know TPC-H.** It is a public benchmark, so the model has probably seen these queries and plans for them. How much that helps is unknown.
 - **The agent is a small model thinking briefly.** A larger model or more effort may plan better.
 - **Answers vary.** The same query can get a different plan on the next call.
-- **The forced plan is partly PostgreSQL's.** When a plan is forced, PostgreSQL still applies its own changes, such as the two index scans for `min()` and `max()`. A decision counts as the agent's only if `force_plan()` does not report it as a gap.
+- **The forced plan is partly PostgreSQL's.** When a plan is forced, PostgreSQL still applies its own changes, such as the two index scans for `min()` and `max()`. A decision counts as the agent's only if it is a forced kind and `force_plan()` does not report it as a gap.
 - **Plan quality is not measured yet.** The checks show that a plan is well formed and can be turned into hints. They do not show that it is fast. That needs the run times of both plans from `EXPLAIN ANALYZE`, and that timing comparison is not built.

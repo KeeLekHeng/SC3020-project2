@@ -116,8 +116,8 @@ A run over all 22 queries costs 3 to 4 US cents.
 
 ### Notes for the comparison and GUI work
 
-- PostgreSQL plans 14 of the 22 queries in parallel; the agent chose parallel plans for 2 to 7, depending on the run. `parallel` and `gather` differences will dominate, so consider reporting the difference rate with and without them.
-- PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; count only followed decisions as the agent's. [What forcing cannot guarantee](docs/agent-plan.md#what-forcing-cannot-guarantee) says what hints control and where gaps come from.
+- PostgreSQL plans 14 of the 22 queries in parallel; the agent chose parallel plans for 2 to 7, depending on the run. Expect `parallel` and `gather` differences in most of those queries, and consider reporting the difference rate with and without them. [Comparing two plans](docs/plan-forcing.md#comparing-two-plans) says how each kind of decision is counted, and why one choice can show as several differences.
+- PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; count only followed decisions as the agent's. [docs/plan-forcing.md](docs/plan-forcing.md) says what hints fix, what they cannot, and how gaps are found.
 - The agent can only write plans that hints can force, and the comparison is uneven in several ways. [docs/agent-plan.md](docs/agent-plan.md) lists what the agent cannot express and how fair the comparison is.
 - When `get_agent_plan()` raises, show it as a failed agent plan, as `project.py` does. The retry loop can run out of answers.
 
@@ -134,7 +134,7 @@ py -m pytest
 | File | Covers | Needs |
 | --- | --- | --- |
 | `tests/test_hints.py` | Hint building, the alias rewrite and plan comparison. | Nothing. |
-| `tests/test_forcing.py` | Forcing PostgreSQL's own plan for TPC-H Q1–Q22, for query shapes that broke forcing before and for a few edited plans, such as swapped join sides; every forced decision must be followed. | The database with `pg_hint_plan`. |
+| `tests/test_forcing.py` | Forcing PostgreSQL's own plan for TPC-H Q1–Q22, for query shapes that are hard to force and for a few edited plans, such as swapped join sides; every forced decision must be followed. | The database with `pg_hint_plan`. |
 | `tests/test_agent.py` | The agent's answer validation, the prompt, the database description and the retry loop with a fake client. | No API key; the database for the description tests. |
 
 Tests that need the database are skipped when it is unavailable. All use `EXPLAIN` only, so no query runs.

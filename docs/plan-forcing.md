@@ -2,7 +2,7 @@
 
 The project compares an AI agent's query plan with PostgreSQL's own. To compare or time the agent's plan, PostgreSQL must first build it. This is called forcing the plan. PostgreSQL has no command for it, so the project uses the `pg_hint_plan` extension, which reads hints from a comment in front of the query. The [README](../README.md) describes the project and how to run it.
 
-This document covers the hints, how a forced plan is checked, which choices were tried, how well forcing works, what cannot be forced, and what forcing changes besides the plan. The code is in `preprocessing.py` (`PlanNode`, the plan tree, `get_postgres_plan()`, `unique_aliases()`, `build_hints()`) and `comparison.py` (`decisions()`, `force_plan()`, `realization_gaps()`). It runs on PostgreSQL 16 with `pg_hint_plan` 1.6. [The agent's plan: format and limits](agent-plan.md) covers the agent's side.
+This document covers the hints, how a forced plan is checked, how two plans are compared, which choices were tried, how well forcing works, what cannot be forced, and what forcing changes besides the plan. The code is in `preprocessing.py` (`PlanNode`, the plan tree, `get_postgres_plan()`, `unique_aliases()`, `build_hints()`) and `comparison.py` (`decisions()`, `differences()`, `force_plan()`, `realization_gaps()`). It runs on PostgreSQL 16 with `pg_hint_plan` 1.6. [The agent's plan: format and limits](agent-plan.md) covers the agent's side.
 
 ## The hints
 
@@ -64,16 +64,57 @@ The plan as printed does not mark parallel scans. In this plan the scan of `orde
 `force_plan()` forces a plan: it calls `build_hints()` and then `get_postgres_plan()` with the hints. It returns three things: the hints, the plan PostgreSQL built with them, and the gaps.
 
 1. `decisions()` reduces a plan to its planner decisions, such as `scan(orders): Seq Scan` and `join(customer, orders): Hash Join`.
-2. `realization_gaps()` compares the decisions of the requested plan with those of the plan PostgreSQL built. Each forced decision that differs is a **gap**. The forced kinds are the scan method with its index, parallel or serial, the join method, and the outer side. Join order needs no kind of its own: a join is named by the set of tables it joins, so a different order gives different joins. The worker count is not checked.
+2. `realization_gaps()` compares the decisions of the requested plan with those of the plan PostgreSQL built. A **gap** is a decision of a forced kind on which the two plans differ, including one that only one of them has. The forced kinds are the scan method with its index, parallel or serial, the join method, and the outer side. Join order needs no kind of its own: a join is named by the set of tables it joins, so a different order gives different joins. The worker count is not checked.
 3. Some hints can backfire. So while there are gaps, `force_plan()` tries again without the switch-offs, then with the switch-offs but without `Leading` hints. It returns the try with the fewest gaps.
 
 A plan with no gaps is **fully followed**. `build_hints()` refuses a plan it cannot write hints for, with a `ValueError`: a table name used twice that the rewrite could not separate, an alias the query does not have, or an alias that contains `/*`, which would open a comment inside the hint.
+
+## Comparing two plans
+
+`differences(a, b)` lists every decision that two plans made differently. The project compares PostgreSQL's plan with the plan PostgreSQL built from the agent's hints. Both must be for the same query text, the one from `unique_aliases()`, because decisions are matched by alias.
+
+Each difference gives the decision and the two choices. A choice is missing when only one plan has that decision, such as a Sort that the other plan does not need. These are 5 of the 16 differences `project.py` printed for TPC-H Q5 in one run:
+
+```text
+- scan(lineitem): PostgreSQL Index Scan on lineitem_pkey, agent Seq Scan
+- parallel(orders): PostgreSQL parallel, agent serial
+- join(customer, orders): PostgreSQL has none, agent Hash Join
+- outer(customer, orders): PostgreSQL has none, agent orders
+- gather(customer, lineitem, nation, orders, region, supplier): PostgreSQL Gather Merge, agent has none
+```
+
+| Kind of decision | Example of a choice | Forced by hints |
+| --- | --- | --- |
+| `scan(o)` | `Index Scan on orders_pkey` | Yes |
+| `parallel(o)` | `parallel` or `serial` | Yes |
+| `join(c, o)` | `Hash Join` | Yes |
+| `outer(c, o)` | `o`, the outer side | Yes |
+| `gather(c, o)` | `Gather` or `Gather Merge` | No |
+| `aggregate(c, o)` | `Hashed` | No |
+| `sort(c, o)`, `limit(c, o)` and other operators | The sort keys or the strategy, or `used` when the operator has neither | No |
+
+A kind that is not forced is PostgreSQL's own choice, made around the forced scans and joins. A difference there does not show what the agent wrote for that operator.
+
+One choice by the agent can show as several differences:
+
+- **Serial or parallel.** `parallel` is one decision for each scan. A serial plan against a parallel one differs once for each parallel scan, and a serial plan is serial everywhere, because its hints turn parallelism off for the whole query.
+- **The place of the Gather.** `gather` is named by the tables below it. A Gather in another place is two differences: one decision that only the first plan has, and one that only the second has.
+- **Join order.** `join` and `outer` are named by the set of tables joined, so one different order changes many sets. In the Q5 run above, 13 of the 16 differences were `join` and `outer`, with 1 each for `gather`, `parallel` and `scan`.
+
+Some things do not count as a difference:
+
+- **Worker counts, conditions, filters, costs and row estimates** are not compared.
+- **An index that is not named.** A scan that names no index equals the same scan on any index. This matters when gaps are found, because the requested plan may be an agent's plan that leaves the index out.
+- **The two stages of a parallel Aggregate.** They are one decision, with the strategy of the stage that groups the rows in the workers.
+- **A Subquery Scan.** PostgreSQL may drop it, so it is left out of both plans.
+
+Two operators of the same type over the same tables, such as two Sorts, are one decision, so one of them is not compared.
 
 ## What was tried
 
 Each choice below was measured on the project's TPC-H database, with local scripts that are not in the repository.
 
-**Switch-offs.** Scan and join hints leave PostgreSQL free to add operators the plan does not have, such as a Materialize or a hashed Aggregate. The switch-offs remove that freedom. Over 2,419 forcings during development, each was counted by how often it improved the forced plan and how many forced decisions it broke:
+**Switch-offs.** Scan and join hints leave PostgreSQL free to add operators the plan does not have, such as a Materialize or a hashed Aggregate. The switch-offs remove that freedom. Over the 2,419 forcings of a separate run, each switch-off was counted by how often it improved the forced plan and how many forced decisions it broke:
 
 | Switch-off | Improved the forced plan | Forced decisions broken |
 | --- | --- | --- |
@@ -112,12 +153,14 @@ The rows add up to 2,065 forcings, where one forcing is one plan forced on one q
 
 - **PostgreSQL's own plans.** All 415 are fully followed. 401 also match in every decision that is not forced, such as the Aggregate strategy and the place of the Gather.
 - **Most plans with a gap are impossible requests.** PostgreSQL adds a cost of 1e10 to a plan that uses a disabled operator, and it picks such a plan only when the hints leave it no other. 319 of the 367 plans with a gap carry that penalty, which means PostgreSQL had no way to build what was asked. This includes all 239 failed Index Scan edits, where the query gives the index no condition to use.
-- **The retries are rare.** `force_plan()` needed a retry in 53 of the 2,065 forcings.
+- **A retry seldom helps.** A retry gave the result that `force_plan()` returned in 53 of the 2,065 forcings.
 - **The refused query** reads a `NOT MATERIALIZED` `WITH` query twice. PostgreSQL copies its tables, and no hint can tell the copies apart.
 
 `tests/test_forcing.py` repeats a part of this on every test run: TPC-H Q1–Q22, query shapes that are hard to force, and a few edited plans.
 
 ## What cannot be forced
+
+The `build_hints()` docstring in `preprocessing.py` holds the complete list of limits. The main ones are below.
 
 `pg_hint_plan` has no hint for these, so PostgreSQL chooses them itself around the forced scans and joins:
 
@@ -142,5 +185,5 @@ And PostgreSQL cannot build these at all:
 ## What forcing changes besides the plan
 
 - **Costs are not comparable.** Hints change the planner's cost numbers, even when the plan stays the same. With a `Parallel` hint, the cost of one identical plan went from 15,426 to 1,010. With a scan hint, another went from 445 to 497. Compare the run times from `EXPLAIN ANALYZE`, not the costs.
-- **A gap does not always mean PostgreSQL ignored a hint.** `build_hints()` writes no hint for some scans and joins, as listed above. A difference there is also reported as a gap, although PostgreSQL chose freely. Check a gap against the hints before you conclude that a hint was ignored.
+- **A gap does not always mean PostgreSQL ignored a hint.** `build_hints()` writes no hint for some scans and joins, as listed above. A difference there is a gap by the definition above, although PostgreSQL chose freely. Check a gap against the hints before you conclude that a hint was ignored.
 - **The forced plan is partly PostgreSQL's.** Count a decision as the agent's only when it is a forced kind and not a gap.
