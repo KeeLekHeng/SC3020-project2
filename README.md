@@ -19,7 +19,7 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
   ```
 
   With `uv`: `uv venv`, then `uv pip install -r requirements.txt`.
-- For the AI agent: an Anthropic API key, in the `ANTHROPIC_API_KEY` environment variable or as a line `ANTHROPIC_API_KEY=...` in a gitignored `.env` file in the project root.
+- For the AI agent: an Anthropic API key, in the `ANTHROPIC_API_KEY` environment variable or in a gitignored `.env` file in the project root. Copy `.env.example` to `.env` and add the key there.
 
 ## Load the database
 
