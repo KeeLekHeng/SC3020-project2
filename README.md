@@ -63,7 +63,7 @@ from preprocessing import get_agent_plan, get_postgres_plan, unique_aliases
 
 query = unique_aliases(original_sql)
 postgres = get_postgres_plan(connection, query)
-result = get_agent_plan(connection, query, postgres_plan=postgres)
+result = get_agent_plan(connection, query)
 hints, hinted, gaps = force_plan(connection, result.query, result.plan)
 diffs = differences(postgres, hinted)
 ```
@@ -82,7 +82,7 @@ How it works:
 
 1. `describe_database()` reads from the catalogs only the tables and columns the query uses: row and page counts, distinct counts, the range and quartiles of each column the query compares with `<`, `>` or `BETWEEN`, common values when they are skewed, strong correlation with the table's order, indexes, and foreign keys between those tables. It also gives `max_parallel_workers_per_gather` and `work_mem`. No schema is hardcoded, and the agent only gets raw statistics, never PostgreSQL's estimates or plan.
 2. The system prompt gives the task, the answer's JSON Schema (from the pydantic model `AgentAnswer`), the plan conventions and a worked example on tables that are not in the TPC-H database, so no query there comes with its answer. The answer is a flat list: one entry per operator, the root first, each with an `id` and the `id` of its `parent`. The agent writes this more reliably than a nested tree, where it lost count of the closing brackets. The prompt is the same for every query, so it is cached. The user message gives the database description, the aliases the plan must use and the query. The rendered prompt is about 6.5K characters of system prompt plus 1–3K of user message.
-3. Each answer is validated by `validate_agent_plan()`, which names operators by `id` in its errors (`node 3: a Seq Scan needs alias.`), then checked against the database: the plan must scan the same aliases as PostgreSQL's plan, every index must exist, and `build_hints()` must accept it. All problems go back to the agent in one message, at `low` effort first and `medium` after, up to three answers.
+3. Each answer is validated by `validate_agent_plan()`, which names operators by `id` in its errors (`node 3: a Seq Scan needs alias.`), then checked against the query and the database: the plan must scan exactly the table aliases the query reads, every index must exist, and `build_hints()` must accept it. All problems go back to the agent in one message, at `low` effort first and `medium` after, up to three answers.
 
 It raises `AgentPlanError` (with `.errors` and the raw `.answer`) when no answer is usable, and `RuntimeError` when the model declines or its answer is cut off. Without an API key, the Anthropic SDK raises an authentication error on the first request. Answers vary from call to call, so save `result.answer` when a run must be repeatable.
 
@@ -132,5 +132,5 @@ py -m pytest
 | `project.py` | Prompts for the password, prints PostgreSQL's plan, then forces the same plan with hints, prints it and reports any decision not followed. |
 | `preprocessing.py` | Defines `PlanNode`, the plan form shared by every plan source; `get_postgres_plan()` runs `EXPLAIN` (optionally `ANALYZE` or with hints) and returns a `PlanNode` tree; `unique_aliases()` gives each reused table name its own alias; `build_hints()` turns a plan into `pg_hint_plan` hints; `get_agent_plan()` asks the AI agent for its plan, which `AgentPlanNode` and `validate_agent_plan()` check, using the database facts from `describe_database()`. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
-| `tests/` | Tests for hint building and comparison, for forcing plans on PostgreSQL, and for the AI agent; `tests/fixtures/` holds a sample PostgreSQL plan and agent answer. |
+| `tests/` | Tests for hint building and comparison, for forcing plans on PostgreSQL, and for the AI agent; `tests/fixtures/` holds a sample agent answer. |
 | `agent_runs/` | Not in git: raw agent answers and rendered prompts from local runs. |

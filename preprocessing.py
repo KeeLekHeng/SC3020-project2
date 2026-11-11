@@ -1242,26 +1242,14 @@ def validate_agent_plan(output: str | dict) -> AgentAnswer:
     return answer
 
 
-def relation_mismatches(agent: PlanNode, postgres: PlanNode) -> tuple[set[str], set[str]]:
-    """
-    Return (missing, extra): aliases PostgreSQL's plan scans that the agent's does not,
-    and aliases the agent's plan scans that PostgreSQL's does not.
-
-    A mismatch means the agent misread the query, so its hints would not line up.
-    """
-
-    def scanned(plan: PlanNode) -> set[str]:
-        return {n.alias for n in plan.walk() if n.relation and n.alias}
-
-    return scanned(postgres) - scanned(agent), scanned(agent) - scanned(postgres)
-
-
 def query_relations(query: str) -> list[tuple[str, str, str]] | None:
     """
     Return what the query reads, as (alias, name, kind) per FROM item, outermost first.
 
     kind is "table" (name is the table), "cte" (name is the CTE) or "subquery" (a FROM
-    subquery; name is empty). Returns None if sqlglot cannot parse the query.
+    subquery; name is empty). A function in FROM, such as generate_series(), is left
+    out, because the agent has no operator to read it with. Returns None if sqlglot
+    cannot parse the query.
     """
     parsed = _parse(query)
     if parsed is None:
@@ -1271,6 +1259,7 @@ def query_relations(query: str) -> list[tuple[str, str, str]] | None:
     items = [
         (t.alias_or_name, t.name, "cte" if t.name in ctes and not t.db else "table")
         for t in _relations(parsed)
+        if t.name
     ]
     for sub in parsed.find_all(exp.Subquery):
         alias = sub.parent.alias if isinstance(sub.parent, exp.Lateral) else sub.alias
@@ -1430,25 +1419,20 @@ def get_agent_plan(
     connection: psycopg.Connection,
     query: str,
     client: anthropic.Anthropic | None = None,
-    postgres_plan: PlanNode | None = None,
 ) -> AgentResult:
     """
     Ask the AI agent for its plan for query and return the plan it settles on.
 
     The query is first rewritten by unique_aliases(); result.query holds the rewritten
-    text. postgres_plan is PostgreSQL's plan for that text, used only to check that the
-    agent read the same tables; it is fetched when not given. client defaults to an
-    anthropic.Anthropic() with the key from api_key().
+    text. The agent is never shown PostgreSQL's plan, and its answer is not checked
+    against it. client defaults to an anthropic.Anthropic() with the key from api_key().
     """
     query = unique_aliases(query)
     database = describe_database(connection, query)
-    if postgres_plan is None:
-        postgres_plan = get_postgres_plan(connection, query)
-
     if client is None:
         client = anthropic.Anthropic(api_key=api_key())
 
-    return ask_agent(client, query, database, postgres_plan)
+    return ask_agent(client, query, database)
 
 
 def api_key() -> str | None:
@@ -1477,15 +1461,14 @@ def ask_agent(
     client: anthropic.Anthropic,
     query: str,
     database: DatabaseDescription,
-    postgres_plan: PlanNode,
     max_attempts: int = 3,
 ) -> AgentResult:
     """
     Run the conversation with the agent until it gives a usable plan.
 
-    Each answer is checked by validate_agent_plan(), then against the database: the
-    scanned aliases must match postgres_plan's (relation_mismatches()), every index must
-    exist, and build_hints() must accept the plan. All problems go back in one retry
+    Each answer is checked by validate_agent_plan(), then against the query and the
+    database: the plan must scan exactly the table aliases the query reads
+    (query_relations()), every index must exist, and build_hints() must accept the plan. All problems go back in one retry
     message, up to max_attempts answers in all.
 
     The first answer is asked for at low effort (how hard the model thinks), any retry
@@ -1529,7 +1512,7 @@ def ask_agent(
         try:
             answer = validate_agent_plan(text)
             plan = answer.to_plan_node()
-            errors = _agent_database_errors(plan, postgres_plan, query, database)
+            errors = _agent_database_errors(plan, query, database)
         except AgentPlanError as error:
             errors = error.errors
 
@@ -1553,11 +1536,21 @@ def ask_agent(
 
 
 def _agent_database_errors(
-    plan: PlanNode, postgres_plan: PlanNode, query: str, database: DatabaseDescription
+    plan: PlanNode, query: str, database: DatabaseDescription
 ) -> list[str]:
-    """Problems that only show against the query and database; see ask_agent()."""
+    """
+    Problems that only show against the query and database; see ask_agent().
+
+    The aliases come from the query's text, the list the prompt gives the agent, and not
+    from PostgreSQL's plan, which can drop a join or read a table twice. A query sqlglot
+    cannot parse has no such list, so its aliases are left to build_hints().
+    """
     errors: list[str] = []
-    missing, extra = relation_mismatches(plan, postgres_plan)
+    relations = query_relations(query)
+    tables = {alias: name for alias, name, kind in relations or () if kind == "table"}
+    scanned = {n.alias for n in plan.walk() if n.relation and n.alias}
+    missing = tables.keys() - scanned
+    extra = scanned - tables.keys() if relations is not None else set()
     if missing:
         errors.append(
             f"The query reads {', '.join(sorted(missing))}, but no scan in the plan has "
@@ -1570,7 +1563,6 @@ def _agent_database_errors(
             "table the query reads."
         )
 
-    tables = {n.alias: n.relation for n in postgres_plan.walk() if n.relation and n.alias}
     for node in plan.walk():
         table = tables.get(node.alias or "")
         if node.relation and table and node.relation != table:

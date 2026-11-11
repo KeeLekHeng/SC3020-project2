@@ -19,7 +19,6 @@ from preprocessing import (
     AgentNodeType,
     AgentPlanError,
     DatabaseDescription,
-    PlanNode,
     agent_system_prompt,
     agent_user_prompt,
     ask_agent,
@@ -30,7 +29,6 @@ from preprocessing import (
     _parse,
     _range_columns,
     query_relations,
-    relation_mismatches,
     unique_aliases,
     validate_agent_plan,
 )
@@ -47,12 +45,6 @@ DATABASE = DatabaseDescription(
 def answer() -> dict[str, Any]:
     """A fresh copy of the sample agent answer for query.sql."""
     return json.loads((FIXTURES / "agent_customer_orders.json").read_text(encoding="utf-8"))
-
-
-def postgres_plan() -> PlanNode:
-    """PostgreSQL's plan for query.sql, from the hand-written EXPLAIN fixture."""
-    explain = json.loads((FIXTURES / "pg_customer_orders.json").read_text(encoding="utf-8"))
-    return PlanNode.model_validate(explain[0]["Plan"])
 
 
 def errors_of(output: Any) -> list[str]:
@@ -315,18 +307,6 @@ def test_problems_are_reported_one_stage_at_a_time() -> None:
     assert rules == ["node 5: alias 'o' is already used at node 3."]
 
 
-def test_relation_mismatches() -> None:
-    agent = validate_agent_plan(answer()).to_plan_node()
-
-    assert relation_mismatches(agent, postgres_plan()) == (set(), set())
-
-    data = answer()
-    node(data, 3)["alias"] = "customer"
-    missing, extra = relation_mismatches(validate_agent_plan(data).to_plan_node(), postgres_plan())
-
-    assert (missing, extra) == ({"c"}, {"customer"})
-
-
 def test_system_prompt_is_static_and_free_of_schema_noise() -> None:
     prompt = agent_system_prompt()
 
@@ -365,6 +345,9 @@ def test_query_relations_lists_tables_ctes_and_subqueries() -> None:
     assert ("n2", "nation", "table") in q7_relations
     assert ("shipping", "", "subquery") in q7_relations
     assert query_relations("not sql at all (") is None
+    assert query_relations("SELECT 1 FROM generate_series(1, 3) g JOIN nation n ON n_nationkey = g") == [
+        ("n", "nation", "table")
+    ]
 
 
 def test_query_relations_lists_tables_inside_parenthesised_joins() -> None:
@@ -469,7 +452,7 @@ class FakeClient:
 def test_good_first_answer_is_accepted() -> None:
     client = FakeClient(json.dumps(answer()))
 
-    result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
+    result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert result.problems == []
     assert result.summary.startswith("Hash the filtered orders")
@@ -486,7 +469,7 @@ def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
     node(bad, 3)["alias"] = "customer"
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
-    result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
+    result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert len(result.problems) == 1
     assert [r["output_config"]["effort"] for r in client.requests] == ["low", "medium"]
@@ -494,6 +477,21 @@ def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
     assert [m["role"] for m in retry] == ["user", "assistant", "user"]
     assert retry[1]["content"][0].type == "thinking"
     assert "The query reads c, but no scan in the plan has that alias." in retry[2]["content"]
+    assert "The plan scans customer, which is not an alias of a table the query reads." in retry[2]["content"]
+
+
+def test_plan_is_checked_against_the_query_and_not_postgresqls_plan() -> None:
+    # PostgreSQL answers this with two index scans, lineitem and lineitem_1.
+    query = "SELECT min(l_orderkey), max(l_orderkey) FROM lineitem"
+    plan = {"nodes": [
+        {"id": 1, "parent": None, "node_type": "Aggregate", "strategy": "Plain"},
+        {"id": 2, "parent": 1, "node_type": "Seq Scan", "relation": "lineitem", "alias": "lineitem"},
+    ]}
+    client = FakeClient(json.dumps(plan))
+
+    result = ask_agent(cast(anthropic.Anthropic, client), query, DATABASE)
+
+    assert result.problems == []
 
 
 def test_unknown_index_goes_back_to_the_agent() -> None:
@@ -501,7 +499,7 @@ def test_unknown_index_goes_back_to_the_agent() -> None:
     node(bad, 3).update(node_type="Index Scan", index_name="customer_idx")
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
-    ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
+    ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     retry = client.requests[1]["messages"][2]["content"]
     assert "'customer_idx' is not an index on customer. Its indexes are: customer_pkey." in retry
@@ -512,7 +510,7 @@ def test_relation_that_is_not_the_aliased_table_goes_back_to_the_agent() -> None
     node(bad, 3).update(node_type="Index Scan", relation="c", index_name="customer_pkey")
     client = FakeClient(json.dumps(bad), json.dumps(answer()))
 
-    ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
+    ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     retry = client.requests[1]["messages"][2]["content"]
     assert "Scan of c: c reads the table customer, so relation must be 'customer', not 'c'." in retry
@@ -523,7 +521,7 @@ def test_agent_gives_up_after_max_attempts() -> None:
     client = FakeClient("no plan", "still no plan")
 
     with pytest.raises(AgentPlanError) as caught:
-        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan(), max_attempts=2)
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, max_attempts=2)
 
     assert caught.value.answer == "still no plan"
     assert len(client.requests) == 2
@@ -533,7 +531,7 @@ def test_cut_off_answer_raises() -> None:
     client = FakeClient("{", stop_reason="max_tokens")
 
     with pytest.raises(RuntimeError, match="max_tokens"):
-        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, postgres_plan())
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
 
 def test_database_description_reads_the_catalogs(connection: psycopg.Connection) -> None:
