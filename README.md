@@ -100,13 +100,13 @@ One run on 2026-11-11 with the Docker database:
 | Measure | Value |
 | --- | --- |
 | Plans accepted | 22/22 |
-| Accepted on the first answer | 21/22 |
-| Answers in total | 23 |
-| Input tokens per request (cached part) | 3,757 (2,523) |
-| Output tokens per request, thinking included | 2,853 |
-| Input and output tokens per query | 3,928 and 2,982 |
+| Accepted on the first answer | 20/22 |
+| Answers in total | 24 |
+| Input tokens per request (cached part) | 3,760 (2,523) |
+| Output tokens per request, thinking included | 2,448 |
+| Input and output tokens per query | 4,102 and 2,671 |
 
-A run over all 22 queries costs about 4 US cents.
+A run over all 22 queries costs 3 to 4 US cents.
 
 ### Notes for the comparison and GUI work
 
