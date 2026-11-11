@@ -1032,6 +1032,17 @@ class AgentPlanNode(BaseModel):
     because the agent is asked for its choices, not for estimates. The field
     descriptions, and the description in model_config instead of this docstring, are
     part of the JSON Schema in the agent's prompt.
+
+    Limitations, each there so that build_hints() can force the plan:
+
+    - Every table alias the query reads is scanned exactly once (see
+      _agent_database_errors()). The plan cannot read one alias twice or leave one
+      out, as PostgreSQL's own plans sometimes do.
+    - Only the operators in AgentNodeType can be chosen. Memoize and Incremental
+      Sort, for example, cannot.
+    - Only tables can be scanned. A function or a VALUES list in FROM has no operator
+      here, and a view is treated as a table although hints for it have no effect.
+    - An answer holds at most AGENT_MAX_NODES operators.
     """
 
     model_config = ConfigDict(
