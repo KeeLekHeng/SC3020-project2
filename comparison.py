@@ -9,7 +9,7 @@ on PostgreSQL and checks which forced decisions it followed.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import psycopg
 
@@ -174,15 +174,6 @@ class PlanEvaluation:
     attribution: tuple[Attribution, ...]
     forcing: ForcePlanResult | ForcingFailure
 
-    def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-safe representation with stable primitive field names."""
-        return {
-            "proposed": _comparison_dict(self.proposed),
-            "realizability": _realizability_dict(self.realizability),
-            "realized": _comparison_dict(self.realized),
-            "attribution": [_attribution_dict(item) for item in self.attribution],
-            "forcing": _forcing_dict(self.forcing),
-        }
 
 
 def decisions(plan: PlanNode) -> dict[Decision, Choice]:
@@ -528,100 +519,3 @@ def _attribution(
         )
 
     return tuple(entries)
-
-
-def _score_dict(score: MetricScore) -> dict[str, Any]:
-    return {
-        "numerator": score.numerator,
-        "denominator": score.denominator,
-        "rate": score.rate,
-        "status": score.status.value,
-        "explanation": score.explanation,
-    }
-
-
-def _view_dict(view: ComparisonView) -> dict[str, Any]:
-    return {
-        "matching": view.matching,
-        "different": view.different,
-        "total": view.total,
-        "difference": _score_dict(view.difference),
-        "similarity": _score_dict(view.similarity),
-    }
-
-
-def _decision_dict(decision: Decision) -> dict[str, Any]:
-    return {"kind": decision.kind, "tables": list(decision.tables)}
-
-
-def _choice_dict(choice: Choice | None) -> dict[str, str] | None:
-    return None if choice is None else {"value": choice.value}
-
-
-def _difference_dict(difference: Difference) -> dict[str, Any]:
-    return {
-        "decision": _decision_dict(difference.decision),
-        "a": _choice_dict(difference.a),
-        "b": _choice_dict(difference.b),
-    }
-
-
-def _decision_choice_dict(item: DecisionChoice) -> dict[str, Any]:
-    return {
-        "decision": _decision_dict(item.decision),
-        "choice": _choice_dict(item.choice),
-    }
-
-
-def _comparison_dict(comparison: PlanComparison) -> dict[str, Any]:
-    return {
-        "all_kinds": _view_dict(comparison.all_kinds),
-        "core": _view_dict(comparison.core),
-        "by_kind": [
-            {"kind": item.kind, **_view_dict(item.view)} for item in comparison.by_kind
-        ],
-        "matches": [
-            {
-                "decision": _decision_dict(match.decision),
-                "a": _choice_dict(match.a),
-                "b": _choice_dict(match.b),
-            }
-            for match in comparison.matches
-        ],
-        "differences": [_difference_dict(item) for item in comparison.differences],
-    }
-
-
-def _realizability_dict(result: RealizabilityResult) -> dict[str, Any]:
-    return {
-        "score": _score_dict(result.score),
-        "reproduced": [_decision_choice_dict(item) for item in result.reproduced],
-        "extra": [_decision_choice_dict(item) for item in result.extra],
-        "gaps": [_difference_dict(item) for item in result.gaps],
-    }
-
-
-def _attribution_dict(item: Attribution) -> dict[str, Any]:
-    return {
-        "decision": _decision_dict(item.decision),
-        "choice": _choice_dict(item.choice),
-        "attributable": item.attributable,
-        "targeted": item.targeted,
-        "reproduced": item.reproduced,
-        "has_gap": item.has_gap,
-        "reason": item.reason,
-    }
-
-
-def _forcing_dict(outcome: ForcePlanResult | ForcingFailure) -> dict[str, Any]:
-    if isinstance(outcome, ForcingFailure):
-        return {"status": "unavailable", "reason": outcome.reason}
-
-    return {
-        "status": "defined",
-        "hints": outcome.hints,
-        "switch_offs": outcome.switch_offs,
-        "leading": outcome.leading,
-        "targets": [_decision_dict(item) for item in sorted(outcome.targets)],
-        "gaps": [_difference_dict(item) for item in outcome.gaps],
-    }

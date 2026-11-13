@@ -390,25 +390,11 @@ labelled as partly or wholly chosen by PostgreSQL.
 
 ## Structured result contract
 
-The typed Python result is `PlanEvaluation`. GUI and experiment consumers should use
-its `to_dict()` representation rather than inspect `PlanNode`, `Decision` or `Choice`
-objects directly. The primitive representation contains:
-
-- `proposed`: all-kinds/core scores, per-kind views, matches and differences;
-- `realizability`: its score, reproduced and extra decisions, and gaps (the unmatched
-  requests);
-- `realized`: the same pairwise structure as `proposed`, including unavailable status
-  and explanation when forcing failed;
-- `attribution`: one primitive entry per realized decision with targeted, reproduced,
-  gap and attributable flags plus a reason; and
-- `forcing`: status, selected hints and retry settings, targets and gaps, or the
-  structured failure reason.
-
-Decisions are ordered list entries with string `kind` and a list of `tables`; choices
-contain their display `value`. Status values are stable strings: `defined`,
-`not_applicable`, or `unavailable`. Rates remain unrounded numbers; formatting belongs
-to the CLI or GUI. The result can be passed directly to `json.dumps()` without a custom
-encoder.
+The typed Python result is `PlanEvaluation`. It holds the proposed comparison,
+the realizability result, the realized comparison, the attribution entries and the
+forcing outcome. Each difference keeps the `PlanNode` that made each choice, so a
+consumer can highlight the node. Rates remain unrounded numbers; formatting belongs to
+the CLI or GUI.
 
 ## Reproducibility records
 

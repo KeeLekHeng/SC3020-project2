@@ -1,6 +1,5 @@
 """Deterministic plan-comparison metrics and their consumer-facing evidence."""
 
-import json
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -312,28 +311,3 @@ def test_forcing_failure_preserves_proposal_and_marks_dependent_metrics_unavaila
     assert evaluation.realized.all_kinds.difference.denominator is None
     assert evaluation.realized.all_kinds.difference.explanation == "pg_hint_plan unavailable"
     assert evaluation.realized.all_kinds.total is None
-
-
-@pytest.mark.parametrize("failure", [False, True])
-def test_evaluation_to_dict_is_json_safe_for_complete_and_partial_results(failure: bool) -> None:
-    postgres = scan("o")
-    agent = scan("o", "Index Scan")
-    outcome = (
-        ForcingFailure("cannot force")
-        if failure
-        else force_result(
-            postgres,
-            requested=agent,
-            targets=frozenset({Decision("scan", ("o",))}),
-        )
-    )
-
-    data = evaluate_plans(postgres, agent, outcome).to_dict()
-    encoded = json.dumps(data)
-
-    assert encoded
-    assert data["proposed"]["differences"][0]["decision"] == {
-        "kind": "scan", "tables": ["o"]
-    }
-    assert data["forcing"]["status"] == ("unavailable" if failure else "defined")
-    assert "PlanNode" not in encoded
