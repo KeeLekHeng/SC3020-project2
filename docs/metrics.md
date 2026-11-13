@@ -134,10 +134,9 @@ comparison = compare_plans(postgres_plan, agent_plan)
 proposed_difference = comparison.all_kinds.difference
 ```
 
-`proposed_difference.numerator` and `.denominator` are the documented fraction. Its
-rate is `0.0` if the comparison universe is empty, although a valid execution plan
-will normally produce at least one decision. The paired similarity score uses the same
-universe and is `1.0` for that empty identity case.
+`proposed_difference.numerator` and `.denominator` are the documented fraction. If the
+comparison universe is empty, both the difference and similarity scores are
+`not_applicable`, although a valid execution plan always produces at least one decision.
 
 ## Metric 2: plan realizability rate
 
@@ -396,8 +395,8 @@ its `to_dict()` representation rather than inspect `PlanNode`, `Decision` or `Ch
 objects directly. The primitive representation contains:
 
 - `proposed`: all-kinds/core scores, per-kind views, matches and differences;
-- `realizability`: its score, requested/reproduced/unmatched/extra decisions, gaps and
-  selected-attempt targets;
+- `realizability`: its score, reproduced and extra decisions, and gaps (the unmatched
+  requests);
 - `realized`: the same pairwise structure as `proposed`, including unavailable status
   and explanation when forcing failed;
 - `attribution`: one primitive entry per realized decision with targeted, reproduced,

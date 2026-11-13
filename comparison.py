@@ -76,11 +76,11 @@ class MetricScore:
 
 @dataclass(frozen=True)
 class ComparisonView:
-    """Matching and different counts for one decision universe."""
+    """Matching and different counts for one decision universe; None if unobservable."""
 
-    matching: int
-    different: int
-    total: int
+    matching: int | None
+    different: int | None
+    total: int | None
     difference: MetricScore
     similarity: MetricScore
 
@@ -145,12 +145,10 @@ class RealizabilityResult:
     """How many force-eligible agent requests appear in the realized plan."""
 
     score: MetricScore
-    requested: tuple[DecisionChoice, ...]
     reproduced: tuple[DecisionChoice, ...]
-    unmatched: tuple[Difference, ...]
     extra: tuple[DecisionChoice, ...]
+    # The requested force-eligible decisions not reproduced, from the forcing outcome.
     gaps: tuple[Difference, ...]
-    targets: tuple[Decision, ...]
 
 
 @dataclass(frozen=True)
@@ -266,32 +264,28 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
 def compare_plans(a: PlanNode, b: PlanNode) -> PlanComparison:
     """Compare any two plans over the union of their semantic decision keys."""
     found_a, found_b = decisions(a), decisions(b)
-    universe = set(found_a) | set(found_b)
-    ordered = sorted(universe)
-    matching_keys = [
-        decision
-        for decision in ordered
-        if choices_equal(decision, found_a.get(decision), found_b.get(decision))
-    ]
-    different_keys = [decision for decision in ordered if decision not in matching_keys]
+    same = {
+        decision: choices_equal(decision, found_a.get(decision), found_b.get(decision))
+        for decision in sorted(found_a.keys() | found_b.keys())
+    }
 
     matches = tuple(
         DecisionMatch(decision, found_a[decision], found_b[decision])
-        for decision in matching_keys
+        for decision, equal in same.items()
+        if equal
     )
     found_differences = tuple(
         Difference(decision, found_a.get(decision), found_b.get(decision))
-        for decision in different_keys
+        for decision, equal in same.items()
+        if not equal
     )
-    all_kinds = _comparison_view(ordered, found_a, found_b)
-    core_keys = [d for d in ordered if d.kind not in {"parallel", "gather"}]
-    core = _comparison_view(core_keys, found_a, found_b)
+    all_kinds = _comparison_view(list(same.values()))
+    core = _comparison_view(
+        [equal for d, equal in same.items() if d.kind not in {"parallel", "gather"}]
+    )
     by_kind = tuple(
-        KindComparison(
-            kind,
-            _comparison_view([d for d in ordered if d.kind == kind], found_a, found_b),
-        )
-        for kind in sorted({decision.kind for decision in ordered})
+        KindComparison(kind, _comparison_view([e for d, e in same.items() if d.kind == kind]))
+        for kind in sorted({decision.kind for decision in same})
     )
 
     return PlanComparison(all_kinds, core, by_kind, matches, found_differences)
@@ -301,16 +295,16 @@ def realizability(
     requested_plan: PlanNode,
     outcome: ForcePlanResult | ForcingFailure,
 ) -> RealizabilityResult:
-    """Measure reproduced force-eligible requests without claiming hint causality."""
-    requested_all = decisions(requested_plan)
+    """
+    Measure reproduced force-eligible requests without claiming hint causality.
+
+    outcome must come from forcing requested_plan: its gaps are the unreproduced requests.
+    """
     requested = {
         decision: choice
-        for decision, choice in requested_all.items()
+        for decision, choice in decisions(requested_plan).items()
         if decision.kind in FORCED_KINDS
     }
-    requested_items = tuple(
-        DecisionChoice(decision, requested[decision]) for decision in sorted(requested)
-    )
 
     if isinstance(outcome, ForcingFailure):
         score = MetricScore(
@@ -320,15 +314,11 @@ def realizability(
             MetricStatus.UNAVAILABLE,
             outcome.reason,
         )
-        return RealizabilityResult(score, requested_items, (), (), (), (), ())
+        return RealizabilityResult(score, (), (), ())
 
     realized_all = decisions(outcome.plan)
-    reproduced_keys = [
-        decision
-        for decision in sorted(requested)
-        if choices_equal(decision, requested[decision], realized_all.get(decision))
-    ]
-    unmatched_keys = [d for d in sorted(requested) if d not in reproduced_keys]
+    gap_keys = {gap.decision for gap in outcome.gaps}
+    reproduced_keys = [d for d in sorted(requested) if d not in gap_keys]
     extra_keys = [
         decision
         for decision in sorted(realized_all)
@@ -354,19 +344,13 @@ def realizability(
 
     return RealizabilityResult(
         score=score,
-        requested=requested_items,
         reproduced=tuple(
             DecisionChoice(decision, requested[decision]) for decision in reproduced_keys
-        ),
-        unmatched=tuple(
-            Difference(decision, requested[decision], realized_all.get(decision))
-            for decision in unmatched_keys
         ),
         extra=tuple(
             DecisionChoice(decision, realized_all[decision]) for decision in extra_keys
         ),
         gaps=outcome.gaps,
-        targets=tuple(sorted(outcome.targets)),
     )
 
 
@@ -393,13 +377,7 @@ def evaluate_plans(
 
 def differences(a: PlanNode, b: PlanNode) -> list[Difference]:
     """Return every decision plans a and b made differently, sorted by decision."""
-    found_a, found_b = decisions(a), decisions(b)
-
-    return [
-        Difference(decision, found_a.get(decision), found_b.get(decision))
-        for decision in sorted(found_a.keys() | found_b.keys())
-        if not choices_equal(decision, found_a.get(decision), found_b.get(decision))
-    ]
+    return list(compare_plans(a, b).differences)
 
 
 def realization_gaps(requested: PlanNode, forced: PlanNode) -> list[Difference]:
@@ -490,39 +468,24 @@ def choices_equal(decision: Decision, a: Choice | None, b: Choice | None) -> boo
     )
 
 
-def _comparison_view(
-    keys: list[Decision],
-    found_a: dict[Decision, Choice],
-    found_b: dict[Decision, Choice],
-) -> ComparisonView:
-    """Build counts and rates for an already-selected decision universe."""
-    total = len(keys)
-    matching = sum(
-        choices_equal(decision, found_a.get(decision), found_b.get(decision))
-        for decision in keys
-    )
+def _comparison_view(same: list[bool]) -> ComparisonView:
+    """Counts and rates for a decision universe, given whether each decision matched."""
+    total, matching = len(same), sum(same)
     different = total - matching
-    explanation = "No comparable decisions existed; the plans are identical on an empty universe."
-    difference = MetricScore(
-        different,
-        total,
-        different / total if total else 0.0,
-        MetricStatus.DEFINED,
-        explanation if not total else None,
-    )
-    similarity = MetricScore(
-        matching,
-        total,
-        matching / total if total else 1.0,
-        MetricStatus.DEFINED,
-        explanation if not total else None,
-    )
+    if not total:
+        score = MetricScore(
+            0, 0, None, MetricStatus.NOT_APPLICABLE, "The plans have no decisions to compare."
+        )
+        return ComparisonView(0, 0, 0, score, score)
+
+    difference = MetricScore(different, total, different / total, MetricStatus.DEFINED)
+    similarity = MetricScore(matching, total, matching / total, MetricStatus.DEFINED)
     return ComparisonView(matching, different, total, difference, similarity)
 
 
 def _unavailable_comparison(reason: str) -> PlanComparison:
     score = MetricScore(None, None, None, MetricStatus.UNAVAILABLE, reason)
-    view = ComparisonView(0, 0, 0, score, score)
+    view = ComparisonView(None, None, None, score, score)
     return PlanComparison(view, view, (), (), ())
 
 
@@ -639,12 +602,9 @@ def _comparison_dict(comparison: PlanComparison) -> dict[str, Any]:
 def _realizability_dict(result: RealizabilityResult) -> dict[str, Any]:
     return {
         "score": _score_dict(result.score),
-        "requested": [_decision_choice_dict(item) for item in result.requested],
         "reproduced": [_decision_choice_dict(item) for item in result.reproduced],
-        "unmatched": [_difference_dict(item) for item in result.unmatched],
         "extra": [_decision_choice_dict(item) for item in result.extra],
         "gaps": [_difference_dict(item) for item in result.gaps],
-        "targets": [_decision_dict(item) for item in result.targets],
     }
 
 

@@ -98,13 +98,13 @@ def test_pairwise_identical_changed_and_missing_decisions() -> None:
     ]
 
 
-def test_empty_pairwise_universe_uses_identity_convention() -> None:
+def test_empty_pairwise_universe_is_not_applicable() -> None:
     comparison = compare_plans(PlanNode(node_type="Hash"), PlanNode(node_type="Hash"))
 
     assert comparison.all_kinds.total == 0
-    assert comparison.all_kinds.difference.rate == 0.0
-    assert comparison.all_kinds.similarity.rate == 1.0
-    assert "empty universe" in (comparison.all_kinds.difference.explanation or "")
+    assert comparison.all_kinds.difference.status is MetricStatus.NOT_APPLICABLE
+    assert comparison.all_kinds.difference.rate is None
+    assert comparison.all_kinds.similarity.rate is None
 
 
 def test_core_view_excludes_parallel_and_gather_only() -> None:
@@ -129,7 +129,7 @@ def test_moved_gather_counts_twice_only_in_all_kinds() -> None:
     gather = [item for item in comparison.differences if item.decision.kind == "gather"]
 
     assert len(gather) == 2
-    assert comparison.all_kinds.different == comparison.core.different + 2
+    assert (comparison.all_kinds.different, comparison.core.different) == (2, 0)
 
 
 def test_per_kind_totals_reconcile_with_all_kinds() -> None:
@@ -165,7 +165,6 @@ def test_realizability_retains_gaps_without_counting_extras_in_denominator() -> 
     result = realizability(requested, outcome)
 
     assert (result.score.numerator, result.score.denominator) == (1, 2)
-    assert [str(item.decision) for item in result.unmatched] == ["scan(o)"]
     assert result.gaps == outcome.gaps
     assert str(result.gaps[0].decision) == "scan(o)"
 
@@ -322,6 +321,7 @@ def test_forcing_failure_preserves_proposal_and_marks_dependent_metrics_unavaila
     assert evaluation.realized.all_kinds.difference.numerator is None
     assert evaluation.realized.all_kinds.difference.denominator is None
     assert evaluation.realized.all_kinds.difference.explanation == "pg_hint_plan unavailable"
+    assert evaluation.realized.all_kinds.total is None
 
 
 @pytest.mark.parametrize("failure", [False, True])
