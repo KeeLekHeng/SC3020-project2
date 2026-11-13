@@ -67,6 +67,21 @@ the same PostgreSQL scan method with a named index.
 For transparency, every reported rate should be accompanied by its numerator and
 denominator, for example `6/20 decisions (30%)`.
 
+Every metric also has one of three explicit statuses:
+
+- `defined`: the required inputs exist and the rate has an applicable denominator;
+- `not_applicable`: the inputs exist, but there are no applicable decisions for this
+  metric; or
+- `unavailable`: a required input, such as the realized plan, could not be obtained.
+
+`not_applicable` and `unavailable` are both displayed without a numeric rate, but they
+mean different things and must not be converted to 0%. Each carries a human-readable
+reason. In particular, if forcing fails, the proposed-plan comparison remains defined
+because `P` and `A` still exist; only realizability and realized-plan difference are
+unavailable. Counts that cannot be observed are represented as `null`, not zero. A
+known denominator may remain available—for example, the number of force-eligible agent
+requests is known even when forcing fails.
+
 ## Metric 1: proposed-plan difference rate
 
 ### Question answered
@@ -115,22 +130,21 @@ scan is impossible and falls back to a sequential scan.
 ### Implementation mapping
 
 ```python
-postgres = decisions(postgres_plan)
-agent = decisions(agent_plan)
-universe = postgres.keys() | agent.keys()
-different = differences(postgres_plan, agent_plan)
-
-proposed_difference_rate = len(different) / len(universe)
+comparison = compare_plans(postgres_plan, agent_plan)
+proposed_difference = comparison.all_kinds.difference
 ```
 
-The implementation should define the rate as `0.0` if the comparison universe is
-empty, although a valid execution plan will normally produce at least one decision.
+`proposed_difference.numerator` and `.denominator` are the documented fraction. Its
+rate is `0.0` if the comparison universe is empty, although a valid execution plan
+will normally produce at least one decision. The paired similarity score uses the same
+universe and is `1.0` for that empty identity case.
 
 ## Metric 2: plan realizability rate
 
 ### Question answered
 
-How much of the agent's forceable strategy could PostgreSQL actually realize?
+How much of the agent's force-eligible strategy appeared in PostgreSQL's realized
+plan?
 
 ### Plans compared
 
@@ -138,39 +152,52 @@ How much of the agent's forceable strategy could PostgreSQL actually realize?
 Agent-proposed plan A  versus  realized agent plan R
 ```
 
-Only decision kinds that `pg_hint_plan` is intended to force are included:
+Only decision kinds that the forcing layer can potentially target are included:
 
 ```text
 scan, parallel, join, outer
 ```
 
-These are the kinds in `FORCED_KINDS` in `comparison.py`.
+These are the kinds in `FORCED_KINDS` in `comparison.py`. This makes a decision
+*force-eligible*; it does not prove that the selected forcing attempt emitted a hint
+for that particular decision.
 
 ### Definition
 
-Let `F(A)` be the forceable decisions requested by the agent. A requested decision is
-followed when the same decision key exists in `D(R)` and its choice matches under the
-same equality rule used by `differences()`.
+Let `F(A)` be the force-eligible decisions requested by the agent. A requested decision
+is reproduced when the same decision key exists in `D(R)` and its choice matches under
+the same equality rule used by `differences()`.
 
 ```text
-Realizability(A, R) = followed requested forceable decisions / |F(A)|
+Realizability(A, R) = reproduced requested force-eligible decisions / |F(A)|
 ```
 
 Equivalently:
 
 ```text
 Realizability(A, R)
-    = 1 - unmatched requested forceable decisions / |F(A)|
+    = 1 - unmatched requested force-eligible decisions / |F(A)|
 ```
 
-If the agent plan contains no forceable decisions, the rate is undefined and should be
-reported as `N/A`, not as 0% or 100%.
+If the agent plan contains no force-eligible decisions, the rate is `not_applicable`
+and should be reported as `N/A`, not as 0% or 100%.
 
 `force_plan()` also returns `realization_gaps()`. The gaps should be listed alongside
 this rate because they explain exactly which requested scan, parallelism, join-method
 or outer-side decisions were not reproduced. When calculating the rate, count
 unmatched decisions requested by `A`; a new decision that appears only in `R` is useful
-diagnostic information but is not itself an agent request.
+diagnostic information but is not itself an agent request or realization gap.
+
+Realizability is an outcome metric, not a causality claim. `build_hints()` can skip a
+scan with no usable alias, a join involving an unnamed input, or a Parallel hint when
+the worker count is unknown. `force_plan()` can also select its retry with
+`leading=False`. Therefore every requested force-eligible decision should additionally
+record whether the *selected* forcing attempt actually targeted it. A reproduced but
+untargeted choice may simply be what PostgreSQL would have chosen itself.
+
+The implementation exposes this through `realizability(agent_plan, forcing_outcome)`.
+Its score is the reproduced count divided by the requested force-eligible count; extra
+realized decisions are returned separately and never enter that denominator.
 
 ### Reasoning
 
@@ -235,21 +262,27 @@ Gather placement and other surrounding operators may be PostgreSQL's own choices
 it constructs `R`. A realized-plan difference is therefore a structural difference
 between two executable plans, not automatically a difference caused by the agent.
 
-When attributing an individual realized decision to the agent, require both:
+When attributing an individual realized decision to the agent, require all three:
 
-1. its kind is in `FORCED_KINDS`; and
-2. `force_plan()` reports no realization gap for that decision.
+1. the selected forcing attempt emitted a hint that targets that decision;
+2. the realized plan reproduced the requested choice; and
+3. `force_plan()` reports no realization gap for that decision.
+
+Membership in `FORCED_KINDS` alone is insufficient. For example, if the selected retry
+uses `leading=False`, a matching `outer` choice is not attributable unless another
+emitted `Leading` target actually covers it. This conservative rule prevents a
+coincidental PostgreSQL choice from being credited to the agent.
 
 ### Implementation mapping
 
 ```python
-postgres = decisions(postgres_plan)
-realized = decisions(realized_agent_plan)
-universe = postgres.keys() | realized.keys()
-different = differences(postgres_plan, realized_agent_plan)
-
-realized_difference_rate = len(different) / len(universe)
+comparison = compare_plans(postgres_plan, realized_agent_plan)
+realized_difference = comparison.all_kinds.difference
 ```
+
+`evaluate_plans(postgres_plan, agent_plan, forcing_outcome)` composes this comparison
+with the proposed comparison and realizability result. When forcing is unavailable it
+returns an unavailable realized comparison rather than discarding the proposed one.
 
 ## Interpreting the three metrics together
 
@@ -258,14 +291,14 @@ For example:
 
 ```text
 Proposed-plan difference:  9/21 decisions (42.9%)
-Plan realizability:        14/16 forceable decisions (87.5%)
+Plan realizability:        14/16 force-eligible decisions (87.5%)
 Realized-plan difference:  6/20 decisions (30.0%)
 ```
 
 This result means:
 
 - the agent originally made a substantially different set of choices;
-- PostgreSQL could reproduce most, but not all, forceable agent choices; and
+- PostgreSQL could reproduce most, but not all, force-eligible agent choices; and
 - after the unrealizable choices were replaced, the executable agent plan was closer
   to PostgreSQL's normal plan than the original proposal was.
 
@@ -348,11 +381,35 @@ this distinction may materially affect the results.
 
 ### Agent-attributable realized decisions
 
-For the realized plan, separately report how many followed decisions can confidently
-be attributed to the agent. These are only followed decisions of kinds `scan`,
-`parallel`, `join` and `outer`. Differences involving Aggregate, Gather, Sort, Limit,
+For the realized plan, separately report how many decisions can confidently be
+attributed to the agent. These must be explicitly targeted by the selected forcing
+attempt, reproduced in the realized plan, and free of a realization gap. Decisions of
+kinds `scan`, `parallel`, `join` and `outer` are eligible for this check, but eligibility
+alone is not attribution. Differences involving Aggregate, Gather, Sort, Limit,
 Materialize and other unforced kinds describe the executable result but must be
 labelled as partly or wholly chosen by PostgreSQL.
+
+## Structured result contract
+
+The typed Python result is `PlanEvaluation`. GUI and experiment consumers should use
+its `to_dict()` representation rather than inspect `PlanNode`, `Decision` or `Choice`
+objects directly. The primitive representation contains:
+
+- `proposed`: all-kinds/core scores, per-kind views, matches and differences;
+- `realizability`: its score, requested/reproduced/unmatched/extra decisions, gaps and
+  selected-attempt targets;
+- `realized`: the same pairwise structure as `proposed`, including unavailable status
+  and explanation when forcing failed;
+- `attribution`: one primitive entry per realized decision with targeted, reproduced,
+  gap and attributable flags plus a reason; and
+- `forcing`: status, selected hints and retry settings, targets and gaps, or the
+  structured failure reason.
+
+Decisions are ordered list entries with string `kind` and a list of `tables`; choices
+contain their display `value`. Status values are stable strings: `defined`,
+`not_applicable`, or `unavailable`. Rates remain unrounded numbers; formatting belongs
+to the CLI or GUI. The result can be passed directly to `json.dumps()` without a custom
+encoder.
 
 ## Reproducibility records
 
@@ -364,7 +421,8 @@ information to reconstruct its result. Save at least:
 - the raw `AgentResult.answer`, summary and retry problems;
 - the validated agent `PlanNode`;
 - PostgreSQL's normal plan and the realized hinted plan;
-- the generated hints and realization gaps;
+- the generated hints, selected forcing attempt, targeted decisions and realization
+  gaps;
 - PostgreSQL version, database scale, indexes and relevant planner settings; and
 - all metric numerators, denominators, rates and per-kind breakdowns.
 
@@ -442,6 +500,32 @@ some non-table scans, individual aggregate strategies and certain outer-join sid
 Some requested plans are also inherently impossible, such as a usable index scan with
 no applicable index condition. Realization gaps should therefore be classified where
 possible as either an impossible request, a forcing limitation or an unexplained gap.
+
+The gap calculation compares every requested decision in `FORCED_KINDS`, even when
+hint generation skipped that individual decision. It excludes decisions that appear
+only in the realized plan; those are reported separately as extras. A gap is therefore evidence
+that the requested choice was not reproduced, not proof that PostgreSQL rejected a
+specific hint. The selected attempt's target metadata must be consulted before making
+that stronger claim. The reverse is also important: an untargeted decision can match
+by coincidence and must not be marked agent-attributable.
+
+## Technical debt
+
+### Decision-key construction is duplicated
+
+`preprocessing._decision_tables()` mirrors `comparison._tables()` so hint-generation
+targets use the same semantic keys as plan comparison. This duplication does not alter
+current metric results and is covered by target-tracking tests, but the two helpers
+could drift when folded operators or unnamed-leaf rules change. A future cleanup should
+move decision-key construction into one dependency-neutral shared helper and have both
+modules call it.
+
+### Forcing failure produces a partial evaluation
+
+Failure to build or execute hints does not invalidate the original agent proposal.
+The `P` versus `A` metric should still be reported, while realizability and realized
+difference are marked `unavailable` with the exact failure reason. Workload summaries
+must count these forcing failures rather than silently dropping the query.
 
 ### The agent's plan vocabulary is restricted
 

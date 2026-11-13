@@ -3,11 +3,35 @@
 import psycopg
 import pytest
 
-from comparison import differences, force_plan, realization_gaps
+from comparison import (
+    MetricStatus,
+    differences,
+    evaluate_plans,
+    force_plan,
+    force_plan_detailed,
+    realization_gaps,
+)
 from preprocessing import PlanNode, build_hints, get_postgres_plan, unique_aliases
 from tests.queries import REFUSED, REMOVED_JOINS, SHAPES, TPCH
 
 QUERIES = {**TPCH, **SHAPES}
+
+
+def test_live_pipeline_produces_three_metrics_and_details(
+    connection: psycopg.Connection,
+) -> None:
+    """A real PostgreSQL forcing outcome feeds the complete evaluation contract."""
+    query = "SELECT * FROM customer c"
+    postgres = get_postgres_plan(connection, query)
+    outcome = force_plan_detailed(connection, query, postgres)
+
+    evaluation = evaluate_plans(postgres, postgres, outcome)
+
+    assert evaluation.proposed.all_kinds.difference.status is MetricStatus.DEFINED
+    assert evaluation.realizability.score.status is MetricStatus.DEFINED
+    assert evaluation.realized.all_kinds.difference.status is MetricStatus.DEFINED
+    assert isinstance(evaluation.proposed.differences, tuple)
+    assert isinstance(evaluation.realized.differences, tuple)
 
 
 def swap_join_sides(node: PlanNode) -> PlanNode:
