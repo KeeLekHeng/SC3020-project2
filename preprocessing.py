@@ -362,11 +362,24 @@ JoinTree = str | tuple
 OUTER_JOINS = ("Left", "Right", "Full")
 
 
-class HintTarget(NamedTuple):
-    """A semantic planner decision directly targeted by an emitted hint."""
+# Operators that make no decision of their own: a Hash belongs to its Hash Join, a
+# Bitmap Index Scan to its heap scan, and a Subquery Scan only passes rows through.
+# PostgreSQL drops a Subquery Scan when nothing above needs it, so counting it would
+# make two equal plans differ.
+FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
 
+
+class Decision(NamedTuple):
+    """A planner decision: its kind, such as "join", and the tables it covers."""
+
+    # "scan", "parallel", "join", "outer", "aggregate", "gather", or any other
+    # operator's lowercased node_type, such as "sort", "limit" or "materialize".
     kind: str
+    # Sorted aliases, such as ("c", "o"), and <Result>-style names for unnamed leaves.
     tables: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return f"{self.kind}({', '.join(self.tables)})"
 
 
 @dataclass(frozen=True)
@@ -374,7 +387,7 @@ class HintBuildResult:
     """The generated hint text and the decisions those exact hints target."""
 
     hints: str
-    targets: frozenset[HintTarget]
+    targets: frozenset[Decision]
 
 # A query's subqueries, each as (aliases of the relations inside, its name in hints or
 # None for a pulled-up IN or EXISTS, whether PostgreSQL keeps it whole with exactly
@@ -485,9 +498,9 @@ def build_hints_detailed(
     query lacks.
     """
     hints: list[str] = []
-    targets: set[HintTarget] = set()
+    targets: set[Decision] = set()
     levels: list[JoinTree] = []
-    join_trees: dict[HintTarget, JoinTree] = {}
+    join_trees: dict[Decision, JoinTree] = {}
     parsed = _parse(query)
     relations = {t.alias_or_name: t.name for t in _relations(parsed)} if parsed else {}
 
@@ -515,10 +528,10 @@ def build_hints_detailed(
     else:
         hints.append("Set(max_parallel_workers_per_gather 0)")
         targets.update(
-            HintTarget("parallel", (node.alias,))
+            Decision("parallel", (node.alias,))
             for node in nodes
             if node.alias
-            and node.node_type not in {"Hash", "Bitmap Index Scan", "Subquery Scan"}
+            and node.node_type not in FOLDED
             and not node.parallel_aware
         )
 
@@ -550,18 +563,18 @@ def build_hints_detailed(
             alias = _hint_name(generated.get(node.alias, node.alias))
             names = " ".join([alias, *map(_hint_name, indexes)])
             scan = [f"{SCAN_HINTS[node.node_type]}({names})"]
-            targets.add(HintTarget("scan", (node.alias,)))
+            targets.add(Decision("scan", (node.alias,)))
 
             if node.parallel_aware:
                 # Without a Gather above, the worker count is unknown, so the
                 # planner decides.
                 if workers:
                     scan.append(f"Parallel({alias} {workers} hard)")
-                    targets.add(HintTarget("parallel", (node.alias,)))
+                    targets.add(Decision("parallel", (node.alias,)))
             elif parallel:
                 # Otherwise PostgreSQL may also run this scan in parallel.
                 scan.append(f"Parallel({alias} 0 hard)")
-                targets.add(HintTarget("parallel", (node.alias,)))
+                targets.add(Decision("parallel", (node.alias,)))
 
             if node.alias in generated:
                 copies.append((node.alias, scan))
@@ -573,9 +586,9 @@ def build_hints_detailed(
             hinted.update(flat)
             joined = " ".join(_hint_name(a) for a in flat)
             hints.append(f"{JOIN_HINTS[node.node_type]}({joined})")
-            join_target = HintTarget("join", _decision_tables(node))
+            join_target = Decision("join", decision_tables(node))
             targets.add(join_target)
-            join_trees[HintTarget("outer", join_target.tables)] = tree
+            join_trees[Decision("outer", join_target.tables)] = tree
             # pg_hint_plan can forbid a Memoize under one join but cannot demand one.
             if node.node_type == "Nested Loop" and node.inputs[1].node_type != "Memoize":
                 hints.append(f"NoMemoize({joined})")
@@ -817,13 +830,17 @@ def _joined_trees(tree: JoinTree) -> set[JoinTree]:
     }
 
 
-def _decision_tables(node: PlanNode) -> tuple[str, ...]:
-    """Decision-key tables for a node, kept in sync with comparison._tables()."""
-    folded = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
+def decision_tables(node: PlanNode) -> tuple[str, ...]:
+    """
+    Sorted aliases of the relations below node, outside InitPlans and SubPlans.
+
+    An unnamed operator without inputs, such as a Result, counts as <Result>, so a
+    join over it and the join below get different decisions.
+    """
     unnamed = {
-        f"<{child.node_type}>"
-        for child in node.walk(subplans=False)
-        if not child.alias and not child.inputs and child.node_type not in folded
+        f"<{n.node_type}>"
+        for n in node.walk(subplans=False)
+        if not n.alias and not n.inputs and n.node_type not in FOLDED
     }
     return tuple(sorted(node.relations() | unnamed))
 

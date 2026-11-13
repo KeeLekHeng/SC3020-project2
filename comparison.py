@@ -14,35 +14,19 @@ from typing import Any, NamedTuple
 import psycopg
 
 from preprocessing import (
+    FOLDED,
     GATHER,
     JOIN_HINTS,
     PASS_THROUGH,
+    Decision,
     PlanNode,
     build_hints_detailed,
+    decision_tables,
     get_postgres_plan,
 )
 
-# Operators that make no decision of their own: a Hash belongs to its Hash Join, a
-# Bitmap Index Scan to its heap scan, and a Subquery Scan only passes rows through.
-# PostgreSQL drops a Subquery Scan when nothing above needs it, so counting it would
-# make two equal plans differ.
-FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
-
 # Decision kinds that build_hints() can force; realization_gaps() checks only these.
 FORCED_KINDS = {"scan", "parallel", "join", "outer"}
-
-
-class Decision(NamedTuple):
-    """A planner decision: its kind, such as "join", and the tables it covers."""
-
-    # "scan", "parallel", "join", "outer", "aggregate", "gather", or any other
-    # operator's lowercased node_type, such as "sort", "limit" or "materialize".
-    kind: str
-    # Sorted aliases, such as ("c", "o"), and <Result>-style names for unnamed leaves.
-    tables: tuple[str, ...]
-
-    def __str__(self) -> str:
-        return f"{self.kind}({', '.join(self.tables)})"
 
 
 class Choice(NamedTuple):
@@ -260,11 +244,11 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
             found[Decision("parallel", (node.alias,))] = Choice(parallel, node)
             continue
 
-        tables = _tables(node)
+        tables = decision_tables(node)
 
         if node.node_type in JOIN_HINTS and len(node.inputs) == 2:
             found[Decision("join", tables)] = Choice(node.node_type, node)
-            kind, value = "outer", ", ".join(_tables(node.inputs[0]))
+            kind, value = "outer", ", ".join(decision_tables(node.inputs[0]))
         elif node.node_type == "Aggregate":
             kind, value = "aggregate", node.strategy or "Plain"
         elif node.node_type in GATHER:
@@ -481,7 +465,7 @@ def force_plan_detailed(
             hints=built.hints,
             plan=forced,
             gaps=tuple(gaps),
-            targets=frozenset(Decision(target.kind, target.tables) for target in built.targets),
+            targets=built.targets,
             switch_offs=switch_offs,
             leading=leading,
         )
@@ -493,21 +477,6 @@ def force_plan_detailed(
 
     assert best is not None
     return best
-
-
-def _tables(node: PlanNode) -> tuple[str, ...]:
-    """
-    Sorted aliases of the relations below node, outside InitPlans and SubPlans.
-
-    An unnamed operator without inputs, such as a Result, counts as <Result>, so a
-    join over it and the join below get different decisions.
-    """
-    unnamed = {
-        f"<{n.node_type}>"
-        for n in node.walk(subplans=False)
-        if not n.alias and not n.inputs and n.node_type not in FOLDED
-    }
-    return tuple(sorted(node.relations() | unnamed))
 
 
 def choices_equal(decision: Decision, a: Choice | None, b: Choice | None) -> bool:

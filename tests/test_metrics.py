@@ -17,7 +17,7 @@ from comparison import (
     evaluate_plans,
     realizability,
 )
-from preprocessing import HintBuildResult, HintTarget, PlanNode, build_hints, build_hints_detailed
+from preprocessing import HintBuildResult, PlanNode, build_hints, build_hints_detailed
 
 
 def scan(
@@ -187,10 +187,10 @@ def test_hint_targets_follow_the_exact_emission_branches() -> None:
     without_leading = build_hints_detailed(plan, query, leading=False)
 
     assert build_hints(plan, query) == with_leading.hints
-    assert HintTarget("join", ("c", "o")) in with_leading.targets
-    assert HintTarget("outer", ("c", "o")) in with_leading.targets
-    assert HintTarget("outer", ("c", "o")) not in without_leading.targets
-    assert HintTarget("join", ("c", "o")) in without_leading.targets
+    assert Decision("join", ("c", "o")) in with_leading.targets
+    assert Decision("outer", ("c", "o")) in with_leading.targets
+    assert Decision("outer", ("c", "o")) not in without_leading.targets
+    assert Decision("join", ("c", "o")) in without_leading.targets
 
 
 def test_unemitted_hints_do_not_create_targets() -> None:
@@ -200,8 +200,8 @@ def test_unemitted_hints_do_not_create_targets() -> None:
     parallel_targets = build_hints_detailed(lone_parallel, "SELECT 1 FROM l").targets
     unnamed_targets = build_hints_detailed(unnamed, "SELECT 1 FROM c").targets
 
-    assert HintTarget("scan", ("l",)) in parallel_targets
-    assert HintTarget("parallel", ("l",)) not in parallel_targets
+    assert Decision("scan", ("l",)) in parallel_targets
+    assert Decision("parallel", ("l",)) not in parallel_targets
     assert not {target for target in unnamed_targets if target.kind in {"join", "outer"}}
 
 
@@ -210,9 +210,9 @@ def test_force_plan_detailed_keeps_the_selected_retry_targets(monkeypatch: pytes
     wrong = requested.model_copy(update={"node_type": "Merge Join"})
     built = iter(
         [
-            HintBuildResult("first", frozenset({HintTarget("outer", ("c", "o"))})),
-            HintBuildResult("second", frozenset({HintTarget("outer", ("c", "o"))})),
-            HintBuildResult("third", frozenset({HintTarget("join", ("c", "o"))})),
+            HintBuildResult("first", frozenset({Decision("outer", ("c", "o"))})),
+            HintBuildResult("second", frozenset({Decision("outer", ("c", "o"))})),
+            HintBuildResult("third", frozenset({Decision("join", ("c", "o"))})),
         ]
     )
     forced = iter([wrong, wrong, requested])

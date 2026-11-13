@@ -511,15 +511,6 @@ by coincidence and must not be marked agent-attributable.
 
 ## Technical debt
 
-### Decision-key construction is duplicated
-
-`preprocessing._decision_tables()` mirrors `comparison._tables()` so hint-generation
-targets use the same semantic keys as plan comparison. This duplication does not alter
-current metric results and is covered by target-tracking tests, but the two helpers
-could drift when folded operators or unnamed-leaf rules change. A future cleanup should
-move decision-key construction into one dependency-neutral shared helper and have both
-modules call it.
-
 ### Forcing failure produces a partial evaluation
 
 Failure to build or execute hints does not invalidate the original agent proposal.
