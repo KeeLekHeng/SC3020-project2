@@ -15,6 +15,7 @@ import psycopg
 
 from preprocessing import (
     GATHER,
+    INDEXED,
     JOIN_HINTS,
     PASS_THROUGH,
     PlanNode,
@@ -29,13 +30,17 @@ from preprocessing import (
 FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
 
 # Decision kinds that build_hints() can force; realization_gaps() checks only these.
-FORCED_KINDS = {"scan", "parallel", "join", "outer"}
+FORCED_KINDS = {"scan", "index", "parallel", "join", "outer"}
+
+# The index choice of an index scan that names no index, as an agent plan may. A hint
+# cannot force it, so it is never a request, but it differs from any named index.
+UNSPECIFIED = "unspecified"
 
 
 class Decision(NamedTuple):
     """A planner decision: its kind, such as "join", and the tables it covers."""
 
-    # "scan", "parallel", "join", "outer", "aggregate", "gather", or any other
+    # "scan", "index", "parallel", "join", "outer", "aggregate", "gather", or any other
     # operator's lowercased node_type, such as "sort", "limit" or "materialize".
     kind: str
     # Sorted aliases, such as ("c", "o"), and <Result>-style names for unnamed leaves.
@@ -49,7 +54,8 @@ class Choice(NamedTuple):
     """What a plan chose for a decision, such as "Hash Join", and its node."""
 
     # By decision kind:
-    # - scan: node_type plus any index, such as "Index Scan on orders_pkey"
+    # - scan: node_type, such as "Index Scan"
+    # - index: the index name, such as "orders_pkey", or "unspecified"
     # - parallel: "parallel" or "serial"
     # - join: "Hash Join", "Merge Join" or "Nested Loop"
     # - outer: the outer side's aliases, such as "o" for join(c, o)
@@ -188,9 +194,10 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
     equal. An unnamed operator with no inputs, such as a Result, counts as a table
     named <Result>. Written as decision: choice:
 
-    - scan(o): the operator reading alias o, such as "Index Scan on orders_pkey", and
-      parallel(o): "parallel" or "serial"; a scan that names no index, as a hand-built
-      plan may, equals the same scan on any index
+    - scan(o): the operator reading alias o, such as "Index Scan", and parallel(o):
+      "parallel" or "serial"
+    - index(o), for an index or bitmap scan only: the index it reads, such as
+      "orders_pkey", or "unspecified" if the plan names none, as an agent plan may
     - join(c, o): "Hash Join", and outer(c, o): "o", the outer side
     - aggregate(c, o): its strategy; a parallel aggregate's Partial and Finalize stages
       are one decision, with the Partial stage's strategy, so serial and parallel
@@ -226,13 +233,14 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
             continue
 
         if node.alias:
-            index = node.index_name or ", ".join(
-                n.index_name
-                for n in node.walk(subplans=False)
-                if n.node_type == "Bitmap Index Scan" and n.index_name
-            )
-            method = node.node_type + (f" on {index}" if index else "")
-            found[Decision("scan", (node.alias,))] = Choice(method, node)
+            found[Decision("scan", (node.alias,))] = Choice(node.node_type, node)
+            if node.node_type in INDEXED:
+                index = node.index_name or ", ".join(
+                    n.index_name
+                    for n in node.walk(subplans=False)
+                    if n.node_type == "Bitmap Index Scan" and n.index_name
+                )
+                found[Decision("index", (node.alias,))] = Choice(index or UNSPECIFIED, node)
             parallel = "parallel" if node.parallel_aware else "serial"
             found[Decision("parallel", (node.alias,))] = Choice(parallel, node)
             continue
@@ -259,9 +267,12 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
 def compare_plans(a: PlanNode, b: PlanNode) -> PlanComparison:
     """Compare any two plans over the union of their semantic decision keys."""
     found_a, found_b = decisions(a), decisions(b)
+    # An index is compared only when both plans scan the table through one, so a
+    # different scan method counts once, as scan, and not again as index.
     same = {
-        decision: choices_equal(decision, found_a.get(decision), found_b.get(decision))
+        decision: choices_equal(found_a.get(decision), found_b.get(decision))
         for decision in sorted(found_a.keys() | found_b.keys())
+        if decision.kind != "index" or (decision in found_a and decision in found_b)
     }
 
     matches = tuple(
@@ -295,11 +306,7 @@ def realizability(
 
     outcome must come from forcing requested_plan: its gaps are the unreproduced requests.
     """
-    requested = {
-        decision: choice
-        for decision, choice in decisions(requested_plan).items()
-        if decision.kind in FORCED_KINDS
-    }
+    requested = _requests(requested_plan)
 
     if isinstance(outcome, ForcingFailure):
         score = MetricScore(
@@ -311,14 +318,10 @@ def realizability(
         )
         return RealizabilityResult(score, (), (), ())
 
-    realized_all = decisions(outcome.plan)
+    realized = _requests(outcome.plan)
     gap_keys = {gap.decision for gap in outcome.gaps}
     reproduced_keys = [d for d in sorted(requested) if d not in gap_keys]
-    extra_keys = [
-        decision
-        for decision in sorted(realized_all)
-        if decision.kind in FORCED_KINDS and decision not in requested
-    ]
+    extra_keys = sorted(realized.keys() - requested.keys())
     score = _rate(
         len(reproduced_keys),
         len(requested),
@@ -331,7 +334,7 @@ def realizability(
             DecisionChoice(decision, requested[decision]) for decision in reproduced_keys
         ),
         extra=tuple(
-            DecisionChoice(decision, realized_all[decision]) for decision in extra_keys
+            DecisionChoice(decision, realized[decision]) for decision in extra_keys
         ),
         gaps=outcome.gaps,
     )
@@ -345,12 +348,8 @@ def evaluate_plans(
     """Compose proposed, realizability, and realized metrics without database access."""
     proposed = compare_plans(postgres_plan, agent_plan)
     result = realizability(agent_plan, outcome)
-    # Differences where the agent made a force-eligible choice PostgreSQL did not.
-    disagreements = [
-        d.decision
-        for d in proposed.differences
-        if d.b is not None and d.decision.kind in FORCED_KINDS
-    ]
+    requested = _requests(agent_plan)
+    disagreements = [d.decision for d in proposed.differences if d.decision in requested]
 
     if isinstance(outcome, ForcingFailure):
         realized = _unavailable_comparison(outcome.reason)
@@ -389,17 +388,12 @@ def realization_gaps(requested: PlanNode, forced: PlanNode) -> list[Difference]:
     and joins (see its limitations). Check it against the hints before concluding that
     PostgreSQL refused it.
     """
-    requested_decisions = decisions(requested)
+    requested_decisions = _requests(requested)
     forced_decisions = decisions(forced)
     return [
         Difference(decision, requested_decisions[decision], forced_decisions.get(decision))
         for decision in sorted(requested_decisions)
-        if decision.kind in FORCED_KINDS
-        and not choices_equal(
-            decision,
-            requested_decisions[decision],
-            forced_decisions.get(decision),
-        )
+        if not choices_equal(requested_decisions[decision], forced_decisions.get(decision))
     ]
 
 
@@ -443,15 +437,21 @@ def force_plan(
     return best
 
 
-def choices_equal(decision: Decision, a: Choice | None, b: Choice | None) -> bool:
-    """Whether two plans chose the same; a scan that names no index matches any index."""
+def choices_equal(a: Choice | None, b: Choice | None) -> bool:
+    """Whether two plans chose the same; a decision only one plan has never matches."""
     if a is None or b is None:
         return a is b
 
-    x, y = a.value, b.value
-    return x == y or decision.kind == "scan" and (
-        x.startswith(f"{y} on ") or y.startswith(f"{x} on ")
-    )
+    return a.value == b.value
+
+
+def _requests(plan: PlanNode) -> dict[Decision, Choice]:
+    """The plan's force-eligible decisions, which hints ask PostgreSQL to follow."""
+    return {
+        decision: choice
+        for decision, choice in decisions(plan).items()
+        if decision.kind in FORCED_KINDS and choice.value != UNSPECIFIED
+    }
 
 
 def _tables(node: PlanNode) -> tuple[str, ...]:

@@ -64,7 +64,7 @@ The plan as printed does not mark parallel scans. In this plan the scan of `orde
 `force_plan()` forces a plan: it calls `build_hints()` and then `get_postgres_plan()` with the hints. It returns a `ForcePlanResult`: the hints, the plan PostgreSQL built with them, the gaps, and which retry was chosen.
 
 1. `decisions()` reduces a plan to its planner decisions, such as `scan(orders): Seq Scan` and `join(customer, orders): Hash Join`.
-2. `realization_gaps()` compares the requested force-eligible decisions with the plan PostgreSQL built. A **gap** is a requested decision whose choice is missing or different in the realized plan. A force-eligible decision that appears only in the realized plan is an extra diagnostic, not a gap. The force-eligible kinds are the scan method with its index, parallel or serial, the join method, and the outer side. Join order needs no kind of its own: a join is named by the set of tables it joins, so a different order gives different joins. The worker count is not checked.
+2. `realization_gaps()` compares the requested force-eligible decisions with the plan PostgreSQL built. A **gap** is a requested decision whose choice is missing or different in the realized plan. A force-eligible decision that appears only in the realized plan is an extra diagnostic, not a gap. The force-eligible kinds are the scan method, the index when the requested plan names one, parallel or serial, the join method, and the outer side. Join order needs no kind of its own: a join is named by the set of tables it joins, so a different order gives different joins. The worker count is not checked.
 3. Some hints can backfire. So while there are gaps, `force_plan()` tries again without the switch-offs, then with the switch-offs but without `Leading` hints. It returns the try with the fewest gaps.
 
 A plan with no gaps is **fully followed**. `build_hints()` refuses a plan it cannot write hints for, with a `ValueError`: a table name used twice that the rewrite could not separate, an alias the query does not have, or an alias that contains `/*`, which would open a comment inside the hint.
@@ -76,7 +76,7 @@ A plan with no gaps is **fully followed**. `build_hints()` refuses a plan it can
 Each difference gives the decision and the two choices. A choice is missing when only one plan has that decision, such as a Sort that the other plan does not need. These are 5 of the 16 differences `project.py` printed for TPC-H Q5 in one run:
 
 ```text
-- scan(lineitem): PostgreSQL Index Scan on lineitem_pkey, agent Seq Scan
+- scan(lineitem): PostgreSQL Index Scan, agent Seq Scan
 - parallel(orders): PostgreSQL parallel, agent serial
 - join(customer, orders): PostgreSQL has none, agent Hash Join
 - outer(customer, orders): PostgreSQL has none, agent orders
@@ -85,7 +85,8 @@ Each difference gives the decision and the two choices. A choice is missing when
 
 | Kind of decision | Example of a choice | Forced by hints |
 | --- | --- | --- |
-| `scan(o)` | `Index Scan on orders_pkey` | Yes |
+| `scan(o)` | `Index Scan` | Yes |
+| `index(o)` | `orders_pkey`, or `unspecified` when the plan names none | Yes, when named |
 | `parallel(o)` | `parallel` or `serial` | Yes |
 | `join(c, o)` | `Hash Join` | Yes |
 | `outer(c, o)` | `o`, the outer side | Yes |
@@ -104,7 +105,7 @@ One choice by the agent can show as several differences:
 Some things do not count as a difference:
 
 - **Worker counts, conditions, filters, costs and row estimates** are not compared.
-- **An index that is not named.** A scan that names no index equals the same scan on any index. This matters when gaps are found, because the requested plan may be an agent's plan that leaves the index out.
+- **An index when the scan methods differ.** `index` is compared only when both plans read the table through an index, so a Seq Scan against an Index Scan is one difference. An index the requested plan does not name is never a gap, because the hint then lets PostgreSQL choose.
 - **The two stages of a parallel Aggregate.** They are one decision, with the strategy of the stage that groups the rows in the workers.
 - **A Subquery Scan.** PostgreSQL may drop it, so it is left out of both plans.
 

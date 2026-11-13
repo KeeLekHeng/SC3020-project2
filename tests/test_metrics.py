@@ -6,13 +6,10 @@ import pytest
 
 import comparison
 from comparison import (
-    Decision,
     ForcePlanResult,
     ForcingFailure,
     MetricStatus,
-    choices_equal,
     compare_plans,
-    decisions,
     evaluate_plans,
     realizability,
 )
@@ -73,12 +70,22 @@ def test_result_records_are_immutable_and_statuses_are_distinct() -> None:
         result.all_kinds.difference.rate = 0.5  # type: ignore[misc]
 
 
-def test_public_choice_equivalence_matches_an_unnamed_index() -> None:
-    unnamed = scan("o", "Index Scan")
-    named = scan("o", "Index Scan", index="orders_pkey")
-    decision = Decision("scan", ("o",))
+def test_an_unnamed_index_is_not_a_request() -> None:
+    agent = scan("o", "Index Scan")
+    realized = scan("o", "Index Scan", index="orders_pkey")
 
-    assert choices_equal(decision, decisions(unnamed)[decision], decisions(named)[decision])
+    result = realizability(agent, force_result(realized, requested=agent))
+
+    assert (result.score.numerator, result.score.denominator) == (2, 2)
+    assert [str(item.decision) for item in result.extra] == ["index(o)"]
+
+
+def test_a_named_index_that_falls_back_to_a_seq_scan_is_two_gaps() -> None:
+    agent = scan("o", "Index Scan", index="orders_pkey")
+
+    result = realizability(agent, force_result(scan("o"), requested=agent))
+
+    assert [str(gap.decision) for gap in result.gaps] == ["index(o)", "scan(o)"]
 
 
 def test_pairwise_identical_changed_and_missing_decisions() -> None:
@@ -243,7 +250,9 @@ def test_evaluator_keeps_proposed_realizability_and_realized_views_distinct() ->
     evaluation = evaluate_plans(postgres, agent, outcome)
 
     assert evaluation.proposed.all_kinds.different == 1
-    assert evaluation.realizability.score.rate == 0.5
+    # scan, index and parallel were requested; only the serial scan was reproduced.
+    score = evaluation.realizability.score
+    assert (score.numerator, score.denominator) == (1, 3)
     assert evaluation.realized.all_kinds.different == 0
 
 
@@ -264,3 +273,13 @@ def test_forcing_failure_preserves_proposal_and_marks_dependent_metrics_unavaila
     assert evaluation.realized.all_kinds.total is None
     assert evaluation.intended.status is MetricStatus.UNAVAILABLE
     assert evaluation.intended.denominator == 1
+
+
+def test_an_unnamed_index_is_a_difference_but_not_an_intended_change() -> None:
+    postgres = scan("o", "Index Scan", index="orders_pkey")
+    agent = scan("o", "Index Scan")
+
+    evaluation = evaluate_plans(postgres, agent, force_result(postgres, requested=agent))
+
+    assert [str(d.decision) for d in evaluation.proposed.differences] == ["index(o)"]
+    assert evaluation.intended.status is MetricStatus.NOT_APPLICABLE

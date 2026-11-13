@@ -39,7 +39,8 @@ semantic `Decision` to its `Choice`. Examples include:
 
 | Decision | Example choice | Meaning |
 | --- | --- | --- |
-| `scan(o)` | `Index Scan on orders_pkey` | How alias `o` is read. |
+| `scan(o)` | `Index Scan` | How alias `o` is read. |
+| `index(o)` | `orders_pkey` | Which index an index or bitmap scan of `o` reads, or `unspecified`. |
 | `parallel(o)` | `parallel` | Whether the scan of `o` is parallel-aware. |
 | `join(c, o)` | `Hash Join` | The join method used for aliases `c` and `o`. |
 | `outer(c, o)` | `c` | Which input is on the outer side of that join. |
@@ -62,9 +63,12 @@ A key is different when:
 - it appears in only one plan; or
 - it appears in both plans but has different choices.
 
-Choice equality follows the existing `_same()` rule in `comparison.py`. In particular,
-an agent scan that specifies a scan method but omits the index name is allowed to match
-the same PostgreSQL scan method with a named index.
+Two choices are equal when their values are equal (`choices_equal()` in
+`comparison.py`). The index is a decision of its own, compared only when both plans
+read the table through an index, so a different scan method counts once, as `scan`.
+An agent scan that names no index has the index `unspecified`, which differs from any
+named index: the agent agrees with PostgreSQL on the method but did not choose the
+index.
 
 For transparency, every reported rate should be accompanied by its numerator and
 denominator, for example `6/20 decisions (30%)`.
@@ -156,8 +160,12 @@ Agent-proposed plan A  versus  realized agent plan R
 Only decision kinds that the forcing layer can potentially target are included:
 
 ```text
-scan, parallel, join, outer
+scan, index, parallel, join, outer
 ```
+
+An `index` counts only when the agent names one. A hint without an index lets
+PostgreSQL choose, so `unspecified` is never a request. A named index whose scan falls
+back to a sequential scan is two unreproduced requests, the method and the index.
 
 These are the kinds in `FORCED_KINDS` in `comparison.py`. This makes a decision
 *force-eligible*; it does not prove that the selected forcing attempt emitted a hint
@@ -262,7 +270,7 @@ may correct an impossible agent decision while producing `R`, making `R` look cl
 to `P` than the original proposal `A` was.
 
 The whole realized plan must not be attributed to the agent. Hints directly target
-only `scan`, `parallel`, `join` and `outer` decisions. Aggregate strategy, sorting,
+only `scan`, `index`, `parallel`, `join` and `outer` decisions. Aggregate strategy, sorting,
 Gather placement and other surrounding operators may be PostgreSQL's own choices while
 it constructs `R`. A realized-plan difference is therefore a structural difference
 between two executable plans, not automatically a difference caused by the agent.
