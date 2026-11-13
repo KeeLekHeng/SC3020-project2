@@ -38,7 +38,7 @@ def show_forced(
     """
     Force plan on PostgreSQL and print the hints, the plan PostgreSQL chose with them
     and every force-eligible decision it did not reproduce. The returned structured
-    outcome preserves hints, targets, gaps, selected retry settings, or a failure reason.
+    outcome preserves hints, gaps, selected retry settings, or a failure reason.
     """
     try:
         result = force_plan(connection, query, plan)
@@ -66,6 +66,29 @@ def show_forced(
     return result
 
 
+def execution_time(
+    connection: psycopg.Connection, query: str, hints: str = "", timeout_ms: int = 60_000
+) -> float | None:
+    """
+    Milliseconds query takes to run, with hints, or None when a run passes timeout_ms,
+    since a bad forced plan can run for hours.
+
+    It runs twice and keeps the second time, so each plan is timed with a warm cache.
+    shortcut: one timed run is noisy; take the median of several runs for a workload.
+    """
+    connection.execute(f"SET statement_timeout = {int(timeout_ms)}".encode())
+    try:
+        for _ in range(2):
+            plan = get_postgres_plan(connection, query, analyze=True, hints=hints)
+    except psycopg.errors.QueryCanceled:
+        connection.rollback()
+        return None
+    finally:
+        connection.execute(b"RESET statement_timeout")
+
+    return plan.execution_time_ms
+
+
 def _format_score(score: MetricScore, unit: str) -> str:
     """Format a score without inventing a number for unavailable or N/A results."""
     if score.status is not MetricStatus.DEFINED:
@@ -89,6 +112,10 @@ def show_evaluation(evaluation: PlanEvaluation) -> None:
     print(
         "- Realized-plan difference: "
         + _format_score(evaluation.realized.all_kinds.difference, "decisions")
+    )
+    print(
+        "- Intended-difference realization: "
+        + _format_score(evaluation.intended, "agent disagreements")
     )
     print(
         "- Proposed core difference: "
@@ -164,6 +191,19 @@ def main() -> None:
         outcome = show_forced(connection, result.query, result.plan)
         evaluation = evaluate_plans(postgres, result.plan, outcome)
         show_evaluation(evaluation)
+
+        if isinstance(outcome, ForcingFailure):
+            return
+
+        print("\nRunning both plans with EXPLAIN ANALYZE...")
+        postgres_ms = execution_time(connection, query)
+        agent_ms = execution_time(connection, result.query, outcome.hints)
+        times = [
+            "over the timeout" if ms is None else f"{ms:.1f} ms" for ms in (postgres_ms, agent_ms)
+        ]
+        print(f"Execution time: PostgreSQL plan {times[0]}, agent plan {times[1]}")
+        if postgres_ms and agent_ms:
+            print(f"The agent plan took {agent_ms / postgres_ms:.2f}x PostgreSQL's time.")
 
 
 if __name__ == "__main__":

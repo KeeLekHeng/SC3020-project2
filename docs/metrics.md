@@ -21,6 +21,8 @@ This document defines three complementary metrics:
 3. realized-plan difference rate.
 
 No single metric answers all three questions. They should be reported together.
+A supporting fourth metric, the intended-difference realization rate, combines all
+three plans to show which of the agent's disagreements with PostgreSQL took effect.
 Two diagnostic views are also recommended: a per-kind breakdown and a core structural
 difference rate that excludes `parallel` and `gather` decisions. These views explain
 whether one broad planning choice is dominating an overall percentage; they do not
@@ -187,16 +189,20 @@ or outer-side decisions were not reproduced. When calculating the rate, count
 unmatched decisions requested by `A`; a new decision that appears only in `R` is useful
 diagnostic information but is not itself an agent request or realization gap.
 
-Realizability is an outcome metric, not a causality claim. `build_hints()` can skip a
-scan with no usable alias, a join involving an unnamed input, or a Parallel hint when
-the worker count is unknown. `force_plan()` can also select its retry with
-`leading=False`. Therefore every requested force-eligible decision should additionally
-record whether the *selected* forcing attempt actually targeted it. A reproduced but
-untargeted choice may simply be what PostgreSQL would have chosen itself.
+Realizability is an outcome metric, not a causality claim. A reproduced choice may
+simply be what PostgreSQL would have chosen itself, so an agent that copies
+PostgreSQL's plan scores 100%. The intended-difference realization rate below counts
+only the choices where the agent disagreed with PostgreSQL.
 
 The implementation exposes this through `realizability(agent_plan, forcing_outcome)`.
 Its score is the reproduced count divided by the requested force-eligible count; extra
 realized decisions are returned separately and never enter that denominator.
+
+Realizability is measured only on plans the validator accepted. The validator rejects
+an answer that `build_hints()` cannot turn into hints and asks the agent again, so plans
+the forcing layer cannot express never reach this denominator. Report the retry count
+(`len(AgentResult.problems)`) for each query, and across a workload the share of queries
+whose first answer was rejected, next to this rate.
 
 ### Reasoning
 
@@ -261,16 +267,8 @@ Gather placement and other surrounding operators may be PostgreSQL's own choices
 it constructs `R`. A realized-plan difference is therefore a structural difference
 between two executable plans, not automatically a difference caused by the agent.
 
-When attributing an individual realized decision to the agent, require all three:
-
-1. the selected forcing attempt emitted a hint that targets that decision;
-2. the realized plan reproduced the requested choice; and
-3. `force_plan()` reports no realization gap for that decision.
-
-Membership in `FORCED_KINDS` alone is insufficient. For example, if the selected retry
-uses `leading=False`, a matching `outer` choice is not attributable unless another
-emitted `Leading` target actually covers it. This conservative rule prevents a
-coincidental PostgreSQL choice from being credited to the agent.
+The intended-difference realization rate separates the realized differences the agent
+asked for from those PostgreSQL introduced while planning the hinted query.
 
 ### Implementation mapping
 
@@ -283,6 +281,49 @@ realized_difference = comparison.all_kinds.difference
 with the proposed comparison and realizability result. When forcing is unavailable it
 returns an unavailable realized comparison rather than discarding the proposed one.
 
+## Metric 4 (supporting): intended-difference realization rate
+
+### Question answered
+
+Of the force-eligible choices where the agent disagreed with PostgreSQL, how many did
+the realized plan keep?
+
+### Definition
+
+Let `F(A)` be the force-eligible decisions requested by the agent. The agent's intended
+differences are those whose choice differs from PostgreSQL's normal plan, including a
+decision `P` does not have:
+
+```text
+Intended(P, A) = {d in F(A) where A_d differs from P_d}
+
+IntendedRealization(P, A, R)
+    = |{d in Intended(P, A) where R_d matches A_d}| / |Intended(P, A)|
+```
+
+Choices are compared with the same equality rule as the other metrics. A decision is
+realized exactly when it is not a realization gap.
+
+If the agent agrees with PostgreSQL on every force-eligible decision, the rate is
+`not_applicable`. If forcing fails, it is `unavailable`, with the number of intended
+differences still known as its denominator.
+
+### Reasoning
+
+A realized choice that PostgreSQL would have made anyway says nothing about the agent.
+A realized choice that differs from `P` and matches `A` is a change the agent caused,
+because forcing the agent's plan is the only thing that differs between `P` and `R`.
+
+The rate needs only the three plans, so it can be recomputed from saved plans. Unlike
+the realized-plan difference, it excludes side effects: a realized difference the
+agent did not ask for, such as a new aggregate strategy, is not counted. It is limited
+to force-eligible kinds because hints cannot request aggregate, Gather, sort or other
+operator choices.
+
+### Implementation mapping
+
+`evaluate_plans(postgres_plan, agent_plan, forcing_outcome).intended` is the score.
+
 ## Interpreting the three metrics together
 
 The three values should be presented as one result, not treated as competing metrics.
@@ -292,14 +333,17 @@ For example:
 Proposed-plan difference:  9/21 decisions (42.9%)
 Plan realizability:        14/16 force-eligible decisions (87.5%)
 Realized-plan difference:  6/20 decisions (30.0%)
+Intended realization:      5/7 agent disagreements (71.4%)
 ```
 
 This result means:
 
 - the agent originally made a substantially different set of choices;
-- PostgreSQL could reproduce most, but not all, force-eligible agent choices; and
+- PostgreSQL could reproduce most, but not all, force-eligible agent choices;
 - after the unrealizable choices were replaced, the executable agent plan was closer
-  to PostgreSQL's normal plan than the original proposal was.
+  to PostgreSQL's normal plan than the original proposal was; and
+- 5 of the 7 force-eligible choices where the agent disagreed with PostgreSQL took
+  effect.
 
 A particularly important case is:
 
@@ -378,21 +422,11 @@ parallelism category together. In the documented TPC-H runs, PostgreSQL planned 
 22 queries in parallel while the agent planned only 2 to 7, depending on the run, so
 this distinction may materially affect the results.
 
-### Agent-attributable realized decisions
-
-For the realized plan, separately report how many decisions can confidently be
-attributed to the agent. These must be explicitly targeted by the selected forcing
-attempt, reproduced in the realized plan, and free of a realization gap. Decisions of
-kinds `scan`, `parallel`, `join` and `outer` are eligible for this check, but eligibility
-alone is not attribution. Differences involving Aggregate, Gather, Sort, Limit,
-Materialize and other unforced kinds describe the executable result but must be
-labelled as partly or wholly chosen by PostgreSQL.
-
 ## Structured result contract
 
 The typed Python result is `PlanEvaluation`. It holds the proposed comparison,
-the realizability result, the realized comparison, the attribution entries and the
-forcing outcome. Each difference keeps the `PlanNode` that made each choice, so a
+the realizability result, the realized comparison, the intended-difference
+realization score and the forcing outcome. Each difference keeps the `PlanNode` that made each choice, so a
 consumer can highlight the node. Rates remain unrounded numbers; formatting belongs to
 the CLI or GUI.
 
@@ -406,8 +440,7 @@ information to reconstruct its result. Save at least:
 - the raw `AgentResult.answer`, summary and retry problems;
 - the validated agent `PlanNode`;
 - PostgreSQL's normal plan and the realized hinted plan;
-- the generated hints, selected forcing attempt, targeted decisions and realization
-  gaps;
+- the generated hints, selected forcing attempt and realization gaps;
 - PostgreSQL version, database scale, indexes and relevant planner settings; and
 - all metric numerators, denominators, rates and per-kind breakdowns.
 
@@ -421,8 +454,17 @@ remain in the experiment record.
 
 A low difference rate means that two plans make similar structural choices. It does
 not prove that either plan is fast. Two identical plans can both perform poorly, while
-two structurally different plans can have similar execution times. Runtime performance
-requires a separate, carefully controlled `EXPLAIN ANALYZE` experiment.
+two structurally different plans can have similar execution times.
+
+Agreement with PostgreSQL also says nothing about which plan is better: the agent is
+given the same statistics PostgreSQL plans from, so both can share one wrong row
+estimate. Execution time is the independent measure. `project.execution_time()` runs a
+query with `EXPLAIN ANALYZE`, once to warm the cache and once to time it, and gives up
+after a timeout of one minute by default. Report the PostgreSQL plan's and the realized
+agent plan's times next to the structural metrics, especially for decisions where the
+agent disagreed with PostgreSQL. A single timed run is noisy; across a workload, take
+the median of several runs. `EXPLAIN ANALYZE` also fills each node's actual row count,
+which shows where a row estimate was wrong.
 
 ### PostgreSQL is a baseline, not absolute ground truth
 
@@ -490,9 +532,8 @@ The gap calculation compares every requested decision in `FORCED_KINDS`, even wh
 hint generation skipped that individual decision. It excludes decisions that appear
 only in the realized plan; those are reported separately as extras. A gap is therefore evidence
 that the requested choice was not reproduced, not proof that PostgreSQL rejected a
-specific hint. The selected attempt's target metadata must be consulted before making
-that stronger claim. The reverse is also important: an untargeted decision can match
-by coincidence and must not be marked agent-attributable.
+specific hint. The selected attempt's hint text shows whether a hint was written for
+that decision.
 
 ## Technical debt
 
@@ -526,8 +567,12 @@ false missing or extra decisions.
 
 ### Workload selection affects the result
 
-Public benchmark queries may have appeared in the LLM's training data. The final
-evaluation should therefore combine TPC-H queries with diverse original queries and
+Public benchmark queries, and PostgreSQL's plans for them, may have appeared in the
+LLM's training data. On TPC-H, agreement with PostgreSQL can then come from recall
+rather than planning. Report every metric separately for TPC-H and for original
+queries, ideally over renamed tables and columns; markedly closer agreement on TPC-H
+points to recall. The final evaluation should therefore combine TPC-H queries with
+diverse original queries and
 should describe the workload, database scale, indexes, PostgreSQL settings, model and
 prompt configuration. Agent failures and retries must be retained as part of the
 reported results.

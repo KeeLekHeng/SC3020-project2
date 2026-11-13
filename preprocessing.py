@@ -30,7 +30,6 @@ import json
 import os
 import re
 import textwrap
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, NamedTuple
 
@@ -361,34 +360,6 @@ PASS_THROUGH = {"Hash", "Sort", "Incremental Sort", "Materialize", "Memoize", *G
 JoinTree = str | tuple
 OUTER_JOINS = ("Left", "Right", "Full")
 
-
-# Operators that make no decision of their own: a Hash belongs to its Hash Join, a
-# Bitmap Index Scan to its heap scan, and a Subquery Scan only passes rows through.
-# PostgreSQL drops a Subquery Scan when nothing above needs it, so counting it would
-# make two equal plans differ.
-FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
-
-
-class Decision(NamedTuple):
-    """A planner decision: its kind, such as "join", and the tables it covers."""
-
-    # "scan", "parallel", "join", "outer", "aggregate", "gather", or any other
-    # operator's lowercased node_type, such as "sort", "limit" or "materialize".
-    kind: str
-    # Sorted aliases, such as ("c", "o"), and <Result>-style names for unnamed leaves.
-    tables: tuple[str, ...]
-
-    def __str__(self) -> str:
-        return f"{self.kind}({', '.join(self.tables)})"
-
-
-@dataclass(frozen=True)
-class HintBuildResult:
-    """The generated hint text and the decisions those exact hints target."""
-
-    hints: str
-    targets: frozenset[Decision]
-
 # A query's subqueries, each as (aliases of the relations inside, its name in hints or
 # None for a pulled-up IN or EXISTS, whether PostgreSQL keeps it whole with exactly
 # these relations); see _subqueries(). A FROM subquery or CTE is listed twice, without
@@ -407,9 +378,9 @@ NOT_PULLED_UP = ("group", "having", "distinct", "order", "limit", "offset", "wit
 NAME_LIMIT = 63
 
 
-def build_hints_detailed(
+def build_hints(
     plan: PlanNode, query: str, switch_offs: bool = True, leading: bool = True
-) -> HintBuildResult:
+) -> str:
     """
     Return pg_hint_plan hints that ask PostgreSQL to use this plan.
 
@@ -498,9 +469,7 @@ def build_hints_detailed(
     query lacks.
     """
     hints: list[str] = []
-    targets: set[Decision] = set()
     levels: list[JoinTree] = []
-    join_trees: dict[Decision, JoinTree] = {}
     parsed = _parse(query)
     relations = {t.alias_or_name: t.name for t in _relations(parsed)} if parsed else {}
 
@@ -527,13 +496,6 @@ def build_hints_detailed(
         hints += ["Set(parallel_setup_cost 0)", "Set(parallel_tuple_cost 0)"]
     else:
         hints.append("Set(max_parallel_workers_per_gather 0)")
-        targets.update(
-            Decision("parallel", (node.alias,))
-            for node in nodes
-            if node.alias
-            and node.node_type not in FOLDED
-            and not node.parallel_aware
-        )
 
     if switch_offs:
         hints += [
@@ -563,18 +525,15 @@ def build_hints_detailed(
             alias = _hint_name(generated.get(node.alias, node.alias))
             names = " ".join([alias, *map(_hint_name, indexes)])
             scan = [f"{SCAN_HINTS[node.node_type]}({names})"]
-            targets.add(Decision("scan", (node.alias,)))
 
             if node.parallel_aware:
                 # Without a Gather above, the worker count is unknown, so the
                 # planner decides.
                 if workers:
                     scan.append(f"Parallel({alias} {workers} hard)")
-                    targets.add(Decision("parallel", (node.alias,)))
             elif parallel:
                 # Otherwise PostgreSQL may also run this scan in parallel.
                 scan.append(f"Parallel({alias} 0 hard)")
-                targets.add(Decision("parallel", (node.alias,)))
 
             if node.alias in generated:
                 copies.append((node.alias, scan))
@@ -586,9 +545,6 @@ def build_hints_detailed(
             hinted.update(flat)
             joined = " ".join(_hint_name(a) for a in flat)
             hints.append(f"{JOIN_HINTS[node.node_type]}({joined})")
-            join_target = Decision("join", decision_tables(node))
-            targets.add(join_target)
-            join_trees[Decision("outer", join_target.tables)] = tree
             # pg_hint_plan can forbid a Memoize under one join but cannot demand one.
             if node.node_type == "Nested Loop" and node.inputs[1].node_type != "Memoize":
                 hints.append(f"NoMemoize({joined})")
@@ -618,15 +574,8 @@ def build_hints_detailed(
     # first, so emit the deepest scope first. A level that cannot be ordered whole
     # repeats the hints of the levels below it; keep the deepest copy.
     if leading:
-        orderable = [part for tree in levels for part in _orderable(tree)]
-        parts = [f"Leading({_format_leading(part)})" for part in orderable]
+        parts = [f"Leading({_format_leading(t)})" for tree in levels for t in _orderable(tree)]
         hints += dict.fromkeys(reversed(parts))
-        covered = {
-            joined
-            for part in orderable
-            for joined in _joined_trees(part)
-        }
-        targets.update(target for target, tree in join_trees.items() if tree in covered)
 
     if levels:
         limits = [f"Set({limit}_collapse_limit {COLLAPSE_LIMIT})" for limit in ("join", "from")]
@@ -661,14 +610,7 @@ def build_hints_detailed(
             "query."
         )
 
-    return HintBuildResult(" ".join(hints), frozenset(targets))
-
-
-def build_hints(
-    plan: PlanNode, query: str, switch_offs: bool = True, leading: bool = True
-) -> str:
-    """Return pg_hint_plan hint text; see build_hints_detailed() for target metadata."""
-    return build_hints_detailed(plan, query, switch_offs, leading).hints
+    return " ".join(hints)
 
 
 def _join_tree(node: PlanNode, subqueries: Subqueries, top: bool = True) -> JoinTree | None:
@@ -815,34 +757,6 @@ def _flatten(tree: JoinTree) -> list[str]:
 
     outer, inner, _ = tree
     return _flatten(outer) + _flatten(inner)
-
-
-def _joined_trees(tree: JoinTree) -> set[JoinTree]:
-    """Every join subtree whose outer/inner ordering a Leading hint describes."""
-    if isinstance(tree, str):
-        return set()
-
-    outer, inner, _ = tree
-    return {
-        tree,
-        *_joined_trees(outer),
-        *_joined_trees(inner),
-    }
-
-
-def decision_tables(node: PlanNode) -> tuple[str, ...]:
-    """
-    Sorted aliases of the relations below node, outside InitPlans and SubPlans.
-
-    An unnamed operator without inputs, such as a Result, counts as <Result>, so a
-    join over it and the join below get different decisions.
-    """
-    unnamed = {
-        f"<{n.node_type}>"
-        for n in node.walk(subplans=False)
-        if not n.alias and not n.inputs and n.node_type not in FOLDED
-    }
-    return tuple(sorted(node.relations() | unnamed))
 
 
 def _has_outer_join(tree: JoinTree) -> bool:

@@ -16,7 +16,7 @@ from comparison import (
     evaluate_plans,
     realizability,
 )
-from preprocessing import HintBuildResult, PlanNode, build_hints, build_hints_detailed
+from preprocessing import PlanNode
 
 
 def scan(
@@ -51,7 +51,6 @@ def force_result(
     plan: PlanNode,
     *,
     requested: PlanNode | None = None,
-    targets: frozenset[Decision] | None = None,
     leading: bool = True,
 ) -> ForcePlanResult:
     from comparison import realization_gaps
@@ -61,7 +60,6 @@ def force_result(
         hints="hints",
         plan=plan,
         gaps=tuple(realization_gaps(requested, plan)),
-        targets=targets or frozenset(),
         switch_offs=True,
         leading=leading,
     )
@@ -177,51 +175,18 @@ def test_realizability_without_force_eligible_requests_is_not_applicable() -> No
     assert "no force-eligible" in (result.score.explanation or "").lower()
 
 
-def test_hint_targets_follow_the_exact_emission_branches() -> None:
-    plan = join(scan("c"), scan("o"))
-    query = "SELECT 1 FROM c JOIN o ON true"
-
-    with_leading = build_hints_detailed(plan, query)
-    without_leading = build_hints_detailed(plan, query, leading=False)
-
-    assert build_hints(plan, query) == with_leading.hints
-    assert Decision("join", ("c", "o")) in with_leading.targets
-    assert Decision("outer", ("c", "o")) in with_leading.targets
-    assert Decision("outer", ("c", "o")) not in without_leading.targets
-    assert Decision("join", ("c", "o")) in without_leading.targets
-
-
-def test_unemitted_hints_do_not_create_targets() -> None:
-    lone_parallel = scan("l", parallel=True)
-    unnamed = join(scan("c"), PlanNode(node_type="Result"))
-
-    parallel_targets = build_hints_detailed(lone_parallel, "SELECT 1 FROM l").targets
-    unnamed_targets = build_hints_detailed(unnamed, "SELECT 1 FROM c").targets
-
-    assert Decision("scan", ("l",)) in parallel_targets
-    assert Decision("parallel", ("l",)) not in parallel_targets
-    assert not {target for target in unnamed_targets if target.kind in {"join", "outer"}}
-
-
-def test_force_plan_keeps_the_selected_retry_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_force_plan_keeps_the_selected_retry_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     requested = join(scan("c"), scan("o"))
     wrong = requested.model_copy(update={"node_type": "Merge Join"})
-    built = iter(
-        [
-            HintBuildResult("first", frozenset({Decision("outer", ("c", "o"))})),
-            HintBuildResult("second", frozenset({Decision("outer", ("c", "o"))})),
-            HintBuildResult("third", frozenset({Decision("join", ("c", "o"))})),
-        ]
-    )
+    built = iter(["first", "second", "third"])
     forced = iter([wrong, wrong, requested])
-    monkeypatch.setattr(comparison, "build_hints_detailed", lambda *_args, **_kwargs: next(built))
+    monkeypatch.setattr(comparison, "build_hints", lambda *_args, **_kwargs: next(built))
     monkeypatch.setattr(comparison, "get_postgres_plan", lambda *_args, **_kwargs: next(forced))
 
     result = comparison.force_plan(object(), "SELECT 1", requested)  # type: ignore[arg-type]
 
     assert result.hints == "third"
     assert result.leading is False
-    assert result.targets == frozenset({Decision("join", ("c", "o"))})
 
 
 def test_force_plan_retry_ranking_ignores_extra_realized_decisions(
@@ -230,14 +195,9 @@ def test_force_plan_retry_ranking_ignores_extra_realized_decisions(
     requested = scan("o")
     wrong_request = scan("o", "Index Scan")
     reproduced_with_extras = join(scan("o"), scan("c"))
-    built = iter(
-        [
-            HintBuildResult("first", frozenset()),
-            HintBuildResult("second", frozenset()),
-        ]
-    )
+    built = iter(["first", "second"])
     forced = iter([wrong_request, reproduced_with_extras])
-    monkeypatch.setattr(comparison, "build_hints_detailed", lambda *_args, **_kwargs: next(built))
+    monkeypatch.setattr(comparison, "build_hints", lambda *_args, **_kwargs: next(built))
     monkeypatch.setattr(comparison, "get_postgres_plan", lambda *_args, **_kwargs: next(forced))
 
     result = comparison.force_plan(object(), "SELECT 1", requested)  # type: ignore[arg-type]
@@ -246,38 +206,30 @@ def test_force_plan_retry_ranking_ignores_extra_realized_decisions(
     assert result.gaps == ()
 
 
-def test_attribution_requires_target_reproduction_and_no_gap() -> None:
-    agent = PlanNode(node_type="Aggregate", strategy="Hashed", children=(scan("o"),))
-    outcome = force_result(
-        agent,
-        targets=frozenset({Decision("scan", ("o",))}),
+def test_intended_counts_only_force_eligible_disagreements_the_realized_plan_kept() -> None:
+    def aggregate(strategy: str, child: PlanNode) -> PlanNode:
+        return PlanNode(node_type="Aggregate", strategy=strategy, children=(child,))
+
+    postgres = aggregate("Hashed", join(scan("c"), scan("o")))
+    agent = aggregate(
+        "Sorted", join(scan("c", "Index Scan"), scan("o", "Index Scan"))
     )
+    realized = aggregate("Sorted", join(scan("c"), scan("o", "Index Scan")))
 
-    evaluation = evaluate_plans(agent, agent, outcome)
-    entries = {item.decision.kind: item for item in evaluation.attribution}
+    evaluation = evaluate_plans(postgres, agent, force_result(realized, requested=agent))
 
-    assert entries["scan"].attributable
-    assert not entries["parallel"].attributable
-    assert "no hint" in entries["parallel"].reason
-    assert not entries["aggregate"].attributable
-    assert "PostgreSQL" in entries["aggregate"].reason
+    # scan(c) and scan(o) differ from PostgreSQL; only scan(o) was realized. The
+    # aggregate also differs but cannot be hinted, and the agreements do not count.
+    assert (evaluation.intended.numerator, evaluation.intended.denominator) == (1, 2)
 
 
-def test_targeted_realization_gap_is_not_attributed() -> None:
-    agent = scan("o")
-    realized = scan("o", "Index Scan", index="orders_pkey")
-    outcome = force_result(
-        realized,
-        requested=agent,
-        targets=frozenset({Decision("scan", ("o",))}),
-    )
+def test_intended_is_not_applicable_when_the_agent_agrees_with_postgres() -> None:
+    plan = join(scan("c"), scan("o"))
 
-    evaluation = evaluate_plans(agent, agent, outcome)
-    scan_entry = next(item for item in evaluation.attribution if item.decision.kind == "scan")
+    evaluation = evaluate_plans(plan, plan, force_result(plan))
 
-    assert scan_entry.targeted and scan_entry.has_gap
-    assert not scan_entry.reproduced
-    assert not scan_entry.attributable
+    assert evaluation.intended.status is MetricStatus.NOT_APPLICABLE
+    assert evaluation.intended.rate is None
 
 
 def test_evaluator_keeps_proposed_realizability_and_realized_views_distinct() -> None:
@@ -286,7 +238,6 @@ def test_evaluator_keeps_proposed_realizability_and_realized_views_distinct() ->
     outcome = force_result(
         postgres,
         requested=agent,
-        targets=frozenset({Decision("scan", ("o",))}),
     )
 
     evaluation = evaluate_plans(postgres, agent, outcome)
@@ -311,3 +262,5 @@ def test_forcing_failure_preserves_proposal_and_marks_dependent_metrics_unavaila
     assert evaluation.realized.all_kinds.difference.denominator is None
     assert evaluation.realized.all_kinds.difference.explanation == "pg_hint_plan unavailable"
     assert evaluation.realized.all_kinds.total is None
+    assert evaluation.intended.status is MetricStatus.UNAVAILABLE
+    assert evaluation.intended.denominator == 1

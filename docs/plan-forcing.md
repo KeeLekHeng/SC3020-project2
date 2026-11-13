@@ -61,7 +61,7 @@ The plan as printed does not mark parallel scans. In this plan the scan of `orde
 
 ### How a forced plan is checked
 
-`force_plan()` forces a plan: it calls `build_hints()` and then `get_postgres_plan()` with the hints. It returns a `ForcePlanResult`: the hints, the plan PostgreSQL built with them, the gaps, the decisions the hints target, and which retry was chosen.
+`force_plan()` forces a plan: it calls `build_hints()` and then `get_postgres_plan()` with the hints. It returns a `ForcePlanResult`: the hints, the plan PostgreSQL built with them, the gaps, and which retry was chosen.
 
 1. `decisions()` reduces a plan to its planner decisions, such as `scan(orders): Seq Scan` and `join(customer, orders): Hash Join`.
 2. `realization_gaps()` compares the requested force-eligible decisions with the plan PostgreSQL built. A **gap** is a requested decision whose choice is missing or different in the realized plan. A force-eligible decision that appears only in the realized plan is an extra diagnostic, not a gap. The force-eligible kinds are the scan method with its index, parallel or serial, the join method, and the outer side. Join order needs no kind of its own: a join is named by the set of tables it joins, so a different order gives different joins. The worker count is not checked.

@@ -2,10 +2,11 @@
 
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 
 import project
-from comparison import Decision, ForcePlanResult, ForcingFailure, realization_gaps
+from comparison import ForcePlanResult, ForcingFailure, realization_gaps
 from preprocessing import PlanNode
 
 
@@ -19,7 +20,6 @@ def outcome(plan: PlanNode, requested: PlanNode | None = None) -> ForcePlanResul
         hints="SeqScan(o)",
         plan=plan,
         gaps=tuple(realization_gaps(requested, plan)),
-        targets=frozenset({Decision("scan", ("o",))}),
         switch_offs=True,
         leading=True,
     )
@@ -48,7 +48,6 @@ def test_show_forced_returns_all_selected_attempt_evidence(
 
     assert shown is result
     assert isinstance(shown, ForcePlanResult)
-    assert shown.targets == frozenset({Decision("scan", ("o",))})
     assert "SeqScan(o)" in capsys.readouterr().out
 
 
@@ -97,6 +96,8 @@ def test_main_prints_complete_or_partial_structured_metrics(
         ),
     )
     monkeypatch.setattr(project, "show_forced", lambda *_args, **_kwargs: next(shown))
+    times = iter([100.0, 250.0])
+    monkeypatch.setattr(project, "execution_time", lambda *_args: next(times))
 
     project.main()
 
@@ -109,3 +110,15 @@ def test_main_prints_complete_or_partial_structured_metrics(
     else:
         assert "Plan realizability: 1/2 force-eligible decisions (50.0%)" in output
         assert "Realized-plan difference: 0/2 decisions (0.0%)" in output
+        assert "PostgreSQL plan 100.0 ms, agent plan 250.0 ms" in output
+        assert "2.50x" in output
+
+
+def test_execution_time_runs_the_query(connection: psycopg.Connection) -> None:
+    ms = project.execution_time(connection, "SELECT count(*) FROM nation")
+
+    assert ms is not None and ms >= 0
+
+
+def test_execution_time_is_none_past_the_timeout(connection: psycopg.Connection) -> None:
+    assert project.execution_time(connection, "SELECT pg_sleep(1)", timeout_ms=10) is None

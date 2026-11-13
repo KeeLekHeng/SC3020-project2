@@ -14,19 +14,35 @@ from typing import NamedTuple
 import psycopg
 
 from preprocessing import (
-    FOLDED,
     GATHER,
     JOIN_HINTS,
     PASS_THROUGH,
-    Decision,
     PlanNode,
-    build_hints_detailed,
-    decision_tables,
+    build_hints,
     get_postgres_plan,
 )
 
+# Operators that make no decision of their own: a Hash belongs to its Hash Join, a
+# Bitmap Index Scan to its heap scan, and a Subquery Scan only passes rows through.
+# PostgreSQL drops a Subquery Scan when nothing above needs it, so counting it would
+# make two equal plans differ.
+FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
+
 # Decision kinds that build_hints() can force; realization_gaps() checks only these.
 FORCED_KINDS = {"scan", "parallel", "join", "outer"}
+
+
+class Decision(NamedTuple):
+    """A planner decision: its kind, such as "join", and the tables it covers."""
+
+    # "scan", "parallel", "join", "outer", "aggregate", "gather", or any other
+    # operator's lowercased node_type, such as "sort", "limit" or "materialize".
+    kind: str
+    # Sorted aliases, such as ("c", "o"), and <Result>-style names for unnamed leaves.
+    tables: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return f"{self.kind}({', '.join(self.tables)})"
 
 
 class Choice(NamedTuple):
@@ -128,7 +144,6 @@ class ForcePlanResult:
     hints: str
     plan: PlanNode
     gaps: tuple[Difference, ...]
-    targets: frozenset[Decision]
     switch_offs: bool
     leading: bool
 
@@ -152,26 +167,15 @@ class RealizabilityResult:
 
 
 @dataclass(frozen=True)
-class Attribution:
-    """Whether one realized choice can conservatively be credited to the agent."""
-
-    decision: Decision
-    choice: Choice
-    attributable: bool
-    targeted: bool
-    reproduced: bool
-    has_gap: bool
-    reason: str
-
-
-@dataclass(frozen=True)
 class PlanEvaluation:
-    """The three plan perspectives and their display/serialization evidence."""
+    """The plan comparisons, realizability and intended-difference realization."""
 
     proposed: PlanComparison
     realizability: RealizabilityResult
     realized: PlanComparison
-    attribution: tuple[Attribution, ...]
+    # Of the force-eligible decisions where the agent chose differently from PostgreSQL,
+    # how many the realized plan kept.
+    intended: MetricScore
     forcing: ForcePlanResult | ForcingFailure
 
 
@@ -233,11 +237,11 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
             found[Decision("parallel", (node.alias,))] = Choice(parallel, node)
             continue
 
-        tables = decision_tables(node)
+        tables = _tables(node)
 
         if node.node_type in JOIN_HINTS and len(node.inputs) == 2:
             found[Decision("join", tables)] = Choice(node.node_type, node)
-            kind, value = "outer", ", ".join(decision_tables(node.inputs[0]))
+            kind, value = "outer", ", ".join(_tables(node.inputs[0]))
         elif node.node_type == "Aggregate":
             kind, value = "aggregate", node.strategy or "Plain"
         elif node.node_type in GATHER:
@@ -315,23 +319,11 @@ def realizability(
         for decision in sorted(realized_all)
         if decision.kind in FORCED_KINDS and decision not in requested
     ]
-    denominator = len(requested)
-    numerator = len(reproduced_keys)
-    if denominator:
-        score = MetricScore(
-            numerator,
-            denominator,
-            numerator / denominator,
-            MetricStatus.DEFINED,
-        )
-    else:
-        score = MetricScore(
-            0,
-            0,
-            None,
-            MetricStatus.NOT_APPLICABLE,
-            "The agent requested no force-eligible decisions.",
-        )
+    score = _rate(
+        len(reproduced_keys),
+        len(requested),
+        "The agent requested no force-eligible decisions.",
+    )
 
     return RealizabilityResult(
         score=score,
@@ -352,18 +344,29 @@ def evaluate_plans(
 ) -> PlanEvaluation:
     """Compose proposed, realizability, and realized metrics without database access."""
     proposed = compare_plans(postgres_plan, agent_plan)
-    realized = (
-        _unavailable_comparison(outcome.reason)
-        if isinstance(outcome, ForcingFailure)
-        else compare_plans(postgres_plan, outcome.plan)
-    )
     result = realizability(agent_plan, outcome)
-    attribution = (
-        ()
-        if isinstance(outcome, ForcingFailure)
-        else _attribution(agent_plan, outcome)
-    )
-    return PlanEvaluation(proposed, result, realized, attribution, outcome)
+    # Differences where the agent made a force-eligible choice PostgreSQL did not.
+    disagreements = [
+        d.decision
+        for d in proposed.differences
+        if d.b is not None and d.decision.kind in FORCED_KINDS
+    ]
+
+    if isinstance(outcome, ForcingFailure):
+        realized = _unavailable_comparison(outcome.reason)
+        intended = MetricScore(
+            None, len(disagreements), None, MetricStatus.UNAVAILABLE, outcome.reason
+        )
+    else:
+        realized = compare_plans(postgres_plan, outcome.plan)
+        reproduced = {item.decision for item in result.reproduced}
+        intended = _rate(
+            sum(decision in reproduced for decision in disagreements),
+            len(disagreements),
+            "The agent chose like PostgreSQL on every force-eligible decision.",
+        )
+
+    return PlanEvaluation(proposed, result, realized, intended, outcome)
 
 
 def differences(a: PlanNode, b: PlanNode) -> list[Difference]:
@@ -405,7 +408,7 @@ def force_plan(
 ) -> ForcePlanResult:
     """
     Force plan on PostgreSQL and return the selected try: its hints, the plan chosen,
-    the realization gaps, the decisions its hints target and its retry settings.
+    the realization gaps and its retry settings.
 
     Some hints backfire: a switch-off of an operator plan needs but does not show, and
     a Leading hint over an anti join made from a LEFT JOIN, which build_hints() cannot
@@ -420,14 +423,13 @@ def force_plan(
     best: ForcePlanResult | None = None
 
     for switch_offs, leading in ((True, True), (False, True), (True, False)):
-        built = build_hints_detailed(plan, query, switch_offs, leading)
-        forced = get_postgres_plan(connection, query, hints=built.hints)
+        hints = build_hints(plan, query, switch_offs, leading)
+        forced = get_postgres_plan(connection, query, hints=hints)
         gaps = realization_gaps(plan, forced)
         candidate = ForcePlanResult(
-            hints=built.hints,
+            hints=hints,
             plan=forced,
             gaps=tuple(gaps),
-            targets=built.targets,
             switch_offs=switch_offs,
             leading=leading,
         )
@@ -452,70 +454,44 @@ def choices_equal(decision: Decision, a: Choice | None, b: Choice | None) -> boo
     )
 
 
+def _tables(node: PlanNode) -> tuple[str, ...]:
+    """
+    Sorted aliases of the relations below node, outside InitPlans and SubPlans.
+
+    An unnamed operator without inputs, such as a Result, counts as <Result>, so a
+    join over it and the join below get different decisions.
+    """
+    unnamed = {
+        f"<{n.node_type}>"
+        for n in node.walk(subplans=False)
+        if not n.alias and not n.inputs and n.node_type not in FOLDED
+    }
+    return tuple(sorted(node.relations() | unnamed))
+
+
+def _rate(numerator: int, denominator: int, empty: str) -> MetricScore:
+    """A defined fraction, or not_applicable with the reason empty when nothing applies."""
+    if not denominator:
+        return MetricScore(0, 0, None, MetricStatus.NOT_APPLICABLE, empty)
+
+    return MetricScore(numerator, denominator, numerator / denominator, MetricStatus.DEFINED)
+
+
 def _comparison_view(same: list[bool]) -> ComparisonView:
     """Counts and rates for a decision universe, given whether each decision matched."""
     total, matching = len(same), sum(same)
     different = total - matching
-    if not total:
-        score = MetricScore(
-            0, 0, None, MetricStatus.NOT_APPLICABLE, "The plans have no decisions to compare."
-        )
-        return ComparisonView(0, 0, 0, score, score)
-
-    difference = MetricScore(different, total, different / total, MetricStatus.DEFINED)
-    similarity = MetricScore(matching, total, matching / total, MetricStatus.DEFINED)
-    return ComparisonView(matching, different, total, difference, similarity)
+    empty = "The plans have no decisions to compare."
+    return ComparisonView(
+        matching,
+        different,
+        total,
+        _rate(different, total, empty),
+        _rate(matching, total, empty),
+    )
 
 
 def _unavailable_comparison(reason: str) -> PlanComparison:
     score = MetricScore(None, None, None, MetricStatus.UNAVAILABLE, reason)
     view = ComparisonView(None, None, None, score, score)
     return PlanComparison(view, view, (), (), ())
-
-
-def _attribution(
-    agent_plan: PlanNode,
-    outcome: ForcePlanResult,
-) -> tuple[Attribution, ...]:
-    requested = decisions(agent_plan)
-    realized = decisions(outcome.plan)
-    gap_keys = {gap.decision for gap in outcome.gaps}
-    entries: list[Attribution] = []
-
-    for decision in sorted(realized):
-        choice = realized[decision]
-        requested_choice = requested.get(decision)
-        targeted = decision in outcome.targets
-        reproduced = (
-            requested_choice is not None
-            and choices_equal(decision, requested_choice, choice)
-        )
-        has_gap = decision in gap_keys
-        attributable = targeted and reproduced and not has_gap
-
-        if attributable:
-            reason = "The selected forcing attempt targeted and reproduced this choice."
-        elif decision.kind not in FORCED_KINDS:
-            reason = "This surrounding operator kind is selected by PostgreSQL, not directly hinted."
-        elif requested_choice is None:
-            reason = "The agent did not request this realized decision."
-        elif not targeted:
-            reason = "The selected forcing attempt emitted no hint targeting this decision."
-        elif has_gap or not reproduced:
-            reason = "PostgreSQL did not reproduce the agent's targeted choice."
-        else:  # Defensive: the conditions above exhaust current attribution states.
-            reason = "The decision cannot be conservatively attributed to the agent."
-
-        entries.append(
-            Attribution(
-                decision,
-                choice,
-                attributable,
-                targeted,
-                reproduced,
-                has_gap,
-                reason,
-            )
-        )
-
-    return tuple(entries)
