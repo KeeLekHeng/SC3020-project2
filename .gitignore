@@ -17,3 +17,6 @@ agent_runs/
 
 # Local agent workflow files
 /.agents/
+
+# Local OpenSpec planning artifacts
+/openspec/
