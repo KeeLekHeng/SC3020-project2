@@ -8,7 +8,6 @@ from comparison import (
     differences,
     evaluate_plans,
     force_plan,
-    force_plan_detailed,
     realization_gaps,
 )
 from preprocessing import PlanNode, build_hints, get_postgres_plan, unique_aliases
@@ -23,7 +22,7 @@ def test_live_pipeline_produces_three_metrics_and_details(
     """A real PostgreSQL forcing outcome feeds the complete evaluation contract."""
     query = "SELECT * FROM customer c"
     postgres = get_postgres_plan(connection, query)
-    outcome = force_plan_detailed(connection, query, postgres)
+    outcome = force_plan(connection, query, postgres)
 
     evaluation = evaluate_plans(postgres, postgres, outcome)
 
@@ -61,9 +60,9 @@ def test_postgresql_plan_is_forced_back(connection: psycopg.Connection, name: st
     query = unique_aliases(QUERIES[name])
     plan = get_postgres_plan(connection, query)
 
-    _, _, gaps = force_plan(connection, query, plan)
+    gaps = force_plan(connection, query, plan).gaps
 
-    assert gaps == []
+    assert gaps == ()
 
 
 @pytest.mark.parametrize(
@@ -83,9 +82,9 @@ def test_swapped_join_over_subquery_is_forced(connection: psycopg.Connection, na
     query = SHAPES[name]
     plan = swap_join_sides(get_postgres_plan(connection, query))
 
-    _, _, gaps = force_plan(connection, query, plan)
+    gaps = force_plan(connection, query, plan).gaps
 
-    assert gaps == []
+    assert gaps == ()
 
 
 @pytest.mark.parametrize(
@@ -117,10 +116,10 @@ def test_swapped_outer_full_join_keeps_its_method(connection: psycopg.Connection
     query = SHAPES["nested FULL JOINs"]
     plan = swap_join_sides(get_postgres_plan(connection, query))
 
-    _, forced, gaps = force_plan(connection, query, plan)
+    result = force_plan(connection, query, plan)
 
-    assert [str(gap.decision) for gap in gaps] == ["outer(c, n, r, s)"]
-    assert (forced.total_cost or 0) < 1e10
+    assert [str(gap.decision) for gap in result.gaps] == ["outer(c, n, r, s)"]
+    assert (result.plan.total_cost or 0) < 1e10
 
 
 def test_hash_joins_are_forced_after_postgresql_removes_joins(
@@ -129,9 +128,9 @@ def test_hash_joins_are_forced_after_postgresql_removes_joins(
     plan = get_postgres_plan(connection, REMOVED_JOINS)
     hashed = all_hash_joins(plan)
 
-    _, _, gaps = force_plan(connection, REMOVED_JOINS, hashed)
+    gaps = force_plan(connection, REMOVED_JOINS, hashed).gaps
 
-    assert gaps == []
+    assert gaps == ()
 
 
 def test_lone_parallel_scan_is_forced(connection: psycopg.Connection) -> None:
@@ -142,17 +141,17 @@ def test_lone_parallel_scan_is_forced(connection: psycopg.Connection) -> None:
     finally:
         connection.execute("RESET parallel_setup_cost; RESET parallel_tuple_cost")
 
-    _, _, gaps = force_plan(connection, query, plan)
+    gaps = force_plan(connection, query, plan).gaps
 
     assert plan.node_type == "Gather"
-    assert gaps == []
+    assert gaps == ()
 
 
 def test_gather_above_a_join_stays_there(connection: psycopg.Connection) -> None:
     query = TPCH["Q10"]
     plan = get_postgres_plan(connection, query)
 
-    _, forced, _ = force_plan(connection, query, plan)
+    forced = force_plan(connection, query, plan).plan
 
     assert [d for d in differences(plan, forced) if d.decision.kind == "gather"] == []
 

@@ -411,9 +411,10 @@ def realization_gaps(requested: PlanNode, forced: PlanNode) -> list[Difference]:
 
 def force_plan(
     connection: psycopg.Connection, query: str, plan: PlanNode
-) -> tuple[str, PlanNode, list[Difference]]:
+) -> ForcePlanResult:
     """
-    Force plan on PostgreSQL and return (hints used, plan chosen, realization gaps).
+    Force plan on PostgreSQL and return the selected try: its hints, the plan chosen,
+    the realization gaps, the decisions its hints target and its retry settings.
 
     Some hints backfire: a switch-off of an operator plan needs but does not show, and
     a Leading hint over an anti join made from a LEFT JOIN, which build_hints() cannot
@@ -425,14 +426,6 @@ def force_plan(
     psycopg.errors.UndefinedFile or InsufficientPrivilege when pg_hint_plan cannot be
     loaded (see get_postgres_plan()).
     """
-    result = force_plan_detailed(connection, query, plan)
-    return result.hints, result.plan, list(result.gaps)
-
-
-def force_plan_detailed(
-    connection: psycopg.Connection, query: str, plan: PlanNode
-) -> ForcePlanResult:
-    """Force a plan and retain the selected retry's hints, targets, and settings."""
     best: ForcePlanResult | None = None
 
     for switch_offs, leading in ((True, True), (False, True), (True, False)):

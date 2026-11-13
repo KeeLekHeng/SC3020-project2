@@ -204,7 +204,7 @@ def test_unemitted_hints_do_not_create_targets() -> None:
     assert not {target for target in unnamed_targets if target.kind in {"join", "outer"}}
 
 
-def test_force_plan_detailed_keeps_the_selected_retry_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_force_plan_keeps_the_selected_retry_targets(monkeypatch: pytest.MonkeyPatch) -> None:
     requested = join(scan("c"), scan("o"))
     wrong = requested.model_copy(update={"node_type": "Merge Join"})
     built = iter(
@@ -218,7 +218,7 @@ def test_force_plan_detailed_keeps_the_selected_retry_targets(monkeypatch: pytes
     monkeypatch.setattr(comparison, "build_hints_detailed", lambda *_args, **_kwargs: next(built))
     monkeypatch.setattr(comparison, "get_postgres_plan", lambda *_args, **_kwargs: next(forced))
 
-    result = comparison.force_plan_detailed(object(), "SELECT 1", requested)  # type: ignore[arg-type]
+    result = comparison.force_plan(object(), "SELECT 1", requested)  # type: ignore[arg-type]
 
     assert result.hints == "third"
     assert result.leading is False
@@ -241,20 +241,10 @@ def test_force_plan_retry_ranking_ignores_extra_realized_decisions(
     monkeypatch.setattr(comparison, "build_hints_detailed", lambda *_args, **_kwargs: next(built))
     monkeypatch.setattr(comparison, "get_postgres_plan", lambda *_args, **_kwargs: next(forced))
 
-    result = comparison.force_plan_detailed(object(), "SELECT 1", requested)  # type: ignore[arg-type]
+    result = comparison.force_plan(object(), "SELECT 1", requested)  # type: ignore[arg-type]
 
     assert result.hints == "second"
     assert result.gaps == ()
-
-
-def test_force_plan_legacy_tuple_api_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
-    plan = scan("o")
-    detailed = force_result(plan, targets=frozenset({Decision("scan", ("o",))}))
-    monkeypatch.setattr(comparison, "force_plan_detailed", lambda *_args: detailed)
-
-    hints, forced, gaps = comparison.force_plan(object(), "SELECT 1", plan)  # type: ignore[arg-type]
-
-    assert (hints, forced, gaps) == (detailed.hints, plan, [])
 
 
 def test_attribution_requires_target_reproduction_and_no_gap() -> None:

@@ -12,7 +12,7 @@ from comparison import (
     MetricStatus,
     PlanEvaluation,
     evaluate_plans,
-    force_plan_detailed,
+    force_plan,
 )
 from preprocessing import (
     AgentPlanError,
@@ -41,7 +41,7 @@ def show_forced(
     outcome preserves hints, targets, gaps, selected retry settings, or a failure reason.
     """
     try:
-        result = force_plan_detailed(connection, query, plan)
+        result = force_plan(connection, query, plan)
 
     except ValueError as error:
         reason = str(error)
