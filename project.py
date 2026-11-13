@@ -114,11 +114,6 @@ def show_evaluation(evaluation: PlanEvaluation) -> None:
                 f"realized agent plan {difference.b or 'has none'}"
             )
 
-    if evaluation.realizability.gaps:
-        print(f"\nRealization gaps: {len(evaluation.realizability.gaps)}")
-        for gap in evaluation.realizability.gaps:
-            print(f"- {gap.decision}: requested {gap.a}, got {gap.b or 'none'}")
-
 
 def main() -> None:
     """

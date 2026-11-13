@@ -109,4 +109,3 @@ def test_main_prints_complete_or_partial_structured_metrics(
     else:
         assert "Plan realizability: 1/2 force-eligible decisions (50.0%)" in output
         assert "Realized-plan difference: 0/2 decisions (0.0%)" in output
-        assert "Realization gaps: 1" in output
