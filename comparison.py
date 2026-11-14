@@ -348,8 +348,17 @@ def evaluate_plans(
     """Compose proposed, realizability, and realized metrics without database access."""
     proposed = compare_plans(postgres_plan, agent_plan)
     result = realizability(agent_plan, outcome)
+    postgres = decisions(postgres_plan)
     requested = _requests(agent_plan)
-    disagreements = [d.decision for d in proposed.differences if d.decision in requested]
+    # Unlike the general pairwise metric, count every explicit forceable request here,
+    # including a named index that PostgreSQL's plan does not have. IDRR asks whether
+    # the agent's intended requests survived, not how many structural differences to
+    # display without double-counting one access-method change.
+    disagreements = [
+        decision
+        for decision, choice in requested.items()
+        if not choices_equal(choice, postgres.get(decision))
+    ]
 
     if isinstance(outcome, ForcingFailure):
         realized = _unavailable_comparison(outcome.reason)

@@ -283,3 +283,19 @@ def test_an_unnamed_index_is_a_difference_but_not_an_intended_change() -> None:
 
     assert [str(d.decision) for d in evaluation.proposed.differences] == ["index(o)"]
     assert evaluation.intended.status is MetricStatus.NOT_APPLICABLE
+
+
+def test_intended_rate_counts_a_named_index_postgres_did_not_request() -> None:
+    postgres = scan("o")
+    agent = scan("o", "Index Scan", index="orders_pkey")
+    realized = scan("o", "Index Scan", index="orders_date_idx")
+
+    evaluation = evaluate_plans(postgres, agent, force_result(realized, requested=agent))
+
+    # The access method survived, but the agent's explicit index choice did not.
+    assert [str(gap.decision) for gap in evaluation.realizability.gaps] == ["index(o)"]
+    assert (
+        evaluation.intended.numerator,
+        evaluation.intended.denominator,
+        evaluation.intended.rate,
+    ) == (1, 2, 0.5)
