@@ -37,6 +37,7 @@ from preprocessing import (
     AGENT_MODEL,
     AGENT_RETRY_EFFORT,
     AgentPlanError,
+    AgentRequestError,
     AgentResponseError,
     AgentResult,
     DatabaseDescription,
@@ -440,7 +441,7 @@ class RunRecord(RecordModel):
     analyst: AnalystResult = AnalystResult()
 
     @model_validator(mode="after")
-    def failure_is_explicit(self) -> "RunRecord":
+    def status_matches_evidence(self) -> "RunRecord":
         if self.status is RunStatus.FAILED and (
             not self.failure_stage or not self.failure_reason
         ):
@@ -449,6 +450,21 @@ class RunRecord(RecordModel):
             self.failure_stage is not None or self.failure_reason is not None
         ):
             raise ValueError("A completed run cannot carry a pipeline failure.")
+        if self.status is RunStatus.COMPLETED:
+            forcing = self.evidence.forcing
+            required = {
+                "database context": self.database,
+                "PostgreSQL plan": self.evidence.postgres_plan,
+                "agent plan": self.evidence.agent_plan,
+                "planner attempts": self.evidence.agent_attempts or None,
+                "realized plan": forcing.realized_plan if forcing else None,
+                "timing evidence": self.evidence.timing,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "A completed run is missing " + ", ".join(missing) + "."
+                )
         return self
 
 
@@ -796,12 +812,15 @@ def collect_run(
         description = describe_database(connection, rewritten)
         database = database_context(connection, description)
         postgres_plan = get_postgres_plan(connection, rewritten)
+    except psycopg.Error as error:
+        connection.rollback()
+        return finish(RunStatus.FAILED, "postgres_plan", str(error))
     except Exception as error:
         return finish(RunStatus.FAILED, "postgres_plan", str(error))
 
-    if client is None:
-        client = anthropic.Anthropic(api_key=api_key())
     try:
+        if client is None:
+            client = anthropic.Anthropic(api_key=api_key())
         result: AgentResult = ask_agent(client, rewritten, description)
         agent_plan = result.plan
         attempts = tuple(
@@ -820,7 +839,7 @@ def collect_run(
             for attempt in error.attempts
         )
         return finish(RunStatus.FAILED, "agent_plan", str(error))
-    except AgentResponseError as error:
+    except (AgentRequestError, AgentResponseError) as error:
         attempts = tuple(
             PlannerAttempt(
                 response=attempt.response,
@@ -850,10 +869,17 @@ def collect_run(
 
     try:
         postgres_ms = measure_execution_time(connection, rewritten, timeout_ms=timeout_ms)
+        timing = TimingEvidence(
+            postgres_ms=postgres_ms,
+            postgres_timed_out=postgres_ms is None,
+        )
         realized_ms = measure_execution_time(
             connection, rewritten, outcome.hints, timeout_ms=timeout_ms
         )
-    except (psycopg.Error, RuntimeError) as error:
+    except psycopg.Error as error:
+        connection.rollback()
+        return finish(RunStatus.FAILED, "timing", str(error))
+    except RuntimeError as error:
         return finish(RunStatus.FAILED, "timing", str(error))
     timing = TimingEvidence(
         postgres_ms=postgres_ms,

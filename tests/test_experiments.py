@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import anthropic
+import psycopg
 import pytest
 from pydantic import ValidationError
 
@@ -48,6 +49,7 @@ from comparison import ForcePlanResult, ForcingFailure, realization_gaps
 from preprocessing import (
     AgentAttempt,
     AgentPlanError,
+    AgentRequestError,
     AgentResult,
     DatabaseDescription,
     PlanNode,
@@ -83,6 +85,12 @@ def configuration() -> PlannerConfiguration:
 
 
 def record(*, failed: bool = False) -> RunRecord:
+    postgres = PlanNode(node_type="Seq Scan", alias="orders")
+    agent = PlanNode(
+        node_type="Index Scan",
+        alias="orders",
+        index_name="orders_pkey",
+    )
     return RunRecord(
         identity=RunIdentity(
             experiment_id="experiment-1",
@@ -104,7 +112,20 @@ def record(*, failed: bool = False) -> RunRecord:
         evidence=RunEvidence(
             original_sql="SELECT * FROM orders",
             rewritten_sql="SELECT * FROM orders",
-            postgres_plan=PlanNode(node_type="Seq Scan", alias="orders"),
+            postgres_plan=postgres,
+            agent_plan=None if failed else agent,
+            agent_attempts=() if failed else (PlannerAttempt(response="{}"),),
+            forcing=(
+                None
+                if failed
+                else ForcingEvidence(
+                    realized_plan=postgres,
+                    hints="SeqScan(orders)",
+                    switch_offs=False,
+                    leading=False,
+                )
+            ),
+            timing=None if failed else TimingEvidence(postgres_ms=1, realized_ms=1),
         ),
         status=RunStatus.FAILED if failed else RunStatus.COMPLETED,
         failure_stage="agent" if failed else None,
@@ -120,6 +141,14 @@ def test_successful_and_partial_run_schema_round_trip(failed: bool) -> None:
 
     assert loaded == original
     assert loaded.provenance.schema_version == 1
+
+
+def test_completed_run_rejects_missing_success_evidence() -> None:
+    payload = record().model_dump()
+    payload["evidence"]["agent_plan"] = None
+
+    with pytest.raises(ValidationError, match="completed run is missing agent plan"):
+        RunRecord.model_validate(payload)
 
 
 def test_run_schema_rejects_secret_fields() -> None:
@@ -155,7 +184,9 @@ def test_selected_forcing_outcome_round_trips_into_evaluator() -> None:
                 rewritten_sql="SELECT * FROM orders",
                 postgres_plan=postgres,
                 agent_plan=agent,
+                agent_attempts=(PlannerAttempt(response="{}"),),
                 forcing=forcing_evidence(selected),
+                timing=TimingEvidence(postgres_ms=1, realized_ms=1),
             )
         }
     )
@@ -300,8 +331,11 @@ class FakeInfo:
 class FakeConnection:
     info = FakeInfo()
 
+    def __init__(self) -> None:
+        self.rollbacks = 0
+
     def rollback(self) -> None:
-        pass
+        self.rollbacks += 1
 
 
 def arrange_collection(
@@ -420,6 +454,69 @@ def test_collector_preserves_failure_and_prior_evidence(
         assert run.evidence.forcing.failure_reason == "cannot force"
 
 
+def test_collector_stores_postgres_evidence_when_client_initialization_fails(
+    run_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import experiments
+
+    arrange_collection(monkeypatch)
+
+    def fail_client(**_kwargs: object) -> None:
+        raise anthropic.AnthropicError("client initialization failed")
+
+    monkeypatch.setattr(experiments.anthropic, "Anthropic", fail_client)
+
+    run = collect_run(
+        FakeConnection(),  # type: ignore[arg-type]
+        experiment_id="experiment-client-failure",
+        run_id="client-failure",
+        query_name="Q1",
+        sample=1,
+        sql="SELECT * FROM orders",
+        output_root=run_root,
+    )
+
+    assert run.status is RunStatus.FAILED
+    assert run.failure_stage == "agent_plan"
+    assert run.evidence.postgres_plan is not None
+    assert load_run(
+        run_root / "experiment-client-failure" / "client-failure.json"
+    ) == run
+
+
+def test_collector_stores_attempts_completed_before_request_failure(
+    run_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import experiments
+
+    arrange_collection(monkeypatch)
+    completed = AgentAttempt("invalid response", ("invalid JSON",))
+
+    def fail_after_attempt(*_args: object) -> AgentResult:
+        raise AgentRequestError("network failed", (completed,))
+
+    monkeypatch.setattr(experiments, "ask_agent", fail_after_attempt)
+
+    run = collect_run(
+        FakeConnection(),  # type: ignore[arg-type]
+        experiment_id="experiment-request-failure",
+        run_id="request-failure",
+        query_name="Q1",
+        sample=1,
+        sql="SELECT * FROM orders",
+        output_root=run_root,
+        client=object(),  # type: ignore[arg-type]
+    )
+
+    assert run.status is RunStatus.FAILED
+    assert run.failure_stage == "agent_plan"
+    assert run.evidence.agent_attempts == (
+        PlannerAttempt(
+            response="invalid response", validation_problems=("invalid JSON",)
+        ),
+    )
+
+
 def test_collector_records_timeout_without_discarding_plans(
     run_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -451,10 +548,16 @@ def test_collector_preserves_selected_plan_when_timing_fails(
 
     arrange_collection(monkeypatch)
 
-    def fail_timing(*_args: object, **_kwargs: object) -> float:
+    calls = 0
+
+    def fail_realized_timing(*_args: object, **_kwargs: object) -> float:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 100.0
         raise RuntimeError("timing failed")
 
-    monkeypatch.setattr(experiments, "measure_execution_time", fail_timing)
+    monkeypatch.setattr(experiments, "measure_execution_time", fail_realized_timing)
 
     run = collect_run(
         FakeConnection(),  # type: ignore[arg-type]
@@ -472,6 +575,40 @@ def test_collector_preserves_selected_plan_when_timing_fails(
     assert run.failure_reason == "timing failed"
     assert run.evidence.forcing is not None
     assert run.evidence.forcing.realized_plan is not None
+    assert run.evidence.timing == TimingEvidence(postgres_ms=100.0)
+
+
+@pytest.mark.parametrize("stage", ["postgres_plan", "timing"])
+def test_collector_rolls_back_database_errors(
+    run_root: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import experiments
+
+    arrange_collection(monkeypatch)
+
+    def fail_database(*_args: object, **_kwargs: object) -> None:
+        raise psycopg.OperationalError("database failed")
+
+    if stage == "postgres_plan":
+        monkeypatch.setattr(experiments, "get_postgres_plan", fail_database)
+    else:
+        monkeypatch.setattr(experiments, "measure_execution_time", fail_database)
+    connection = FakeConnection()
+
+    run = collect_run(
+        connection,  # type: ignore[arg-type]
+        experiment_id="experiment-rollback",
+        run_id=stage,
+        query_name="Q1",
+        sample=1,
+        sql="SELECT * FROM orders",
+        output_root=run_root,
+        client=object(),  # type: ignore[arg-type]
+    )
+
+    assert run.status is RunStatus.FAILED
+    assert run.failure_stage == stage
+    assert connection.rollbacks == 1
 
 
 def evaluable_record(
@@ -730,6 +867,7 @@ def gapped_run() -> RunRecord:
                 agent_plan=agent,
                 agent_attempts=(PlannerAttempt(response="private planner prose",),),
                 forcing=forcing_evidence(selected),
+                timing=TimingEvidence(postgres_ms=1, realized_ms=1),
             )
         }
     )

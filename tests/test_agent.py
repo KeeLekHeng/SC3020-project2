@@ -18,6 +18,7 @@ from preprocessing import (
     SCAN_HINTS,
     AgentNodeType,
     AgentPlanError,
+    AgentRequestError,
     AgentResponseError,
     DatabaseDescription,
     PlanNode,
@@ -459,7 +460,9 @@ def test_user_prompt_lists_the_aliases_and_the_database() -> None:
 class FakeClient:
     """Stands in for anthropic.Anthropic: answers each request with the next reply."""
 
-    def __init__(self, *replies: str, stop_reason: str = "end_turn") -> None:
+    def __init__(
+        self, *replies: str | Exception, stop_reason: str = "end_turn"
+    ) -> None:
         self.replies = list(replies)
         self.stop_reason = stop_reason
         self.requests: list[dict[str, Any]] = []
@@ -476,9 +479,12 @@ class FakeClient:
         pass
 
     def get_final_message(self) -> SimpleNamespace:
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
         content = [
             anthropic.types.ThinkingBlock(type="thinking", thinking="", signature=""),
-            anthropic.types.TextBlock(type="text", text=self.replies.pop(0)),
+            anthropic.types.TextBlock(type="text", text=reply),
         ]
         return SimpleNamespace(
             content=content, stop_reason=self.stop_reason, stop_details=None
@@ -582,6 +588,16 @@ def test_cut_off_answer_raises() -> None:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert [attempt.response for attempt in caught.value.attempts] == ["{"]
+
+
+def test_request_failure_preserves_completed_prior_attempts() -> None:
+    client = FakeClient("no plan", anthropic.AnthropicError("network failed"))
+
+    with pytest.raises(AgentRequestError, match="network failed") as caught:
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
+
+    assert [attempt.response for attempt in caught.value.attempts] == ["no plan"]
+    assert caught.value.attempts[0].validation_problems
 
 
 def test_database_description_reads_the_catalogs(connection: psycopg.Connection) -> None:

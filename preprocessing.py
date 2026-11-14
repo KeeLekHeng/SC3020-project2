@@ -1193,6 +1193,14 @@ class AgentResponseError(RuntimeError):
         super().__init__(message)
 
 
+class AgentRequestError(RuntimeError):
+    """An agent API request failed after zero or more completed response attempts."""
+
+    def __init__(self, message: str, attempts: tuple["AgentAttempt", ...]) -> None:
+        self.attempts = attempts
+        super().__init__(message)
+
+
 class DatabaseDescription(NamedTuple):
     """What the agent is told about the database for one query, from describe_database()."""
 
@@ -1541,8 +1549,9 @@ def ask_agent(
     The first answer is asked for at low effort (how hard the model thinks), any retry
     at medium.
 
-    Raises AgentPlanError with the last answer's problems when no answer is usable, and
-    RuntimeError when the model declines or its answer is cut off.
+    Raises AgentPlanError with the last answer's problems when no answer is usable,
+    AgentResponseError when the model declines or is cut off, and AgentRequestError
+    with every completed earlier attempt when an API request fails.
     """
     system: list[anthropic.types.TextBlockParam] = [{
         "type": "text",
@@ -1557,16 +1566,19 @@ def ask_agent(
 
     for attempt in range(1, max_attempts + 1):
         # Streaming avoids HTTP timeouts on long answers.
-        with client.messages.stream(
-            model=AGENT_MODEL,
-            max_tokens=AGENT_MAX_TOKENS,
-            system=system,
-            messages=messages,
-            output_config={
-                "effort": AGENT_FIRST_EFFORT if attempt == 1 else AGENT_RETRY_EFFORT
-            },
-        ) as stream:
-            response = stream.get_final_message()
+        try:
+            with client.messages.stream(
+                model=AGENT_MODEL,
+                max_tokens=AGENT_MAX_TOKENS,
+                system=system,
+                messages=messages,
+                output_config={
+                    "effort": AGENT_FIRST_EFFORT if attempt == 1 else AGENT_RETRY_EFFORT
+                },
+            ) as stream:
+                response = stream.get_final_message()
+        except anthropic.AnthropicError as error:
+            raise AgentRequestError(str(error), tuple(attempts)) from error
 
         text = "".join(
             block.text for block in response.content
