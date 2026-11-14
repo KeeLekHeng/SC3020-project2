@@ -5,6 +5,7 @@ from typing import Any
 import anthropic
 import psycopg
 
+from experiments import measure_execution_time as execution_time
 from comparison import (
     ForcePlanResult,
     ForcingFailure,
@@ -64,29 +65,6 @@ def show_forced(
         print(f"\nNot followed: {gap.decision} requested {gap.a}, got {gap.b}")
 
     return result
-
-
-def execution_time(
-    connection: psycopg.Connection, query: str, hints: str = "", timeout_ms: int = 60_000
-) -> float | None:
-    """
-    Milliseconds query takes to run, with hints, or None when a run passes timeout_ms,
-    since a bad forced plan can run for hours.
-
-    It runs twice and keeps the second time, so each plan is timed with a warm cache.
-    shortcut: one timed run is noisy; take the median of several runs for a workload.
-    """
-    connection.execute(f"SET statement_timeout = {int(timeout_ms)}".encode())
-    try:
-        for _ in range(2):
-            plan = get_postgres_plan(connection, query, analyze=True, hints=hints)
-    except psycopg.errors.QueryCanceled:
-        connection.rollback()
-        return None
-    finally:
-        connection.execute(b"RESET statement_timeout")
-
-    return plan.execution_time_ms
 
 
 def _format_score(score: MetricScore, unit: str) -> str:

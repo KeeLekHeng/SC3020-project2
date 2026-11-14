@@ -18,6 +18,7 @@ from preprocessing import (
     SCAN_HINTS,
     AgentNodeType,
     AgentPlanError,
+    AgentResponseError,
     DatabaseDescription,
     PlanNode,
     agent_system_prompt,
@@ -490,6 +491,9 @@ def test_good_first_answer_is_accepted() -> None:
     result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert result.problems == []
+    assert len(result.attempts) == 1
+    assert result.attempts[0].response == json.dumps(answer())
+    assert result.attempts[0].validation_problems == ()
     assert result.summary.startswith("Hash the filtered orders")
     assert result.plan.relations() == {"c", "o"}
 
@@ -507,6 +511,11 @@ def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
     result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert len(result.problems) == 1
+    assert [attempt.response for attempt in result.attempts] == [
+        json.dumps(bad), json.dumps(answer())
+    ]
+    assert result.attempts[0].validation_problems == tuple(result.problems[0])
+    assert result.attempts[1].validation_problems == ()
     assert [r["output_config"]["effort"] for r in client.requests] == ["low", "medium"]
     retry = client.requests[1]["messages"]
     assert [m["role"] for m in retry] == ["user", "assistant", "user"]
@@ -559,14 +568,20 @@ def test_agent_gives_up_after_max_attempts() -> None:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, max_attempts=2)
 
     assert caught.value.answer == "still no plan"
+    assert [attempt.response for attempt in caught.value.attempts] == [
+        "no plan", "still no plan"
+    ]
+    assert all(attempt.validation_problems for attempt in caught.value.attempts)
     assert len(client.requests) == 2
 
 
 def test_cut_off_answer_raises() -> None:
     client = FakeClient("{", stop_reason="max_tokens")
 
-    with pytest.raises(RuntimeError, match="max_tokens"):
+    with pytest.raises(AgentResponseError, match="max_tokens") as caught:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
+
+    assert [attempt.response for attempt in caught.value.attempts] == ["{"]
 
 
 def test_database_description_reads_the_catalogs(connection: psycopg.Connection) -> None:

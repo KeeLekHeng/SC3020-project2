@@ -1,6 +1,6 @@
 # SC3020-project2
 
-Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For one query, `project.py` prints PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, and lists the decisions the two plans made differently. The data is TPC-H. The GUI and the difference rate are not built yet.
+Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For one query, `project.py` prints PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, and lists the decisions the two plans made differently. The data is TPC-H. Deterministic comparison metrics and stored workload experiments are available as Python APIs; the GUI is separate work.
 
 ## Requirements
 
@@ -136,6 +136,7 @@ py -m pytest
 | `tests/test_hints.py` | Hint building, the alias rewrite and plan comparison. | Nothing. |
 | `tests/test_forcing.py` | Forcing PostgreSQL's own plan for TPC-H Q1–Q22, for query shapes that are hard to force and for a few edited plans, such as swapped join sides; every forced decision must be followed. | The database with `pg_hint_plan`. |
 | `tests/test_agent.py` | The agent's answer validation, the prompt, the database description and the retry loop with a fake client. | No API key; the database for the description tests. |
+| `tests/test_experiments.py` | Versioned run storage, offline recomputation, aggregation, timing summaries and advisory analysis with fake clients. | Nothing. |
 
 Tests that need the database are skipped when it is unavailable. All use `EXPLAIN` only, so no query runs.
 
@@ -150,7 +151,9 @@ Tests that need the database are skipped when it is unavailable. All use `EXPLAI
 | `project.py` | Prompts for the password and runs the pipeline on `query.sql`: PostgreSQL's plan, the same plan forced back as a check, the agent's plan, that plan forced, and the decisions the two made differently. |
 | `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
+| `experiments.py` | Stores one JSON record per query sample, recomputes and aggregates metrics, measures per-query performance, and optionally records advisory Haiku explanations. |
 | `docs/plan-forcing.md` | The hints that force a plan, how a forced plan is checked, how well forcing works, and what cannot be forced. |
 | `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |
+| `docs/experiments.md` | The run schema, analyst boundary, aggregation rules and JSON consumer contract. |
 | `tests/` | The tests above; `tests/fixtures/` holds a sample agent answer. |
-| `agent_runs/` | Not in git: raw agent answers and rendered prompts from local runs. |
+| `agent_runs/` | Not in git: versioned raw run records, including plans, attempts, selected forcing evidence, timings and optional analyst feedback. |
