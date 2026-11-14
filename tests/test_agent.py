@@ -601,7 +601,7 @@ def test_database_description_keeps_only_what_the_query_reads(
 def test_agent_plan_is_forced_on_postgres(connection: psycopg.Connection) -> None:
     result = get_agent_plan(connection, QUERY, client=cast(anthropic.Anthropic, FakeClient(json.dumps(answer()))))
 
-    hints, forced, gaps = force_plan(connection, result.query, result.plan)
+    forced = force_plan(connection, result.query, result.plan)
 
-    assert "HashJoin(c o)" in hints
-    assert gaps == []
+    assert "HashJoin(c o)" in forced.hints
+    assert forced.gaps == ()

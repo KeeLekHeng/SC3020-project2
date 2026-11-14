@@ -14,3 +14,9 @@ venv/
 
 # Local agent runs and rendered prompts
 agent_runs/
+
+# Local agent workflow files
+/.agents/
+
+# Local OpenSpec planning artifacts
+/openspec/

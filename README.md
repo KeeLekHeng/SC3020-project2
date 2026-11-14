@@ -69,8 +69,8 @@ from preprocessing import get_agent_plan, get_postgres_plan
 
 result = get_agent_plan(connection, original_sql)
 postgres = get_postgres_plan(connection, result.query)
-hints, hinted, gaps = force_plan(connection, result.query, result.plan)
-diffs = differences(postgres, hinted)
+forced = force_plan(connection, result.query, result.plan)
+diffs = differences(postgres, forced.plan)
 ```
 
 Plan and force with `result.query`, the query after `unique_aliases()`, because the agent's aliases refer to it. `result` is an `AgentResult`:

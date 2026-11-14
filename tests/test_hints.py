@@ -322,12 +322,14 @@ def test_join_over_a_second_values_list_gets_no_hint() -> None:
     assert "*VALUES*_1" not in build_hints(plan, query)
 
 
-def test_scan_without_index_name_matches_any_index() -> None:
+def test_scan_without_index_name_differs_only_on_the_index() -> None:
     named = PlanNode(node_type="Index Scan", alias="o", index_name="orders_pkey")
     unnamed = named.model_copy(update={"index_name": None})
+    seq = named.model_copy(update={"node_type": "Seq Scan", "index_name": None})
 
-    assert differences(unnamed, named) == []
-    assert differences(unnamed.model_copy(update={"node_type": "Seq Scan"}), named) != []
+    assert [str(d.decision) for d in differences(unnamed, named)] == ["index(o)"]
+    # A different scan method counts once, not again for the index.
+    assert [str(d.decision) for d in differences(seq, named)] == ["scan(o)"]
 
 
 def test_join_over_an_unnamed_input_is_its_own_decision() -> None:

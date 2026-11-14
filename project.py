@@ -5,7 +5,15 @@ from typing import Any
 import anthropic
 import psycopg
 
-from comparison import differences, force_plan
+from comparison import (
+    ForcePlanResult,
+    ForcingFailure,
+    MetricScore,
+    MetricStatus,
+    PlanEvaluation,
+    evaluate_plans,
+    force_plan,
+)
 from preprocessing import (
     AgentPlanError,
     PlanNode,
@@ -24,34 +32,114 @@ CONNECTION_SETTINGS: dict[str, Any] = {
 }
 
 
-def show_forced(connection: psycopg.Connection, query: str, plan: PlanNode) -> PlanNode | None:
+def show_forced(
+    connection: psycopg.Connection, query: str, plan: PlanNode
+) -> ForcePlanResult | ForcingFailure:
     """
     Force plan on PostgreSQL and print the hints, the plan PostgreSQL chose with them
-    and every forced decision it did not follow. Returns the chosen plan, or None,
-    after printing why, when the plan cannot be forced.
+    and every force-eligible decision it did not reproduce. The returned structured
+    outcome preserves hints, gaps, selected retry settings, or a failure reason.
     """
     try:
-        hints, forced, gaps = force_plan(connection, query, plan)
+        result = force_plan(connection, query, plan)
 
     except ValueError as error:
-        print(f"\n{error}")
-        return None
+        reason = str(error)
+        print(f"\n{reason}")
+        return ForcingFailure(reason)
 
     except (psycopg.errors.UndefinedFile, psycopg.errors.InsufficientPrivilege) as error:
         connection.rollback()
-        print(f"\npg_hint_plan cannot be loaded, so plans cannot be forced: {error}")
-        return None
+        reason = f"pg_hint_plan cannot be loaded, so plans cannot be forced: {error}"
+        print(f"\n{reason}")
+        return ForcingFailure(reason)
 
-    print(f"\npg_hint_plan hints:\n{hints}")
-    print(f"\nPlan forced with the hints:\n{forced}")
+    print(f"\npg_hint_plan hints:\n{result.hints}")
+    print(f"\nPlan forced with the hints:\n{result.plan}")
 
-    if not gaps:
+    if not result.gaps:
         print("\nPostgreSQL followed every forced decision.")
 
-    for gap in gaps:
+    for gap in result.gaps:
         print(f"\nNot followed: {gap.decision} requested {gap.a}, got {gap.b}")
 
-    return forced
+    return result
+
+
+def execution_time(
+    connection: psycopg.Connection, query: str, hints: str = "", timeout_ms: int = 60_000
+) -> float | None:
+    """
+    Milliseconds query takes to run, with hints, or None when a run passes timeout_ms,
+    since a bad forced plan can run for hours.
+
+    It runs twice and keeps the second time, so each plan is timed with a warm cache.
+    shortcut: one timed run is noisy; take the median of several runs for a workload.
+    """
+    connection.execute(f"SET statement_timeout = {int(timeout_ms)}".encode())
+    try:
+        for _ in range(2):
+            plan = get_postgres_plan(connection, query, analyze=True, hints=hints)
+    except psycopg.errors.QueryCanceled:
+        connection.rollback()
+        return None
+    finally:
+        connection.execute(b"RESET statement_timeout")
+
+    return plan.execution_time_ms
+
+
+def _format_score(score: MetricScore, unit: str) -> str:
+    """Format a score without inventing a number for unavailable or N/A results."""
+    if score.status is not MetricStatus.DEFINED:
+        return f"N/A [{score.status.value}]: {score.explanation or 'No explanation available.'}"
+
+    assert score.numerator is not None and score.denominator is not None and score.rate is not None
+    return f"{score.numerator}/{score.denominator} {unit} ({score.rate:.1%})"
+
+
+def show_evaluation(evaluation: PlanEvaluation) -> None:
+    """Print one concise CLI view derived entirely from a structured evaluation."""
+    print("\nPlan comparison metrics:")
+    print(
+        "- Proposed-plan difference: "
+        + _format_score(evaluation.proposed.all_kinds.difference, "decisions")
+    )
+    print(
+        "- Plan realizability: "
+        + _format_score(evaluation.realizability.score, "force-eligible decisions")
+    )
+    print(
+        "- Realized-plan difference: "
+        + _format_score(evaluation.realized.all_kinds.difference, "decisions")
+    )
+    print(
+        "- Intended-difference realization: "
+        + _format_score(evaluation.intended, "agent disagreements")
+    )
+    print(
+        "- Proposed core difference: "
+        + _format_score(evaluation.proposed.core.difference, "core decisions")
+    )
+    print(
+        "- Realized core difference: "
+        + _format_score(evaluation.realized.core.difference, "core decisions")
+    )
+
+    print(f"\nProposed-plan differences: {len(evaluation.proposed.differences)}")
+    for difference in evaluation.proposed.differences:
+        print(
+            f"- {difference.decision}: PostgreSQL {difference.a or 'has none'}, "
+            f"agent proposed {difference.b or 'has none'}"
+        )
+
+    if evaluation.realized.all_kinds.difference.status is MetricStatus.DEFINED:
+        print(f"\nRealized-plan differences: {len(evaluation.realized.differences)}")
+        for difference in evaluation.realized.differences:
+            print(
+                f"- {difference.decision}: PostgreSQL {difference.a or 'has none'}, "
+                f"realized agent plan {difference.b or 'has none'}"
+            )
 
 
 def main() -> None:
@@ -77,7 +165,8 @@ def main() -> None:
         postgres = get_postgres_plan(connection, query)
         print(f"\nPostgreSQL plan:\n{postgres}")
 
-        if show_forced(connection, query, postgres) is None:
+        postgres_round_trip = show_forced(connection, query, postgres)
+        if isinstance(postgres_round_trip, ForcingFailure):
             return
 
         if api_key() is None:
@@ -99,17 +188,22 @@ def main() -> None:
         print(f"\nAgent plan, after {len(result.problems) + 1} answer(s):\n{result.plan}")
         print(f"\nAgent's strategy: {result.summary}")
 
-        forced = show_forced(connection, result.query, result.plan)
-        if forced is None:
+        outcome = show_forced(connection, result.query, result.plan)
+        evaluation = evaluate_plans(postgres, result.plan, outcome)
+        show_evaluation(evaluation)
+
+        if isinstance(outcome, ForcingFailure):
             return
 
-        found = differences(postgres, forced)
-        print(f"\nDecisions PostgreSQL's plan and the agent's forced plan made differently: {len(found)}")
-        for difference in found:
-            print(
-                f"- {difference.decision}: PostgreSQL {difference.a or 'has none'}, "
-                f"agent {difference.b or 'has none'}"
-            )
+        print("\nRunning both plans with EXPLAIN ANALYZE...")
+        postgres_ms = execution_time(connection, query)
+        agent_ms = execution_time(connection, result.query, outcome.hints)
+        times = [
+            "over the timeout" if ms is None else f"{ms:.1f} ms" for ms in (postgres_ms, agent_ms)
+        ]
+        print(f"Execution time: PostgreSQL plan {times[0]}, agent plan {times[1]}")
+        if postgres_ms and agent_ms:
+            print(f"The agent plan took {agent_ms / postgres_ms:.2f}x PostgreSQL's time.")
 
 
 if __name__ == "__main__":
