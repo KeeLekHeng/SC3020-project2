@@ -943,6 +943,10 @@ def _hint_name(name: str) -> str:
 
 # Model that proposes the agent's plan; its key comes from api_key().
 AGENT_MODEL = "claude-haiku-5-5"
+AGENT_MAX_TOKENS = 64_000
+AGENT_MAX_ATTEMPTS = 3
+AGENT_FIRST_EFFORT = "low"
+AGENT_RETRY_EFFORT = "medium"
 
 # Operators the agent may use. All are PostgreSQL names, so the agent's plan, the
 # PostgreSQL plan and the hinted plan share one vocabulary. Every scan and join here can
@@ -1166,11 +1170,35 @@ class AgentPlanError(ValueError):
     retry message; answer is the agent's raw text.
     """
 
-    def __init__(self, errors: list[str], answer: str = "") -> None:
+    def __init__(
+        self,
+        errors: list[str],
+        answer: str = "",
+        attempts: tuple["AgentAttempt", ...] = (),
+    ) -> None:
         self.errors = errors
         self.answer = answer
+        self.attempts = attempts or (
+            (AgentAttempt(answer, tuple(errors)),) if answer else ()
+        )
         problems = "\n".join(f"- {e}" for e in errors)
         super().__init__(f"The agent's plan is invalid:\n{problems}")
+
+
+class AgentResponseError(RuntimeError):
+    """The model returned a terminal response that cannot produce a plan."""
+
+    def __init__(self, message: str, attempts: tuple["AgentAttempt", ...]) -> None:
+        self.attempts = attempts
+        super().__init__(message)
+
+
+class AgentRequestError(RuntimeError):
+    """An agent API request failed after zero or more completed response attempts."""
+
+    def __init__(self, message: str, attempts: tuple["AgentAttempt", ...]) -> None:
+        self.attempts = attempts
+        super().__init__(message)
 
 
 class DatabaseDescription(NamedTuple):
@@ -1181,6 +1209,13 @@ class DatabaseDescription(NamedTuple):
     """Index names of each table, keyed by table name."""
 
 
+class AgentAttempt(NamedTuple):
+    """One textual model response and the validation problems it produced."""
+
+    response: str
+    validation_problems: tuple[str, ...]
+
+
 class AgentResult(NamedTuple):
     """
     The agent's accepted plan.
@@ -1188,7 +1223,9 @@ class AgentResult(NamedTuple):
     query is the text the agent planned, after unique_aliases(). Plan the PostgreSQL
     side and force the agent's plan with this text, because the plan's aliases refer to
     it. answer is the agent's raw final answer. problems lists, for each rejected answer
-    before it, the errors sent back, so there were len(problems) + 1 answers.
+    before it, the errors sent back. attempts retains every textual response in order,
+    paired with its validation outcome; hidden thinking and SDK response objects are
+    deliberately excluded.
     """
 
     plan: PlanNode
@@ -1196,6 +1233,7 @@ class AgentResult(NamedTuple):
     query: str
     answer: str
     problems: list[list[str]]
+    attempts: tuple[AgentAttempt, ...] = ()
 
 
 def validate_agent_plan(output: str) -> AgentAnswer:
@@ -1498,7 +1536,7 @@ def ask_agent(
     client: anthropic.Anthropic,
     query: str,
     database: DatabaseDescription,
-    max_attempts: int = 3,
+    max_attempts: int = AGENT_MAX_ATTEMPTS,
 ) -> AgentResult:
     """
     Run the conversation with the agent until it gives a usable plan.
@@ -1511,8 +1549,9 @@ def ask_agent(
     The first answer is asked for at low effort (how hard the model thinks), any retry
     at medium.
 
-    Raises AgentPlanError with the last answer's problems when no answer is usable, and
-    RuntimeError when the model declines or its answer is cut off.
+    Raises AgentPlanError with the last answer's problems when no answer is usable,
+    AgentResponseError when the model declines or is cut off, and AgentRequestError
+    with every completed earlier attempt when an API request fails.
     """
     system: list[anthropic.types.TextBlockParam] = [{
         "type": "text",
@@ -1521,31 +1560,42 @@ def ask_agent(
     }]
     messages: list[Any] = [{"role": "user", "content": agent_user_prompt(query, database)}]
     problems: list[list[str]] = []
+    attempts: list[AgentAttempt] = []
     errors: list[str] = []
     text = ""
 
     for attempt in range(1, max_attempts + 1):
         # Streaming avoids HTTP timeouts on long answers.
-        with client.messages.stream(
-            model=AGENT_MODEL,
-            max_tokens=64000,
-            system=system,
-            messages=messages,
-            output_config={"effort": "low" if attempt == 1 else "medium"},
-        ) as stream:
-            response = stream.get_final_message()
-
-        if response.stop_reason == "refusal":
-            category = response.stop_details.category if response.stop_details else None
-            raise RuntimeError(f"The model declined to plan the query ({category}).")
-
-        if response.stop_reason == "max_tokens":
-            raise RuntimeError("The agent's answer was cut off at max_tokens.")
+        try:
+            with client.messages.stream(
+                model=AGENT_MODEL,
+                max_tokens=AGENT_MAX_TOKENS,
+                system=system,
+                messages=messages,
+                output_config={
+                    "effort": AGENT_FIRST_EFFORT if attempt == 1 else AGENT_RETRY_EFFORT
+                },
+            ) as stream:
+                response = stream.get_final_message()
+        except anthropic.AnthropicError as error:
+            raise AgentRequestError(str(error), tuple(attempts)) from error
 
         text = "".join(
             block.text for block in response.content
             if isinstance(block, anthropic.types.TextBlock)
         )
+        if response.stop_reason == "refusal":
+            attempts.append(AgentAttempt(text, ()))
+            category = response.stop_details.category if response.stop_details else None
+            raise AgentResponseError(
+                f"The model declined to plan the query ({category}).", tuple(attempts)
+            )
+
+        if response.stop_reason == "max_tokens":
+            attempts.append(AgentAttempt(text, ()))
+            raise AgentResponseError(
+                "The agent's answer was cut off at max_tokens.", tuple(attempts)
+            )
         try:
             answer = validate_agent_plan(text)
             plan = answer.to_plan_node()
@@ -1553,8 +1603,10 @@ def ask_agent(
         except AgentPlanError as error:
             errors = error.errors
 
+        attempts.append(AgentAttempt(text, tuple(errors)))
+
         if not errors:
-            return AgentResult(plan, answer.summary, query, text, problems)
+            return AgentResult(plan, answer.summary, query, text, problems, tuple(attempts))
 
         problems.append(errors)
         listed = "\n".join(f"- {error}" for error in errors)
@@ -1569,7 +1621,7 @@ def ask_agent(
             {"role": "user", "content": retry},
         ]
 
-    raise AgentPlanError(errors, text)
+    raise AgentPlanError(errors, text, tuple(attempts))
 
 
 def _agent_database_errors(
