@@ -17,6 +17,13 @@ record is loaded. The main sections are:
 Credentials are never fields in the schema. A dirty Git flag makes clear that the
 commit alone does not identify every local code change.
 
+By default, each run uses its UTC start time as its identifier and filename, for
+example `agent_runs/report-workload/2026-11-14_15-20-30.123456Z.json`.
+Microseconds reduce collisions; if a timestamp already exists, a numeric suffix such
+as `-2` is added without overwriting the earlier file. Callers may supply an explicit
+run identifier instead; duplicates of explicit identifiers raise an error. Existing records
+with older identifiers remain loadable.
+
 ## Advisory analyst boundary
 
 When enabled, one fresh Haiku conversation receives every realization gap for the run.

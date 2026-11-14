@@ -1045,6 +1045,12 @@ def test_small_multi_query_repeated_sample_experiment_end_to_end(
     summary = aggregate_runs(loaded)
 
     assert len(runs) == len(loaded) == 4
+    for run in loaded:
+        timestamp = run.identity.created_at.strftime("%Y-%m-%d_%H-%M-%S.%fZ")
+        assert run.identity.run_id == timestamp or (
+            run.identity.run_id.startswith(timestamp + "-")
+            and run.identity.run_id[len(timestamp) + 1:].isdigit()
+        )
     assert {(run.identity.query_name, run.identity.sample) for run in loaded} == {
         ("Q1", 1), ("Q1", 2), ("Q2", 1), ("Q2", 2)
     }

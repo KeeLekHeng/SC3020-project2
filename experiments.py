@@ -13,7 +13,6 @@ import subprocess
 import tempfile
 from statistics import fmean, median
 from typing import Callable, Literal
-from uuid import uuid4
 
 import anthropic
 import psycopg
@@ -752,12 +751,13 @@ def collect_run(
 ) -> RunRecord:
     """Execute one query sample, persist all available evidence, and return its run."""
 
+    created_at = datetime.now(UTC)
     identity = RunIdentity(
         experiment_id=experiment_id,
-        run_id=run_id or uuid4().hex,
+        run_id=run_id or created_at.strftime("%Y-%m-%d_%H-%M-%S.%fZ"),
         query_name=query_name,
         sample=sample,
-        created_at=datetime.now(UTC),
+        created_at=created_at,
     )
     provenance = capture_git_provenance(repository)
     planner = planner_configuration()
@@ -805,7 +805,20 @@ def collect_run(
         reason: str | None = None,
     ) -> RunRecord:
         run = make_record(status, stage, reason)
-        write_run(run, output_root)
+        collision = 1
+        while True:
+            try:
+                write_run(run, output_root)
+                break
+            except FileExistsError:
+                if run_id is not None:
+                    raise
+                collision += 1
+                run = run.model_copy(update={
+                    "identity": identity.model_copy(update={
+                        "run_id": f"{identity.run_id}-{collision}"
+                    })
+                })
         return run
 
     try:
