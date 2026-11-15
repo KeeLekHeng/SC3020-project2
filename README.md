@@ -29,7 +29,13 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
 py prepare_data.py
 ```
 
-Enter your PostgreSQL password when prompted. The script requires exactly eight `.tbl` files in the project folder and its subfolders. It strips each row's trailing `|` and writes headerless CSV files to `data_clean/`, overwriting old ones. It then runs `schema.sql`, loads the tables in foreign key order and runs `ANALYZE`, using the connection settings in `project.py`.
+Enter your PostgreSQL password when prompted, or set `PGPASSWORD` to skip the prompt. The script reads every `.tbl` and `.csv` file in `data/` and loads each into the table with the file's name. It strips each `.tbl` row's trailing `|` and writes headerless CSV files to `data_clean/`, overwriting old ones. It then runs `schema.sql`, stops if a table has no file or a file has no table, loads the tables in foreign key order and runs `ANALYZE`, using the connection settings in `project.py`.
+
+To load another schema, name its DDL file, data folder and database; a `.csv` file must have no header row:
+
+```powershell
+py prepare_data.py --schema library.sql --data library_data --database library
+```
 
 The load is one transaction, so a failure leaves no tables behind. If the tables already exist, the script stops; drop them or recreate the database first.
 
@@ -149,7 +155,7 @@ Tests that need the database are skipped when it is unavailable. Apart from the 
 | File | Purpose |
 | --- | --- |
 | `data/*.tbl` | Source TPC-H table data. |
-| `prepare_data.py` | Converts the source data to CSV files in `data_clean/` and loads the database. |
+| `prepare_data.py` | Loads a schema and its data into a database: TPC-H from `schema.sql` and `data/` by default, or another schema given `--schema`, `--data` and `--database`. `.tbl` files are converted to CSV in `data_clean/` first. |
 | `schema.sql` | Creates the eight database tables. |
 | `queries/` | The experiment workload, one query per `.sql` file; the file name is the query name. `Q1`–`Q22` are TPC-H; `H1`–`H3` are handwritten, each with a comment on what it exercises. |
 | `project.py` | The entry point. With no arguments it opens the GUI; `--experiments` prompts for the password, runs the workload, stores one JSON record per query, and summarises the metrics. It also holds the record format and the advisory Haiku analyst. |
