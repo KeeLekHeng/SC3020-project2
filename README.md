@@ -1,16 +1,15 @@
 # SC3020-project2
 
-Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For each query, `project.py --experiments` gets PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, compares the plans, times them, and saves the run. It prints the comparison metrics for each query and counts across the workload. The data is TPC-H. `project.py` with no arguments opens a GUI that shows the same for one query.
+Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For each query, `project.py --experiments` gets PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, compares the plans, times them, and saves the run. It prints the comparison metrics for each query and counts across the workload. The data is TPC-H by default, and other schemas can be loaded. `project.py` with no arguments opens a GUI that shows the same for one query.
 
 ## Requirements
 
 - Python 3. The commands below use the Windows `py` launcher; on macOS or Linux, use `python3` in its place.
 - A running PostgreSQL server and a database named `tpch`. The `Dockerfile` provides PostgreSQL 16 with `pg_hint_plan`:
 
-  ```bash
+  ```powershell
   docker build -t pg-tpch .
-  docker run -d --name tpch -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=tpch \
-    -p 127.0.0.1:5432:5432 -v tpch-db:/var/lib/postgresql/data pg-tpch
+  docker run -d --name tpch -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=tpch -p 127.0.0.1:5432:5432 -v tpch-db:/var/lib/postgresql/data pg-tpch
   ```
 - The packages in `requirements.txt`: Psycopg 3, Pydantic, sqlglot, the Anthropic SDK and Streamlit:
 
@@ -23,21 +22,28 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
 
 ## Load the database
 
-`data/` holds the eight TPC-H `.tbl` files, generated at scale factor 0.1 (about 100 MB; `lineitem` has 600,572 rows). TPC-H Q1–Q22 in `queries/` are `qgen -d -s 0.1` output: the default parameters, with intervals and Q15's view rewritten for PostgreSQL. The Docker command above creates the empty `tpch` database; without Docker, create it yourself. Then from the project root run:
+`data/` holds the eight TPC-H `.tbl` files, committed in this repository and generated at scale factor 0.1 (about 100 MB; `lineitem` has 600,572 rows). TPC-H Q1–Q22 in `queries/` are `qgen -d -s 0.1` output: the default parameters, with intervals and Q15's view rewritten for PostgreSQL. The Docker command above creates the empty `tpch` database; without Docker, create it yourself. Then from the project root run:
 
 ```powershell
-py prepare_data.py
+py project.py --load-data
 ```
 
-Enter your PostgreSQL password when prompted, or set `PGPASSWORD` to skip the prompt. The script reads every `.tbl` and `.csv` file in `data/` and loads each into the table with the file's name. It strips each `.tbl` row's trailing `|` and writes headerless CSV files to `data_clean/`, overwriting old ones. It then runs `schema.sql`, stops if a table has no file or a file has no table, loads the tables in foreign key order and runs `ANALYZE`, using the connection settings in `project.py`.
+Enter your PostgreSQL password when prompted, or set `PGPASSWORD` to skip the prompt. The loader reads every `.tbl` and `.csv` file in `data/` and loads each into the table with the file's name. It strips each `.tbl` row's trailing `|` and writes headerless CSV files to `data_clean/`, overwriting old ones. It then runs `schema.sql`, stops if a table has no file or a file has no table, loads the tables in foreign key order and runs `ANALYZE`, using the [connection settings](#run-the-experiment-workload) in `project.py`. It prints each table's row count and ends with `Database ready.`
 
-To load another schema, name its DDL file, data folder and database; a `.csv` file must have no header row:
+The load is one transaction, so a failure leaves no tables behind. If the tables already exist, the load stops; drop them or recreate the database first.
+
+### Use another schema
+
+Load it into an existing, empty database by naming its DDL file, data folder and database. Paths are relative to where you run the command, and each option defaults to its TPC-H value:
 
 ```powershell
-py prepare_data.py --schema library.sql --data library_data --database library
+py project.py --load-data --schema library.sql --data library_data --database library
 ```
 
-The load is one transaction, so a failure leaves no tables behind. If the tables already exist, the script stops; drop them or recreate the database first.
+- **DDL:** `CREATE TABLE` statements in the default schema. Primary keys, foreign keys and `CREATE INDEX` statements may be included. Tables load in the order their foreign keys require.
+- **Data:** one file per table in the data folder, named after the table in lowercase, such as `loan.csv`. A `.csv` file is comma-separated with `"` quoting and no header row, its columns in the table's order, and an empty unquoted field loads as NULL. A `.tbl` file is pipe-separated with a trailing `|`, as TPC-H's `dbgen` writes it; an empty field loads as NULL, and a field cannot contain `|`.
+
+To query it, open the GUI and set **Database** under **Database connection** to that database, then type your queries; the examples in `queries/` are TPC-H. `--experiments` also takes `--database`, but it runs the TPC-H queries in `queries/`, so it runs on TPC-H only.
 
 ## Run the GUI
 
@@ -147,6 +153,7 @@ py -m pytest
 | `tests/test_metrics.py` | The four comparison metrics, parallelism left out of them, and how `force_plan()` chooses between its tries. | Nothing. |
 | `tests/test_experiments.py` | Run storage in JSON Lines, each stage of collecting a run, the per-query summary and the advisory analyst, with fake clients. | Nothing. |
 | `tests/test_project.py` | The `--experiments` command line and the timing helper. | The database for two timing tests. |
+| `tests/test_loading.py` | `--load-data` on a small two-table schema in a throwaway `load_data_test` database: foreign key load order, NULLs, and a mismatched data folder leaving no tables. | The database, and a user that can create databases. |
 
 Tests that need the database are skipped when it is unavailable. Apart from the two timing tests, which run small queries with `EXPLAIN ANALYZE`, all use `EXPLAIN` only.
 
@@ -155,12 +162,11 @@ Tests that need the database are skipped when it is unavailable. Apart from the 
 | File | Purpose |
 | --- | --- |
 | `data/*.tbl` | Source TPC-H table data. |
-| `prepare_data.py` | Loads a schema and its data into a database: TPC-H from `schema.sql` and `data/` by default, or another schema given `--schema`, `--data` and `--database`. `.tbl` files are converted to CSV in `data_clean/` first. |
 | `schema.sql` | Creates the eight database tables. |
 | `queries/` | The experiment workload, one query per `.sql` file; the file name is the query name. `Q1`–`Q22` are TPC-H; `H1`–`H3` are handwritten, each with a comment on what it exercises. |
-| `project.py` | The entry point. With no arguments it opens the GUI; `--experiments` prompts for the password, runs the workload, stores one JSON record per query, and summarises the metrics. It also holds the record format and the advisory Haiku analyst. |
+| `project.py` | The entry point. With no arguments it opens the GUI; `--load-data` loads a schema and its data, TPC-H from `schema.sql` and `data/` by default; `--experiments` prompts for the password, runs the workload, stores one JSON record per query, and summarises the metrics. It also holds the record format and the advisory Haiku analyst. |
 | `interface.py` | The Streamlit GUI: runs or loads one query and draws its three plans with Graphviz. |
-| `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. |
+| `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. `load_database()` creates a schema's tables and loads their data, converting `.tbl` files to CSV in `data_clean/` first. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
 | `docs/plan-forcing.md` | The hints that force a plan, how a forced plan is checked, how well forcing works, and what cannot be forced. |
 | `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |

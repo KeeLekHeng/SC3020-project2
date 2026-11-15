@@ -24,17 +24,24 @@ The AI agent's side:
   validate_agent_plan() checks an answer, and every problem goes back to the agent in a
   retry message.
 - describe_database() reads the schema, statistics and indexes the agent plans with.
+
+load_database() creates a schema's tables and loads their data, which python project.py
+--load-data runs before any query can be planned.
 """
 
+import csv
+from graphlib import TopologicalSorter
 import json
 import os
 import re
+import shutil
 import textwrap
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, NamedTuple
 
 import anthropic
 import psycopg
+from psycopg import sql
 import sqlglot
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from pydantic.json_schema import GenerateJsonSchema
@@ -938,6 +945,98 @@ def _hint_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Loading a schema and its data
+# ---------------------------------------------------------------------------
+
+# shortcut: sees only tables the DDL creates in the current schema; widen if a DDL ever
+# creates its tables in another schema.
+TABLES_QUERY = "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()"
+
+
+def load_database(
+    connection: psycopg.Connection, schema: Path, data: Path, converted: Path
+) -> None:
+    """
+    Run the DDL in schema, then load each table from the file in data named after it.
+
+    A .tbl file (pipe-separated, each line ending in |) is first converted to CSV in
+    converted; a headerless .csv file is loaded as it is. Everything runs in the
+    connection's open transaction, so the caller's rollback leaves no tables behind.
+    Raises ValueError when the tables and the data files do not match.
+    """
+    sources = sorted(path for path in data.iterdir() if path.suffix in (".tbl", ".csv"))
+    files = {source.stem: source for source in sources}
+    if len(files) != len(sources):
+        raise ValueError(
+            f"{data} has both a .tbl and a .csv file for the same table. "
+            "Keep one data file per table."
+        )
+
+    converted.mkdir(exist_ok=True)
+    for source in sources:
+        if source.suffix == ".csv":
+            continue
+        row_count = 0
+        with source.open(encoding="utf-8") as input_file, (
+            converted / f"{source.stem}.csv"
+        ).open("w", newline="", encoding="utf-8") as output_file:
+            writer = csv.writer(output_file)
+            for line in input_file:
+                row = line.rstrip("\r\n")
+                if not row.endswith("|"):
+                    raise ValueError(f"Missing final delimiter in {source.name}")
+                writer.writerow(row[:-1].split("|"))
+                row_count += 1
+        print(f"{source.name}: converted {row_count:,} rows")
+
+    with connection.cursor() as cursor:
+        # Tables already in the database are not this schema's to load.
+        existing = set(cursor.execute(TABLES_QUERY))
+        # Bytes, because psycopg types accept str only as literal SQL text.
+        cursor.execute(schema.read_bytes())
+        tables = {name for (name,) in set(cursor.execute(TABLES_QUERY)) - existing}
+
+        if tables != files.keys():
+            no_file = ", ".join(sorted(tables - files.keys())) or "none"
+            no_table = ", ".join(files[t].name for t in sorted(files.keys() - tables)) or "none"
+            raise ValueError(
+                f"{schema.name} and the data files in {data} do not match. "
+                f"Tables with no data file: {no_file}. Data files with no table: {no_table}."
+            )
+
+        # The schema's foreign keys require parent tables to be loaded first.
+        # A self-reference is left out: one COPY loads the table in any order.
+        load_order = TopologicalSorter(dict.fromkeys(sorted(tables), ()))
+        cursor.execute(
+            """
+            SELECT child.relname, parent.relname
+            FROM pg_constraint
+            JOIN pg_class child ON child.oid = conrelid
+            JOIN pg_class parent ON parent.oid = confrelid
+            WHERE contype = 'f' AND conrelid <> confrelid
+              AND connamespace = current_schema()::regnamespace
+              AND parent.relnamespace = connamespace
+              AND child.relname = ANY(%(tables)s)
+              AND parent.relname = ANY(%(tables)s)
+            """,
+            {"tables": list(tables)},
+        )
+        for child, parent in cursor:
+            load_order.add(child, parent)
+
+        for table in load_order.static_order():
+            source = files[table]
+            csv_path = source if source.suffix == ".csv" else converted / f"{table}.csv"
+            with csv_path.open(encoding="utf-8") as rows, cursor.copy(
+                sql.SQL("COPY {} FROM STDIN (FORMAT csv)").format(sql.Identifier(table))
+            ) as copy:
+                shutil.copyfileobj(rows, copy, 1 << 20)
+            print(f"{table}: loaded {cursor.rowcount:,} rows")
+
+        cursor.execute("ANALYZE")
+
+
+# ---------------------------------------------------------------------------
 # The AI agent's plan
 # ---------------------------------------------------------------------------
 
@@ -972,9 +1071,9 @@ INDEXED = ("Index Scan", "Index Only Scan", "Bitmap Heap Scan")
 # Number of inputs, as (min, max), each agent operator takes; max None means no limit.
 # Subqueries marked InitPlan or SubPlan are not inputs, so they are not counted.
 AGENT_INPUT_COUNTS: dict[str, tuple[int, int | None]] = {
-    **{t: (0, 0) for t in SCAN_HINTS},
-    **{t: (2, 2) for t in JOIN_HINTS},
-    **{t: (1, 1) for t in GATHER},
+    **dict.fromkeys(SCAN_HINTS, (0, 0)),
+    **dict.fromkeys(JOIN_HINTS, (2, 2)),
+    **dict.fromkeys(GATHER, (1, 1)),
     "Hash": (1, 1), "Sort": (1, 1), "Aggregate": (1, 1), "Limit": (1, 1),
     "Materialize": (1, 1), "Unique": (1, 1), "Subquery Scan": (1, 1),
     "WindowAgg": (1, 1), "CTE Scan": (0, 0), "Append": (1, None), "SetOp": (1, None),
@@ -992,8 +1091,8 @@ AGENT_FIELD_OWNERS: dict[str, tuple[str, ...]] = {
     "workers_planned": GATHER,
 }
 AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
-    **{t: ("relation", "alias") for t in SCAN_HINTS},
-    **{t: ("join_type",) for t in JOIN_HINTS},
+    **dict.fromkeys(SCAN_HINTS, ("relation", "alias")),
+    **dict.fromkeys(JOIN_HINTS, ("join_type",)),
     "CTE Scan": ("cte_name", "alias"),
     "Subquery Scan": ("alias",),
     "Aggregate": ("strategy",),
@@ -1679,21 +1778,20 @@ def _check_agent_node(
     node_type = node.node_type
     inputs = [c for c in children[node.id] if c.parent_relationship not in SEPARATE_PLANS]
 
-    if node_type in AGENT_INPUT_COUNTS:
-        low, high = AGENT_INPUT_COUNTS[node_type]
-        if len(inputs) < low or (high is not None and len(inputs) > high):
-            wanted = (
-                str(low) if low == high
-                else f"at least {low}" if high is None
-                else f"{low} to {high}"
+    low, high = AGENT_INPUT_COUNTS[node_type]
+    if len(inputs) < low or (high is not None and len(inputs) > high):
+        wanted = (
+            str(low) if low == high
+            else f"at least {low}" if high is None
+            else f"{low} to {high}"
+        )
+        message = f"{path}: a {node_type} takes {wanted} input(s), but has {len(inputs)}."
+        if high is not None and len(inputs) > high:
+            message += (
+                ' If a child is a subquery, mark it with parent_relationship "SubPlan" '
+                'or "InitPlan"; it is not an input.'
             )
-            message = f"{path}: a {node_type} takes {wanted} input(s), but has {len(inputs)}."
-            if high is not None and len(inputs) > high:
-                message += (
-                    ' If a child is a subquery, mark it with parent_relationship "SubPlan" '
-                    'or "InitPlan"; it is not an input.'
-                )
-            errors.append(message)
+        errors.append(message)
 
     for field in AGENT_REQUIRED_FIELDS.get(node_type, ()):
         if not getattr(node, field):

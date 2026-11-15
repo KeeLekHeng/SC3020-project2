@@ -21,7 +21,7 @@ from sqlglot.errors import SqlglotError
 import streamlit as st
 
 from comparison import Choice, Decision, MetricScore, MetricStatus, PlanEvaluation, decisions
-from preprocessing import PlanNode, api_key
+from preprocessing import SEPARATE_PLANS, PlanNode, api_key
 from project import (
     AGENT_RUNS,
     CONNECTION_SETTINGS,
@@ -183,7 +183,7 @@ def plans_dot(trees: Sequence[tuple[str, PlanNode | None, dict[int, Mark]]]) -> 
             child_name = add(child, marks)
             edge = (
                 f" [style=dashed, label={json.dumps(child.subplan_name or '', ensure_ascii=False)}]"
-                if child.parent_relationship in ("InitPlan", "SubPlan")
+                if child.parent_relationship in SEPARATE_PLANS
                 else ""
             )
             lines.append(f"{name} -> {child_name}{edge}")

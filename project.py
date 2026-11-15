@@ -1,5 +1,6 @@
 """
 Entry point. python project.py opens the GUI in interface.py; python project.py
+--load-data loads a schema and its data, TPC-H by default; python project.py
 --experiments runs every query in queries/ and saves the runs to
 agent_runs/<experiment>.jsonl. Run records, their summary and the advisory analyst live
 here too.
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from getpass import getpass
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -45,6 +47,7 @@ from preprocessing import (
     ask_agent,
     describe_database,
     get_postgres_plan,
+    load_database,
     unique_aliases,
 )
 
@@ -618,10 +621,29 @@ def load_queries() -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--experiments",
         action="store_true",
         help="run every query in queries/ and save the runs to agent_runs/<start time>.jsonl",
+    )
+    mode.add_argument(
+        "--load-data",
+        action="store_true",
+        help="create the tables in --schema and load the files in --data into --database",
+    )
+    parser.add_argument(
+        "--schema", type=Path, default=PROJECT_FOLDER / "schema.sql",
+        help="with --load-data: DDL file to run (default: schema.sql)",
+    )
+    parser.add_argument(
+        "--data", type=Path, default=PROJECT_FOLDER / "data",
+        help="with --load-data: folder with one .tbl or headerless .csv file per table, "
+        "named after its table (default: data/)",
+    )
+    parser.add_argument(
+        "--database", default=CONNECTION_SETTINGS["dbname"],
+        help="database to connect to (default: %(default)s)",
     )
     parser.add_argument(
         "-q",
@@ -633,6 +655,25 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.queries and not args.experiments:
         parser.error("-q/--queries needs --experiments")
+    if args.load_data:
+        password = os.environ.get("PGPASSWORD") or getpass("PostgreSQL password: ")
+        try:
+            # One transaction: a failed load leaves no tables behind.
+            with psycopg.connect(
+                **CONNECTION_SETTINGS | {"dbname": args.database}, password=password
+            ) as connection:
+                load_database(connection, args.schema, args.data, PROJECT_FOLDER / "data_clean")
+        except ValueError as error:
+            sys.exit(str(error))
+        except psycopg.errors.DuplicateTable:
+            sys.exit(
+                f"The tables in {args.schema.name} already exist. Drop them, or recreate "
+                f"the {args.database} database, then run this again."
+            )
+        except psycopg.OperationalError as error:
+            sys.exit(f"Could not connect to PostgreSQL: {error}")
+        print("Database ready.")
+        return
     if not args.experiments:
         # Streamlit apps run only under its own runner, not as an imported module. Bound
         # to this machine: the GUI spends the API key and can delete runs.
@@ -658,7 +699,9 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     password = getpass("PostgreSQL password: ")
-    with psycopg.connect(**CONNECTION_SETTINGS, password=password) as connection:
+    with psycopg.connect(
+        **CONNECTION_SETTINGS | {"dbname": args.database}, password=password
+    ) as connection:
         connection.read_only = True
         print("Connected to PostgreSQL!")
         run_experiments(connection, queries)
