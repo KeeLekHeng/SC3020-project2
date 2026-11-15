@@ -162,6 +162,9 @@ class PlanEvaluation:
     # how many the realized plan kept.
     intended: MetricScore
     forcing: ForcePlanResult | ForcingFailure
+    # The decisions intended counts: A's force-eligible requests that differ from P,
+    # including a named index P's plan does not use, which proposed leaves out.
+    disagreements: tuple[Decision, ...] = ()
 
 
 
@@ -335,7 +338,7 @@ def evaluate_plans(
             "The agent chose like PostgreSQL on every force-eligible decision.",
         )
 
-    return PlanEvaluation(proposed, result, realized, intended, outcome)
+    return PlanEvaluation(proposed, result, realized, intended, outcome, tuple(disagreements))
 
 
 def differences(a: PlanNode, b: PlanNode) -> list[Difference]:

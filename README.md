@@ -1,6 +1,6 @@
 # SC3020-project2
 
-Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For each query, `project.py --experiments` gets PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, compares the plans, times them, and saves the run. It prints the comparison metrics for each query and counts across the workload. The data is TPC-H. The GUI is separate work.
+Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For each query, `project.py --experiments` gets PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, compares the plans, times them, and saves the run. It prints the comparison metrics for each query and counts across the workload. The data is TPC-H. `project.py` with no arguments opens a GUI that shows the same for one query.
 
 ## Requirements
 
@@ -12,7 +12,7 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
   docker run -d --name tpch -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=tpch \
     -p 127.0.0.1:5432:5432 -v tpch-db:/var/lib/postgresql/data pg-tpch
   ```
-- The packages in `requirements.txt`: Psycopg 3, Pydantic, sqlglot and the Anthropic SDK:
+- The packages in `requirements.txt`: Psycopg 3, Pydantic, sqlglot, the Anthropic SDK and Streamlit:
 
   ```powershell
   py -m pip install -r requirements.txt
@@ -32,6 +32,18 @@ py prepare_data.py
 Enter your PostgreSQL password when prompted. The script requires exactly eight `.tbl` files in the project folder and its subfolders. It strips each row's trailing `|` and writes headerless CSV files to `data_clean/`, overwriting old ones. It then runs `schema.sql`, loads the tables in foreign key order and runs `ANALYZE`, using the connection settings in `project.py`.
 
 The load is one transaction, so a failure leaves no tables behind. If the tables already exist, the script stops; drop them or recreate the database first.
+
+## Run the GUI
+
+```powershell
+py project.py
+```
+
+This opens the Streamlit GUI in your browser. Under **Database connection**, check the host, port, database and user (they default to the settings below), enter the password, and optionally press **Test connection**: it reports the PostgreSQL version and whether `pg_hint_plan` loads. Then type a query or pick one from `queries/` and press Execute. The query goes through the same steps as one query of the workload, and the run is appended to `agent_runs/<UTC time of the session's first run>.jsonl`. A query PostgreSQL cannot plan, such as one with a typo, shows its error and is not saved. This needs the Anthropic API key.
+
+The sidebar has New query, which opens that form, and lists every run in `agent_runs/`, newest first, each labelled with its query, its time and the start time of the experiment it belongs to. Click a run to see its results; a new run opens when it finishes. A failed run's label starts with ✗, and **Delete run** on a run's page removes it from its file for good. Viewing a saved run needs neither the database nor the key.
+
+The results panel shows the query's SQL, with a collapsed rewritten version below it when the plans were made from a version with unique aliases, then the four metrics, the timings and parallel flags, and PostgreSQL's plan (P), the agent's plan (A) and the realized plan (R) as three trees. Each decision that differs gets a number, shown on every node that holds it and in the table below, so the same number pairs the nodes being compared. A filled node in the agent's or realized plan made that decision differently from PostgreSQL's plan, which is outlined instead; a dashed border marks a decision no other plan makes; a red border and "not kept by R" mark a request the realized plan did not keep. Hovering a node shows its decisions in all three plans. Each metric's help icon defines it. A table lists every decision that differs, and expanders show the hints and the analyst's advice.
 
 ## Run the experiment workload
 
@@ -141,7 +153,8 @@ Tests that need the database are skipped when it is unavailable. Apart from the 
 | `prepare_data.py` | Converts the source data to CSV files in `data_clean/` and loads the database. |
 | `schema.sql` | Creates the eight database tables. |
 | `queries/` | The experiment workload, one query per `.sql` file; the file name is the query name. `Q1`–`Q22` are TPC-H; `H1`–`H3` are handwritten, each with a comment on what it exercises. |
-| `project.py` | The entry point. `--experiments` prompts for the password, runs the workload, stores one JSON record per query, and summarises the metrics. It also holds the record format and the advisory Haiku analyst. |
+| `project.py` | The entry point. With no arguments it opens the GUI; `--experiments` prompts for the password, runs the workload, stores one JSON record per query, and summarises the metrics. It also holds the record format and the advisory Haiku analyst. |
+| `interface.py` | The Streamlit GUI: runs or loads one query and draws its three plans with Graphviz. |
 | `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
 | `docs/plan-forcing.md` | The hints that force a plan, how a forced plan is checked, how well forcing works, and what cannot be forced. |

@@ -95,8 +95,12 @@ def run_main(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list[str]:
     monkeypatch.setattr(project, "getpass", lambda *_args: "password")
     monkeypatch.setattr(project.psycopg, "connect", lambda **_kwargs: FakeConnection())
     monkeypatch.setattr(project, "api_key", lambda: "test-key")
+    saved: list[str] = []
     monkeypatch.setattr(project, "collect_run", collect_run)
+    monkeypatch.setattr(project, "write_run", lambda run, _experiment: saved.append(run.query_name))
     project.main(argv)
+    # Every run is saved, each as soon as it is collected.
+    assert saved == ran
     return ran
 
 

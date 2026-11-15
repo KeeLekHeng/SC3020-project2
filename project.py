@@ -1,7 +1,8 @@
 """
-Entry point. python project.py --experiments runs every query in queries/ and saves the
-runs to agent_runs/<experiment>.jsonl. Run records, their summary and the advisory
-analyst live here too.
+Entry point. python project.py opens the GUI in interface.py; python project.py
+--experiments runs every query in queries/ and saves the runs to
+agent_runs/<experiment>.jsonl. Run records, their summary and the advisory analyst live
+here too.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import subprocess
+import sys
 from statistics import fmean
 from typing import Any, Literal, NamedTuple, get_args
 
@@ -61,6 +63,9 @@ CONNECTION_SETTINGS: dict[str, Any] = {
 ANALYST_MODEL = AGENT_MODEL
 ANALYST_MAX_TOKENS = 4_096
 TIMING_RUNS = 3
+TIMING_TIMEOUT_MS = 60_000
+# An experiment's file name: the UTC time it started.
+EXPERIMENT_ID_FORMAT = "%Y-%m-%d_%H-%M-%SZ"
 AGENT_RUNS = PROJECT_FOLDER / "agent_runs"
 
 
@@ -279,6 +284,25 @@ def load_experiment(experiment_id: str, root: Path = AGENT_RUNS) -> list[RunReco
     return [RunRecord.model_validate_json(line) for line in lines]
 
 
+def delete_run(experiment_id: str, run: RunRecord, root: Path = AGENT_RUNS) -> None:
+    """
+    Remove run from the experiment's file, and the file once no run is left. The run is
+    found by its creation time, not its position, so a page opened before another run
+    was deleted still removes its own run.
+    """
+
+    path = root / f"{experiment_id}.jsonl"
+    lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if RunRecord.model_validate_json(line).created_at != run.created_at
+    ]
+    if lines:
+        path.write_text("".join(lines), encoding="utf-8")
+    else:
+        path.unlink()
+
+
 def evaluation_from_run(run: RunRecord) -> PlanEvaluation | None:
     """
     Recompute the metrics from the stored plans, or None if the run stopped before the
@@ -338,50 +362,53 @@ class QuerySummary(NamedTuple):
     timed_out: bool
 
 
+def summarise_run(run: RunRecord) -> QuerySummary:
+    """A run's row in the workload summary, recomputed from its stored plans."""
+
+    evaluation = evaluation_from_run(run)
+    return QuerySummary(
+        failure_stage=run.failure_stage,
+        answers=(
+            len(run.agent_attempts)
+            if run.agent_attempts and run.failure_stage != "agent_request"
+            else None
+        ),
+        scores={} if evaluation is None else {
+            "proposed_difference": evaluation.proposed.difference,
+            "realizability": evaluation.realizability.score,
+            "realized_difference": evaluation.realized.difference,
+            "intended_realization": evaluation.intended,
+        },
+        parallel=ParallelFlags(*(
+            None if plan is None else is_parallel(plan)
+            for plan in (
+                run.postgres_plan,
+                run.agent_plan,
+                run.forcing.realized_plan if run.forcing else None,
+            )
+        )),
+        time_ratio=(
+            run.realized_ms / run.postgres_ms
+            if run.postgres_ms and run.realized_ms is not None
+            else None
+        ),
+        # A completed run times both plans, so a missing time means a timeout.
+        timed_out=run.failure_stage is None
+        and (run.postgres_ms is None or run.realized_ms is None),
+    )
+
+
 def summarise_workload(runs: list[RunRecord]) -> dict[str, QuerySummary]:
     """One row per query, recomputed from the stored runs."""
 
-    summary: dict[str, QuerySummary] = {}
-    for run in runs:
-        evaluation = evaluation_from_run(run)
-        summary[run.query_name] = QuerySummary(
-            failure_stage=run.failure_stage,
-            answers=(
-                len(run.agent_attempts)
-                if run.agent_attempts and run.failure_stage != "agent_request"
-                else None
-            ),
-            scores={} if evaluation is None else {
-                "proposed_difference": evaluation.proposed.difference,
-                "realizability": evaluation.realizability.score,
-                "realized_difference": evaluation.realized.difference,
-                "intended_realization": evaluation.intended,
-            },
-            parallel=ParallelFlags(*(
-                None if plan is None else is_parallel(plan)
-                for plan in (
-                    run.postgres_plan,
-                    run.agent_plan,
-                    run.forcing.realized_plan if run.forcing else None,
-                )
-            )),
-            time_ratio=(
-                run.realized_ms / run.postgres_ms
-                if run.postgres_ms and run.realized_ms is not None
-                else None
-            ),
-            # A completed run times both plans, so a missing time means a timeout.
-            timed_out=run.failure_stage is None
-            and (run.postgres_ms is None or run.realized_ms is None),
-        )
-    return summary
+    return {run.query_name: summarise_run(run) for run in runs}
 
 
 def execution_time(
     connection: psycopg.Connection,
     query: str,
     hints: str = "",
-    timeout_ms: int = 60_000,
+    timeout_ms: int = TIMING_TIMEOUT_MS,
 ) -> float | None:
     """
     Mean milliseconds of TIMING_RUNS runs after one warm-up run, or None when any run
@@ -407,16 +434,15 @@ def execution_time(
 def collect_run(
     connection: psycopg.Connection,
     *,
-    experiment_id: str,
     query_name: str,
     sql: str,
-    output_root: Path = AGENT_RUNS,
     client: anthropic.Anthropic | None = None,
     analyst_client: anthropic.Anthropic | None = None,
 ) -> RunRecord:
     """
     Run the pipeline on one query: PostgreSQL's plan, the agent's plan, forcing, timing
-    and, with analyst_client, the analyst. The run is saved however far it got.
+    and, with analyst_client, the analyst. The run is returned however far it got; the
+    caller decides whether to save it with write_run().
     """
 
     try:
@@ -441,7 +467,6 @@ def collect_run(
 
     def finish(stage: FailureStage | None = None, reason: str | None = None) -> RunRecord:
         run.failure_stage, run.failure_reason = stage, reason
-        write_run(run, experiment_id, output_root)
         return run
 
     try:
@@ -497,18 +522,15 @@ def run_experiments(connection: psycopg.Connection, queries: dict[str, str]) -> 
     and the workload counts. The analyst explains any realization gaps.
     """
     client = anthropic.Anthropic(api_key=api_key())
-    experiment_id = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%SZ")
-    runs = [
-        collect_run(
-            connection,
-            experiment_id=experiment_id,
-            query_name=query_name,
-            sql=sql,
-            client=client,
-            analyst_client=client,
+    experiment_id = datetime.now(UTC).strftime(EXPERIMENT_ID_FORMAT)
+    runs = []
+    for query_name, sql in queries.items():
+        run = collect_run(
+            connection, query_name=query_name, sql=sql, client=client, analyst_client=client
         )
-        for query_name, sql in queries.items()
-    ]
+        # Saved one by one, so a crash part-way keeps the runs before it.
+        write_run(run, experiment_id)
+        runs.append(run)
     summary = summarise_workload(runs)
 
     def fraction(score: MetricScore | None) -> str:
@@ -582,6 +604,18 @@ def run_experiments(connection: psycopg.Connection, queries: dict[str, str]) -> 
     )
 
 
+def load_queries() -> dict[str, str]:
+    """The workload in queries/, by file name, shorter names first so Q2 precedes Q10."""
+
+    return {
+        path.stem: path.read_text(encoding="utf-8").strip()
+        for path in sorted(
+            (PROJECT_FOLDER / "queries").glob("*.sql"),
+            key=lambda path: (len(path.stem), path.stem),
+        )
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -597,18 +631,23 @@ def main(argv: list[str] | None = None) -> None:
         help="run only these queries, named by their file in queries/, such as Q1 Q6",
     )
     args = parser.parse_args(argv)
+    if args.queries and not args.experiments:
+        parser.error("-q/--queries needs --experiments")
     if not args.experiments:
-        parser.print_help()
-        return
+        # Streamlit apps run only under its own runner, not as an imported module. Bound
+        # to this machine: the GUI spends the API key and can delete runs.
+        try:
+            started = subprocess.run(
+                [
+                    sys.executable, "-m", "streamlit", "run",
+                    str(PROJECT_FOLDER / "interface.py"), "--server.address", "localhost",
+                ]
+            )
+        except KeyboardInterrupt:
+            return
+        sys.exit(started.returncode)
 
-    queries = {
-        path.stem: path.read_text(encoding="utf-8").strip()
-        for path in sorted(
-            (PROJECT_FOLDER / "queries").glob("*.sql"),
-            # Shorter names first, so Q2 comes before Q10.
-            key=lambda path: (len(path.stem), path.stem),
-        )
-    }
+    queries = load_queries()
     if args.queries:
         unknown = [name for name in args.queries if name not in queries]
         if unknown:

@@ -353,3 +353,6 @@ def test_intended_rate_counts_a_named_index_postgres_did_not_request() -> None:
         evaluation.intended.denominator,
         evaluation.intended.rate,
     ) == (1, 2, 0.5)
+    # The index is one of the counted disagreements, though proposed leaves it out.
+    assert [str(decision) for decision in evaluation.disagreements] == ["scan(o)", "index(o)"]
+    assert [str(d.decision) for d in evaluation.proposed.differences] == ["scan(o)"]

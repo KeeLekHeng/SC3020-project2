@@ -29,6 +29,7 @@ from project import (
     RunRecord,
     build_analyst_request,
     collect_run,
+    delete_run,
     evaluation_from_run,
     load_experiment,
     run_analyst,
@@ -131,6 +132,23 @@ def test_runs_are_appended_to_their_experiment_file(tmp_path: Path) -> None:
     assert load_experiment("experiment", tmp_path) == runs
 
 
+def test_deleting_runs_rewrites_the_file_and_removes_it_when_empty(tmp_path: Path) -> None:
+    # Runs are told apart by creation time, which is unique to the microsecond.
+    runs = [
+        record(name).model_copy(update={"created_at": datetime(2026, 11, 15, second=i, tzinfo=UTC)})
+        for i, name in enumerate(("Q1", "Q2", "Q3"))
+    ]
+    for run in runs:
+        write_run(run, "experiment", tmp_path)
+
+    delete_run("experiment", runs[1], tmp_path)
+    assert load_experiment("experiment", tmp_path) == [runs[0], runs[2]]
+
+    delete_run("experiment", runs[2], tmp_path)
+    delete_run("experiment", runs[0], tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_evaluation_is_recomputed_from_the_stored_plans() -> None:
     evaluation = evaluation_from_run(record(agent=INDEX, realized=SEQ))
 
@@ -201,16 +219,14 @@ def collect(
 ) -> RunRecord:
     return collect_run(
         connection or FakeConnection(),  # type: ignore[arg-type]
-        experiment_id="experiment",
         query_name="Q1",
         sql="SELECT * FROM orders",
-        output_root=tmp_path,
         client=client,  # type: ignore[arg-type]
         analyst_client=analyst_client,  # type: ignore[arg-type]
     )
 
 
-def test_a_completed_run_is_saved_with_every_stage(
+def test_a_completed_run_has_every_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     arrange(monkeypatch)
@@ -226,7 +242,8 @@ def test_a_completed_run_is_saved_with_every_stage(
     )
     assert (run.postgres_ms, run.realized_ms) == (100.0, 125.0)
     assert run.analyst.status == "not_requested"
-    assert load_experiment("experiment", tmp_path) == [run]
+    # The caller saves the run; collecting it writes nothing.
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_an_unusable_agent_plan_keeps_its_answers(
@@ -353,7 +370,7 @@ def test_provenance_outside_a_git_checkout_has_no_commit(
     assert collect(tmp_path).provenance.git_commit is None
 
 
-def test_the_analyst_is_saved_inside_the_run(
+def test_the_analyst_is_kept_inside_the_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     arrange(monkeypatch)
@@ -362,7 +379,6 @@ def test_the_analyst_is_saved_inside_the_run(
 
     assert run.analyst.status == "completed"
     assert len(run.analyst.assessments) == 2
-    assert load_experiment("experiment", tmp_path) == [run]
 
 
 # Workload summary
