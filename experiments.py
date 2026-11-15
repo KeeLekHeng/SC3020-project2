@@ -64,37 +64,37 @@ AnalystStatus = Literal["not_requested", "completed", "unavailable", "invalid_re
 
 
 class RunIdentity(RecordModel):
-    experiment_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9._-]+$")
-    run_id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9._-]+$")
-    query_name: str = Field(min_length=1)
-    sample: int = Field(ge=1)
+    experiment_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
+    run_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
+    query_name: str
+    sample: int
     created_at: datetime
 
 
 class RunProvenance(RecordModel):
     schema_version: Literal[RUN_SCHEMA_VERSION] = RUN_SCHEMA_VERSION
-    git_commit: str = Field(min_length=1)
+    git_commit: str
     git_dirty: bool
 
 
 class PlannerConfiguration(RecordModel):
-    model: str = Field(min_length=1)
-    prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    max_tokens: int = Field(gt=0)
-    first_effort: str = Field(min_length=1)
-    retry_effort: str = Field(min_length=1)
-    max_attempts: int = Field(gt=0)
+    model: str
+    prompt_sha256: str
+    max_tokens: int
+    first_effort: str
+    retry_effort: str
+    max_attempts: int
 
 
 class MeasurementConfiguration(RecordModel):
-    timeout_ms: int = Field(gt=0)
-    warmup_runs: int = Field(ge=0)
-    measured_runs: int = Field(gt=0)
+    timeout_ms: int
+    warmup_runs: int
+    measured_runs: int
 
 
 class DatabaseContext(RecordModel):
-    postgres_version: str = Field(min_length=1)
-    description: str = Field(min_length=1)
+    postgres_version: str
+    description: str
     indexes: dict[str, tuple[str, ...]]
 
 
@@ -105,24 +105,10 @@ class ForcingEvidence(RecordModel):
     leading: bool | None = None
     failure_reason: str | None = None
 
-    @model_validator(mode="after")
-    def selected_or_failed(self) -> "ForcingEvidence":
-        selected = self.realized_plan is not None
-        if selected and (
-            self.hints is None
-            or self.switch_offs is None
-            or self.leading is None
-            or self.failure_reason is not None
-        ):
-            raise ValueError("A selected forcing outcome needs hints and flags but no failure.")
-        if not selected and not self.failure_reason:
-            raise ValueError("A forcing outcome without a realized plan needs a failure reason.")
-        return self
-
 
 class TimingEvidence(RecordModel):
-    postgres_ms: float | None = Field(default=None, ge=0)
-    realized_ms: float | None = Field(default=None, ge=0)
+    postgres_ms: float | None = None
+    realized_ms: float | None = None
     postgres_timed_out: bool = False
     realized_timed_out: bool = False
 
@@ -136,7 +122,7 @@ AnalystConfidence = Literal["low", "medium", "high"]
 class AnalystConfiguration(RecordModel):
     model: str = ANALYST_MODEL
     prompt_version: Literal[ANALYST_PROMPT_VERSION] = ANALYST_PROMPT_VERSION
-    max_tokens: int = Field(default=ANALYST_MAX_TOKENS, gt=0)
+    max_tokens: int = ANALYST_MAX_TOKENS
 
 
 ANALYST_CONFIGURATION = AnalystConfiguration()
@@ -165,21 +151,6 @@ class AnalystResult(RecordModel):
     configuration: AnalystConfiguration | None = None
     assessments: tuple[AnalystAssessment, ...] = ()
     reason: str | None = None
-
-    @model_validator(mode="after")
-    def status_matches_payload(self) -> "AnalystResult":
-        failed = self.status in {"unavailable", "invalid_response"}
-        if failed and not self.reason:
-            raise ValueError("An unavailable or invalid analyst result needs a reason.")
-        if self.status == "not_requested" and (
-            self.configuration is not None or self.assessments or self.reason is not None
-        ):
-            raise ValueError("A not-requested analyst result cannot contain output.")
-        if self.status != "not_requested" and self.configuration is None:
-            raise ValueError("A requested analyst result needs its configuration.")
-        if failed and self.assessments:
-            raise ValueError("A failed analyst result cannot contain assessments.")
-        return self
 
 
 def validate_analyst_response(
@@ -736,20 +707,7 @@ def collect_run(
         reason: str | None = None,
     ) -> RunRecord:
         run = make_record(status, stage, reason)
-        collision = 1
-        while True:
-            try:
-                write_run(run, output_root)
-                break
-            except FileExistsError:
-                if run_id is not None:
-                    raise
-                collision += 1
-                run = run.model_copy(update={
-                    "identity": identity.model_copy(update={
-                        "run_id": f"{identity.run_id}-{collision}"
-                    })
-                })
+        write_run(run, output_root)
         return run
 
     try:
