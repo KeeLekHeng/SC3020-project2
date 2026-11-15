@@ -105,14 +105,14 @@ def test_experiments_flag_runs_every_workload_query(
 ) -> None:
     ran = run_main(monkeypatch, ["--experiments"])
 
-    assert ran[:3] == ["Q1", "Q2", "Q3"] and len(ran) == 22
+    assert ran == ["H1", "H2", "H3", *[f"Q{i}" for i in range(1, 23)]]
     lines = capsys.readouterr().out.splitlines()
     # The stored run: an Index Scan proposed, a Seq Scan realized, one answer.
     q1 = next(line for line in lines if line.startswith("Q1 "))
     assert q1.split() == ["Q1", "completed", "1", "1/1", "0/2", "0/1", "0/2", "no/no/no", "1.00x"]
-    assert "Usable agent plans: 22/22, 22 on the first answer" in lines
-    assert "Same plan as PostgreSQL, apart from parallelism: proposed 0/22, realized 22/22" in lines
-    assert "Plans forced: 22/22" in lines
+    assert "Usable agent plans: 25/25, 25 on the first answer" in lines
+    assert "Same plan as PostgreSQL, apart from parallelism: proposed 0/25, realized 25/25" in lines
+    assert "Plans forced: 25/25" in lines
 
 
 def test_queries_flag_runs_only_the_named_queries(monkeypatch: pytest.MonkeyPatch) -> None:
