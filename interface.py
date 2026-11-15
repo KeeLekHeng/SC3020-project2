@@ -449,7 +449,8 @@ def new_run_page() -> None:
         "forces A onto PostgreSQL with pg_hint_plan hints to get the realized plan "
         "(**R**), times P and R, and asks a second model call why R missed any of A's "
         "requests. It takes up to a few minutes. The run is saved and opens in the "
-        "history on the left."
+        "history on the left. The agent's plan and the timings vary from run to run, so "
+        "repeated runs of one query can differ."
     )
     queries = load_queries()
     # Streamlit forgets a widget's value once its page is left, so the form keeps its
@@ -488,7 +489,11 @@ def new_run_page() -> None:
             **CONNECTION_SETTINGS,
             "host": host, "port": port, "dbname": dbname, "user": user, "password": password,
         }
-        if st.button("Test connection", disabled=running or not password):
+        if st.button(
+            "Test connection",
+            disabled=running or not password,
+            help=None if password else "Enter the password first.",
+        ):
             try:
                 with psycopg.connect(**settings) as connection:
                     version = connection.execute("SHOW server_version").fetchone()
@@ -603,7 +608,7 @@ def main() -> None:
             lambda run=run, experiment=experiment: show_run(run, experiment),
             title=("✗ " if run.failure_stage else "")
             + f"{run.query_name} · {run.created_at.astimezone():%m-%d %H:%M} · "
-            + f"from {started:%m-%d %H:%M}",
+            + f"session {started:%m-%d %H:%M}",
             url_path=run_page_key(run),
         )
         for experiment, started, run in history
