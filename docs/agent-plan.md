@@ -118,7 +118,7 @@ The flat list was checked as the rules above describe, so ids could skip a numbe
 
 No single number proves the choice. In the first test, with 44 conversations per format, a difference of a few answers can be chance, and that applies to the 95% against 82% and 86% as much as to the format failures. In the second, the typed union was not measurably better. The flat list was chosen because no format was measurably more reliable, it needs no API feature, and it is the simplest to handle:
 
-- **Format failures are rare.** 2 in the 242 conversations of both tests, each an invented field beside `summary` and `nodes`. The check began to ignore such a field only after these tests.
+- **Format failures are rare.** 2 in the 242 conversations of both tests, each an invented field beside `summary` and `nodes`. `validate_agent_plan()` ignores such a field, so it accepts both answers.
 - **No brackets to balance.** Each entry closes before the next begins, however deep the plan is.
 - **SQL goes in as it is.** A condition is an ordinary JSON string.
 - **Little code.** Rebuilding the tree means attaching each entry to its parent. A JSON parser and pydantic, a Python validation library, do the rest.
@@ -165,4 +165,4 @@ Where it is still uneven:
 - **The agent is a small model thinking briefly.** A larger model or more effort may plan better.
 - **Answers vary.** The same query can get a different plan on the next call.
 - **The forced plan is partly PostgreSQL's.** When a plan is forced, PostgreSQL still applies its own changes, such as the two index scans for `min()` and `max()`. A decision counts as the agent's only if it is a forced kind and `force_plan()` does not report it as a gap.
-- **Plan quality is measured only by run time.** The checks show that a plan is well formed and can be turned into hints, not that it is fast. `python project.py --experiments` times PostgreSQL's plan and the forced agent plan with `EXPLAIN ANALYZE` and reports the ratio, which mixes every difference between the two plans; [the experiments document](experiments.md#workload-summary) describes the timing.
+- **Plan quality is measured only by run time.** The checks show that a plan is well formed and can be turned into hints, not that it is fast. `py project.py --experiments` times PostgreSQL's plan and the forced agent plan with `EXPLAIN ANALYZE` and reports the ratio, which mixes every difference between the two plans; [the experiments document](experiments.md#workload-summary) describes the timing.

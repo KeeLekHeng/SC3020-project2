@@ -148,7 +148,7 @@ Realizability is an outcome metric, not a causality claim. A reproduced choice m
 
 The implementation exposes this through `realizability(agent_plan, forcing_outcome)`. Its score is the reproduced count divided by the requested force-eligible count.
 
-Realizability is measured only on plans the validator accepted. The validator rejects an answer that `build_hints()` cannot turn into hints and asks the agent again, so plans the forcing layer cannot express never reach this denominator. Report the agent's answer count next to this rate, as [Reporting a workload](#reporting-a-workload) describes.
+Realizability is measured only on plans `ask_agent()` accepted. It rejects an answer that `build_hints()` cannot turn into hints and asks the agent again, so plans the forcing layer cannot express never reach this denominator. Report the agent's answer count next to this rate, as [Reporting a workload](#reporting-a-workload) describes.
 
 ### Reasoning
 
@@ -299,7 +299,7 @@ Agent answers vary between calls, so every evaluated query keeps enough to recon
 
 A low difference rate means that two plans make similar structural choices. It does not prove that either plan is fast. Two identical plans can both perform poorly, while two structurally different plans can have similar execution times.
 
-Agreement with PostgreSQL also says nothing about which plan is better: the agent is given the same statistics PostgreSQL plans from, so both can share one wrong row estimate. Execution time is the independent measure: [experiments.md](experiments.md#workload-summary) describes how each plan is timed. Report the PostgreSQL plan's and the realized agent plan's times next to the structural metrics, especially for decisions where the agent disagreed with PostgreSQL. `EXPLAIN ANALYZE` also fills each node's actual row count, which shows where a row estimate was wrong.
+Agreement with PostgreSQL also says nothing about which plan is better: the agent is given a summary of the statistics PostgreSQL plans from, so both can share one wrong row estimate. Execution time is the independent measure: [experiments.md](experiments.md#workload-summary) describes how each plan is timed. Report the PostgreSQL plan's and the realized agent plan's times next to the structural metrics, especially for decisions where the agent disagreed with PostgreSQL. `EXPLAIN ANALYZE` also fills each node's actual row count, which shows where a row estimate was wrong.
 
 ### PostgreSQL is a baseline, not absolute ground truth
 
@@ -352,7 +352,7 @@ A realization gap does not always mean the agent proposed an invalid strategy. `
 
 The agent can choose only the operators allowed by `AgentNodeType`, not every PostgreSQL operator. This makes the comparison more forceable and easier to validate, but it constrains the agent's planning freedom.
 
-The format also requires the agent to scan every table alias named by the query exactly once. PostgreSQL is not subject to this rule. It may scan one alias more than once, such as two index scans for `min(column)` and `max(column)`, or eliminate an unused table from a `LEFT JOIN`. A direct proposed-plan difference caused by such a rewrite is partly a representation limitation rather than evidence of a poor agent decision. Affected results should be flagged and, where possible, classified as a normal planning disagreement, an agent-format limitation or a PostgreSQL query rewrite.
+The format also requires the agent to scan every table alias named by the query exactly once. PostgreSQL is not subject to this rule. It may scan one alias more than once, such as two index scans for `min(column)` and `max(column)`, or eliminate an unused table from a `LEFT JOIN`. A proposed-plan difference caused by such a rewrite is a limit of the format rather than a poor agent decision, and the metrics do not tell the two apart. When reporting one, say which it is: a planning disagreement, an agent-format limit or a PostgreSQL query rewrite.
 
 ### Both plans must refer to the same rewritten query
 
@@ -360,6 +360,6 @@ Decisions are matched through table aliases. The PostgreSQL plan, agent plan and
 
 ### Workload selection affects the result
 
-Public benchmark queries, and PostgreSQL's plans for them, may have appeared in the LLM's training data. On TPC-H, agreement with PostgreSQL can then come from recall rather than planning. Keep TPC-H and original queries in separate tables, ideally running the original ones over renamed tables and columns; markedly closer agreement on TPC-H points to recall. The final evaluation should therefore combine TPC-H queries with diverse original queries and should describe the workload, database scale, indexes, PostgreSQL settings, model and prompt configuration.
+Public benchmark queries, and PostgreSQL's plans for them, may have appeared in the LLM's training data. On TPC-H, agreement with PostgreSQL can then come from recall rather than planning. Keep TPC-H and original queries in separate tables, ideally running the original ones over renamed tables and columns; markedly closer agreement on TPC-H points to recall. The workload therefore adds the handwritten H1–H3 to TPC-H Q1–Q22. A report should describe the workload, database scale, indexes, PostgreSQL settings, model and prompt configuration.
 
 The same query may receive a different agent plan in another run, so name the experiment a reported result comes from.

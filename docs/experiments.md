@@ -1,6 +1,6 @@
 # Stored plan-metric experiments
 
-`python project.py --experiments` runs each query in `queries/` once, or those named with `-q`, and saves one JSON `RunRecord` per query as one line of `agent_runs/<UTC start time>.jsonl`, one file per experiment. A run is saved however far it got. The stored plans are the source of truth: the metrics are recomputed from them when a record is loaded, never stored. `RunRecord` in `project.py` defines the fields, all at the top level of each line:
+`py project.py --experiments` runs each query in `queries/` once, or those named with `-q`, and saves one JSON `RunRecord` per query as one line of `agent_runs/<UTC start time>.jsonl`, one file per experiment. A run is saved however far it got. The stored plans are the source of truth: the metrics are recomputed from them when a record is loaded, never stored. `RunRecord` in `project.py` defines the fields, all at the top level of each line:
 
 - the query name, start time and record format version;
 - `provenance`: the git commit (none outside a git checkout), agent model and a hash of its system prompt, so runs from different commits or prompts are not mixed;
