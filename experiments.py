@@ -47,10 +47,8 @@ from preprocessing import (
 )
 
 
-RUN_SCHEMA_VERSION = 1
 ANALYST_MODEL = AGENT_MODEL
 ANALYST_MAX_TOKENS = 4_096
-ANALYST_PROMPT_VERSION = 1
 
 
 class RecordModel(BaseModel):
@@ -72,7 +70,7 @@ class RunIdentity(RecordModel):
 
 
 class RunProvenance(RecordModel):
-    schema_version: Literal[RUN_SCHEMA_VERSION] = RUN_SCHEMA_VERSION
+    schema_version: Literal[1] = 1
     git_commit: str
     git_dirty: bool
 
@@ -121,7 +119,7 @@ AnalystConfidence = Literal["low", "medium", "high"]
 
 class AnalystConfiguration(RecordModel):
     model: str = ANALYST_MODEL
-    prompt_version: Literal[ANALYST_PROMPT_VERSION] = ANALYST_PROMPT_VERSION
+    prompt_version: Literal[1] = 1
     max_tokens: int = ANALYST_MAX_TOKENS
 
 
@@ -183,7 +181,7 @@ _NON_STRUCTURAL_PLAN_FIELDS = {
 }
 
 
-def _structural_plan(plan: PlanNode) -> dict[str, object]:
+def _structural_plan(plan: PlanNode) -> object:
     """Return plan structure without costs or measured fields distorted by hints."""
 
     def strip(value: object) -> object:
@@ -197,7 +195,7 @@ def _structural_plan(plan: PlanNode) -> dict[str, object]:
             return [strip(item) for item in value]
         return value
 
-    return strip(plan.model_dump(exclude_none=True, exclude_defaults=True))  # type: ignore[return-value]
+    return strip(plan.model_dump(exclude_none=True, exclude_defaults=True))
 
 
 def build_analyst_request(run: RunRecord) -> AnalystRequest | None:
@@ -267,7 +265,7 @@ def build_analyst_request(run: RunRecord) -> AnalystRequest | None:
     return AnalystRequest(
         system=system,
         user=json.dumps(payload, separators=(",", ":"), sort_keys=True),
-        gap_ids=tuple(row["gap_id"] for row in gap_rows),
+        gap_ids=tuple(str(gap.decision) for gap in gaps),
     )
 
 
