@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-# TPC-H Q1-Q22 with the specification's validation parameters, Q15 as a CTE, from the
-# workload project.py --experiments runs.
+# TPC-H Q1-Q22 as qgen -d -s 0.1 writes them, Q15 as a CTE, from the workload
+# project.py --experiments runs.
 TPCH = {
     path.stem: path.read_text(encoding="utf-8").strip()
     for path in sorted((Path(__file__).resolve().parents[1] / "queries").glob("Q*.sql"))

@@ -23,7 +23,7 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
 
 ## Load the database
 
-`data/` holds the eight generated TPC-H `.tbl` files. The Docker command above creates the empty `tpch` database; without Docker, create it yourself. Then from the project root run:
+`data/` holds the eight TPC-H `.tbl` files, generated at scale factor 0.1 (about 100 MB; `lineitem` has 600,572 rows). TPC-H Q1–Q22 in `queries/` are `qgen -d -s 0.1` output: the default parameters, with intervals and Q15's view rewritten for PostgreSQL. The Docker command above creates the empty `tpch` database; without Docker, create it yourself. Then from the project root run:
 
 ```powershell
 py prepare_data.py
@@ -90,7 +90,7 @@ The agent never sees PostgreSQL's plan or estimates, and its answer is not check
 4. **The checks.** `validate_agent_plan()` checks the answer, then `ask_agent()` checks it against the query and the database. [The format document](docs/agent-plan.md#how-an-answer-is-checked) lists the checks.
 5. **Retries.** All problems go back to the agent in one message, for up to three answers: the first at `low` effort, the rest at `medium`.
 
-### Results on TPC-H Q1–Q22
+### Results on TPC-H Q1–Q22 at scale factor 0.1
 
 One run on 2026-11-11 with the Docker database:
 
