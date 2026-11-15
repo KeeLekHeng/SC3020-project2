@@ -66,7 +66,7 @@ class Choice(NamedTuple):
     # - outer: the outer side's aliases, such as "o" for join(c, o)
     # - aggregate: "Plain", "Sorted", "Hashed" or "Mixed"
     # - gather: "Gather" or "Gather Merge"
-    # - other operators: their operation, strategy or sort keys, else "used"
+    # - other operators: their operation or strategy, else "used"
     value: str
     node: PlanNode
 
@@ -183,8 +183,8 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
       grouping compare by how the rows are grouped
     - gather(l): "Gather" or "Gather Merge", the operator combining parallel workers'
       rows, keyed by the tables below it, so moving it is a different decision
-    - any other operator, by its lowercased type: its operation, strategy or sort keys,
-      or "used" if it has none, such as sort(o): "o.o_orderdate"
+    - any other operator, by its lowercased type: its operation or strategy, or "used"
+      if it has neither, such as sort(o): "used"
 
     A decision present in only one plan means only that plan made the choice, for
     example a sort.
@@ -195,7 +195,11 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
       the same aliases.
     - Two operators of the same type over the same tables make one decision, so only the
       last one is kept.
-    - Not compared: worker counts, conditions, filters, costs and row estimates.
+    - Not compared: worker counts, conditions, filters, sort and group keys, costs and
+      row estimates. Sort keys follow from the query and the operator above the sort,
+      and EXPLAIN writes them in its own form: unqualified when one table is read, with
+      output aliases expanded, and without keys it found redundant. So a sort on a wrong
+      or missing key, or in the wrong direction, does not count as a difference.
     """
     found: dict[Decision, Choice] = {}
 
@@ -235,8 +239,7 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
             kind, value = "gather", node.node_type
         else:
             kind = node.node_type.lower()
-            sort_keys = ", ".join(node.sort_keys)
-            value = node.operation or node.strategy or sort_keys or "used"
+            value = node.operation or node.strategy or "used"
 
         found[Decision(kind, tables)] = Choice(value, node)
 

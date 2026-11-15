@@ -92,7 +92,7 @@ Each difference gives the decision and the two choices. A choice is missing when
 | `outer(c, o)` | `o`, the outer side | Yes |
 | `gather(c, o)` | `Gather` or `Gather Merge` | No |
 | `aggregate(c, o)` | `Hashed` | No |
-| `sort(c, o)`, `limit(c, o)` and other operators | The sort keys or the strategy, or `used` when the operator has neither | No |
+| `sort(c, o)`, `limit(c, o)` and other operators | The strategy, or `used` when the operator has none; sort keys are not compared | No |
 
 A kind that is not forced is PostgreSQL's own choice, made around the forced scans and joins. A difference there does not show what the agent wrote for that operator.
 

@@ -32,7 +32,7 @@ The metrics compare planner decisions rather than nodes at the same tree positio
 | `outer(c, o)` | `c` | Which input is on the outer side of that join. |
 | `aggregate(c, o)` | `Hashed` | The aggregation strategy over those aliases. |
 | `gather(c, o)` | `Gather` | How parallel results are collected. |
-| `sort(c, o)` | `c.c_name` | The sort operation and its keys. |
+| `sort(c, o)` | `used` | Whether the plan sorts there. The keys are not compared; see [Conditions, filters and keys](#conditions-filters-and-keys-are-not-compared). |
 
 A join is identified by the sorted set of aliases below it. This allows corresponding joins to be matched semantically even when the two plan trees have different shapes.
 
@@ -311,9 +311,18 @@ The agent plan intentionally contains choices rather than PostgreSQL-style cost 
 
 Costs from the forced plan are also unsuitable for comparison because hints and planner switch-offs alter PostgreSQL's cost calculations. Compare execution times instead, as the workload summary does.
 
-### Conditions and filters are not compared
+### Conditions, filters and keys are not compared
 
-`decisions()` does not compare join conditions, index conditions, filters or group keys in full. This avoids treating formatting differences as semantic differences, but it can miss an incorrect or incomplete expression in an agent plan.
+`decisions()` does not compare join conditions, index conditions, filters, group keys or sort keys. This avoids treating formatting differences as semantic differences, but it can miss an incorrect or incomplete expression in an agent plan.
+
+A sort counts only as present or absent over its tables. Its keys follow from the query and the operator above it: the `ORDER BY`, the `GROUP BY` or the merge condition. EXPLAIN writes them in its own form, which the agent cannot be expected to match:
+
+- unqualified when the query reads one table, as in `l_returnflag` against the agent's `lineitem.l_returnflag` in TPC-H Q1;
+- with output aliases expanded, as in `(sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))) DESC` against the agent's `revenue DESC` in Q3;
+- without `ASC`, and with `NULLS` only when it is not the default;
+- without keys it found redundant: `WHERE o_custkey = 5 ORDER BY o_custkey, o_orderdate` sorts on `o_orderdate` alone.
+
+Comparing key text made those equal sorts differ. Counting keys and directions fails on the last two forms, and normalizing the expressions needs the query's aliases and a rule for each EXPLAIN form. What is missed: an agent sort on a wrong or missing key, or in the wrong direction, does not raise the proposed-plan difference rate. The realized plan is not affected, since hints cannot force sort keys and PostgreSQL derives them from the query.
 
 ### Parallelism is only a flag
 
