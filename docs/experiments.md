@@ -2,23 +2,25 @@
 
 `python project.py --experiments` runs each query in the workload once and saves one
 JSON `RunRecord` per query as one line of `agent_runs/<UTC start time>.jsonl`, one file
-per experiment. A run is saved however far it got. The stored plans are the source of truth: the metrics are
-recomputed from them when a record is loaded, never stored. `RunRecord` in `project.py`
-defines the fields:
+per experiment. A run is saved however far it got. The stored plans are the source of
+truth: the metrics are recomputed from them when a record is loaded, never stored.
+`RunRecord` in `project.py` defines the fields, all at the top level of each line:
 
-- `identity`: experiment, query and start time;
-- `provenance`: record format version, git commit (none outside a git checkout), agent
-  model and a hash of its system prompt, so runs from different code or prompts are
-  not mixed;
-- `evidence`: the SQL, the database description the agent saw, PostgreSQL's plan, the
-  agent's plan and every answer it gave, the forcing outcome, and the timings;
+- the query name, start time and record format version;
+- `provenance`: the git commit (none outside a git checkout), agent model and a hash of
+  its system prompt, so runs from different commits or prompts are not mixed;
+- the original and rewritten SQL, and the database description the agent saw;
+- PostgreSQL's plan, the agent's plan and every answer it gave;
+- `forcing`: the realized plan and the hints and retry settings that produced it, or
+  none unless forcing succeeded;
+- each plan's mean time in milliseconds, none past the timeout;
 - `failure_stage` and `failure_reason`: both empty for a completed run; otherwise
   `postgres_plan`, `agent_plan` (no usable plan), `agent_request` (the API request
   failed), `forcing` or `timing`, and why; and
 - `analyst`: the optional advice below.
 
-Runs are appended, so an existing run is never overwritten. If a crash cuts the last
-line short, loading leaves that run out.
+Runs are appended, so an existing run is never overwritten. A line cut short by a crash
+makes the file fail to load; delete that line and rerun the query.
 
 ## Advisory analyst
 

@@ -20,15 +20,13 @@ from preprocessing import (
     PlanNode,
 )
 from project import (
+    FailureStage,
+    Forcing,
+    Provenance,
     AnalystAssessment,
     AnalystResponse,
-    ForcingEvidence,
     ParallelFlags,
-    RunEvidence,
-    RunIdentity,
-    RunProvenance,
     RunRecord,
-    TimingEvidence,
     build_analyst_request,
     collect_run,
     evaluation_from_run,
@@ -57,40 +55,32 @@ def record(
     agent: PlanNode | None = INDEX,
     realized: PlanNode | None = SEQ,
     answers: int = 1,
-    timing: TimingEvidence | None = None,
-    failure_stage: str | None = None,
+    failure_stage: FailureStage | None = None,
+    postgres_ms: float | None = None,
+    realized_ms: float | None = None,
 ) -> RunRecord:
     """A stored run; realized=None with an agent plan means forcing failed."""
-    forcing = None
-    if agent is not None:
-        forcing = (
-            ForcingEvidence(failure_reason="cannot force")
-            if realized is None
-            else ForcingEvidence(
-                realized_plan=realized, hints="hints", switch_offs=True, leading=True
-            )
-        )
     return RunRecord(
-        identity=RunIdentity(
-            experiment_id="experiment",
-            query_name=query,
-            created_at=datetime(2026, 11, 15, tzinfo=UTC),
-        ),
-        provenance=RunProvenance(
+        query_name=query,
+        created_at=datetime(2026, 11, 15, tzinfo=UTC),
+        provenance=Provenance(
             git_commit="abc123", agent_model="claude-haiku-5-5", prompt_sha256="0" * 64
         ),
-        evidence=RunEvidence(
-            original_sql="SELECT * FROM orders",
-            rewritten_sql="SELECT * FROM orders",
-            database_description="PostgreSQL 16\norders",
-            postgres_plan=postgres,
-            agent_plan=agent,
-            agent_attempts=tuple(AgentAttempt(response="{}") for _ in range(answers)),
-            forcing=forcing,
-            timing=timing,
+        original_sql="SELECT * FROM orders",
+        rewritten_sql="SELECT * FROM orders",
+        database_description="PostgreSQL 16\norders",
+        postgres_plan=postgres,
+        agent_plan=agent,
+        agent_attempts=tuple(AgentAttempt(response="{}") for _ in range(answers)),
+        forcing=(
+            Forcing(realized_plan=realized, hints="hints", switch_offs=True, leading=True)
+            if agent and realized
+            else None
         ),
         failure_stage=failure_stage,
-        failure_reason=failure_stage,
+        failure_reason="cannot force" if failure_stage == "forcing" else failure_stage,
+        postgres_ms=postgres_ms,
+        realized_ms=realized_ms,
     )
 
 
@@ -134,26 +124,11 @@ def advice_for(run: RunRecord) -> FakeAnalystClient:
 def test_runs_are_appended_to_their_experiment_file(tmp_path: Path) -> None:
     runs = [record("Q1"), record("Q2", agent=None, failure_stage="agent_plan")]
 
-    paths = {write_run(run, tmp_path) for run in runs}
+    for run in runs:
+        write_run(run, "experiment", tmp_path)
 
-    assert paths == {tmp_path / "experiment.jsonl"}
+    assert [path.name for path in tmp_path.iterdir()] == ["experiment.jsonl"]
     assert load_experiment("experiment", tmp_path) == runs
-
-
-def test_a_run_cut_off_mid_write_is_left_out(tmp_path: Path) -> None:
-    path = write_run(record("Q1"), tmp_path)
-    with path.open("a", encoding="utf-8") as experiment:
-        experiment.write(record("Q2").model_dump_json()[:40])
-
-    assert load_experiment("experiment", tmp_path) == [record("Q1")]
-
-
-def test_a_broken_line_before_the_last_is_an_error(tmp_path: Path) -> None:
-    path = tmp_path / "experiment.jsonl"
-    path.write_text("not json\n" + record().model_dump_json() + "\n", encoding="utf-8")
-
-    with pytest.raises(ValidationError):
-        load_experiment("experiment", tmp_path)
 
 
 def test_evaluation_is_recomputed_from_the_stored_plans() -> None:
@@ -243,12 +218,13 @@ def test_a_completed_run_is_saved_with_every_stage(
     run = collect(tmp_path)
 
     assert run.failure_stage is None
-    assert run.evidence.database_description == "PostgreSQL 16\norders"
-    assert (run.evidence.postgres_plan, run.evidence.agent_plan) == (SEQ, INDEX)
-    assert run.evidence.agent_attempts == ANSWERS
-    assert run.evidence.forcing is not None
-    assert run.evidence.forcing.hints == "IndexScan(orders orders_pkey)"
-    assert run.evidence.timing == TimingEvidence(postgres_ms=100.0, realized_ms=125.0)
+    assert run.database_description == "PostgreSQL 16\norders"
+    assert (run.postgres_plan, run.agent_plan) == (SEQ, INDEX)
+    assert run.agent_attempts == ANSWERS
+    assert run.forcing == Forcing(
+        realized_plan=SEQ, hints="IndexScan(orders orders_pkey)", switch_offs=False, leading=True
+    )
+    assert (run.postgres_ms, run.realized_ms) == (100.0, 125.0)
     assert run.analyst.status == "not_requested"
     assert load_experiment("experiment", tmp_path) == [run]
 
@@ -266,8 +242,8 @@ def test_an_unusable_agent_plan_keeps_its_answers(
     run = collect(tmp_path)
 
     assert run.failure_stage == "agent_plan"
-    assert run.evidence.postgres_plan == SEQ
-    assert run.evidence.agent_attempts == ANSWERS[:1]
+    assert run.postgres_plan == SEQ
+    assert run.agent_attempts == ANSWERS[:1]
 
 
 def test_a_failed_request_keeps_the_answers_before_it(
@@ -283,7 +259,7 @@ def test_a_failed_request_keeps_the_answers_before_it(
     run = collect(tmp_path)
 
     assert run.failure_stage == "agent_request"
-    assert run.evidence.agent_attempts == ANSWERS[:1]
+    assert run.agent_attempts == ANSWERS[:1]
 
 
 def test_a_client_that_cannot_start_is_an_agent_request_failure(
@@ -299,7 +275,7 @@ def test_a_client_that_cannot_start_is_an_agent_request_failure(
     run = collect(tmp_path, client=None)
 
     assert run.failure_stage == "agent_request"
-    assert run.evidence.postgres_plan == SEQ
+    assert run.postgres_plan == SEQ
 
 
 def test_a_forcing_failure_keeps_the_agent_plan(
@@ -315,8 +291,8 @@ def test_a_forcing_failure_keeps_the_agent_plan(
     run = collect(tmp_path)
 
     assert run.failure_stage == "forcing"
-    assert run.evidence.agent_plan == INDEX
-    assert run.evidence.forcing == ForcingEvidence(failure_reason="cannot force")
+    assert (run.agent_plan, run.forcing) == (INDEX, None)
+    assert run.failure_reason == "cannot force"
 
 
 def test_a_timeout_completes_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -325,7 +301,7 @@ def test_a_timeout_completes_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyP
     run = collect(tmp_path)
 
     assert run.failure_stage is None
-    assert run.evidence.timing == TimingEvidence(postgres_ms=100.0, realized_ms=None)
+    assert (run.postgres_ms, run.realized_ms) == (100.0, None)
 
 
 def test_a_database_error_while_planning_rolls_back(
@@ -365,7 +341,7 @@ def test_a_database_error_while_timing_keeps_the_first_time(
 
     assert run.failure_stage == "timing"
     assert connection.rollbacks == 1
-    assert run.evidence.timing == TimingEvidence(postgres_ms=100.0)
+    assert (run.postgres_ms, run.realized_ms) == (100.0, None)
 
 
 def test_provenance_outside_a_git_checkout_has_no_commit(
@@ -436,10 +412,10 @@ def test_summary_flags_each_plan_parallel_or_not() -> None:
 
 def test_summary_time_ratio_and_timeouts() -> None:
     summary = summarise_workload([
-        record("Q1", timing=TimingEvidence(postgres_ms=100, realized_ms=200)),
-        record("Q2", timing=TimingEvidence(postgres_ms=100, realized_ms=None)),
-        record("Q3", timing=TimingEvidence(postgres_ms=100), failure_stage="timing"),
-        record("Q4", timing=None),
+        record("Q1", postgres_ms=100, realized_ms=200),
+        record("Q2", postgres_ms=100, realized_ms=None),
+        record("Q3", postgres_ms=100, failure_stage="timing"),
+        record("Q4", agent=None, failure_stage="agent_plan"),
     ])
 
     assert {query: (row.time_ratio, row.timed_out) for query, row in summary.items()} == {
@@ -451,11 +427,9 @@ def test_summary_time_ratio_and_timeouts() -> None:
 
 
 def test_one_request_covers_every_gap_without_measured_fields_or_answers() -> None:
-    run = record()
-    run = run.model_copy(update={"evidence": run.evidence.model_copy(update={
-        "agent_attempts": (AgentAttempt(response="private planner prose"),),
-        "postgres_plan": SEQ.model_copy(update={"total_cost": 12.5}),
-    })})
+    run = record(postgres=SEQ.model_copy(update={"total_cost": 12.5})).model_copy(
+        update={"agent_attempts": (AgentAttempt(response="private planner prose"),)}
+    )
     client = advice_for(run)
 
     result = run_analyst(client, run)  # type: ignore[arg-type]

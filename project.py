@@ -1,7 +1,7 @@
 """
 Entry point. python project.py --experiments runs every query in queries/ and saves the
-runs to agent_runs/<experiment>.jsonl. Run records, their aggregation and the advisory analyst live here
-too.
+runs to agent_runs/<experiment>.jsonl. Run records, their summary and the advisory
+analyst live here too.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ from preprocessing import (
     AgentAttempt,
     AgentError,
     AgentPlanError,
-    DatabaseDescription,
     PlanNode,
     agent_system_prompt,
     api_key,
@@ -76,52 +75,6 @@ class RecordModel(BaseModel):
 FailureStage = Literal["postgres_plan", "agent_plan", "agent_request", "forcing", "timing"]
 
 
-class RunIdentity(RecordModel):
-    # Names the file agent_runs/<experiment_id>.jsonl, so it is limited to safe characters.
-    experiment_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
-    query_name: str
-    created_at: datetime
-
-
-class RunProvenance(RecordModel):
-    """What produced the run, so runs from different commits or prompts are not mixed."""
-
-    schema_version: Literal[2] = 2
-    # None when the project is not a git checkout, such as an unpacked submission.
-    git_commit: str | None
-    agent_model: str
-    prompt_sha256: str
-
-
-class ForcingEvidence(RecordModel):
-    """The forcing try force_plan() selected, or why forcing failed."""
-
-    realized_plan: PlanNode | None = None
-    hints: str | None = None
-    switch_offs: bool | None = None
-    leading: bool | None = None
-    failure_reason: str | None = None
-
-
-class TimingEvidence(RecordModel):
-    """Each plan's mean time in milliseconds; None if it passed the statement timeout."""
-
-    postgres_ms: float | None = None
-    realized_ms: float | None = None
-
-
-class RunEvidence(RecordModel):
-    original_sql: str
-    rewritten_sql: str
-    # What the agent was told about the database, from describe_database().
-    database_description: str | None = None
-    postgres_plan: PlanNode | None = None
-    agent_plan: PlanNode | None = None
-    agent_attempts: tuple[AgentAttempt, ...] = ()
-    forcing: ForcingEvidence | None = None
-    timing: TimingEvidence | None = None
-
-
 class AnalystAssessment(RecordModel):
     """The analyst's suggested cause for one realization gap."""
 
@@ -155,12 +108,50 @@ class AnalystResult(RecordModel):
     reason: str | None = None
 
 
-class RunRecord(RecordModel):
-    """One query's run, saved as one line of agent_runs/<experiment_id>.jsonl."""
+class Provenance(RecordModel):
+    """What produced a run, so runs from different commits or prompts are not mixed."""
 
-    identity: RunIdentity
-    provenance: RunProvenance
-    evidence: RunEvidence
+    # None outside a git checkout, such as an unpacked submission.
+    git_commit: str | None
+    agent_model: str
+    prompt_sha256: str
+
+
+class Forcing(RecordModel):
+    """The forcing try force_plan() selected: the plan PostgreSQL chose with its hints."""
+
+    realized_plan: PlanNode
+    hints: str
+    switch_offs: bool
+    leading: bool
+
+
+class RunRecord(RecordModel):
+    """
+    One query's run, saved as one line of agent_runs/<experiment>.jsonl. Each stage of
+    collect_run() fills in its fields, so a failed run keeps everything before the
+    failure. Unlike the other records it is not frozen, so collect_run() can fill it in
+    place; every assignment is validated.
+    """
+
+    model_config = ConfigDict(frozen=False, validate_assignment=True)
+
+    schema_version: Literal[3] = 3
+    query_name: str
+    created_at: datetime
+    provenance: Provenance
+    original_sql: str
+    rewritten_sql: str
+    # What the agent was told about the database, from describe_database().
+    database_description: str | None = None
+    postgres_plan: PlanNode | None = None
+    agent_plan: PlanNode | None = None
+    agent_attempts: tuple[AgentAttempt, ...] = ()
+    # None unless forcing succeeded.
+    forcing: Forcing | None = None
+    # Mean milliseconds of each plan; None if it was not timed or passed the timeout.
+    postgres_ms: float | None = None
+    realized_ms: float | None = None
     # Both None for a completed run; otherwise the stage that failed and why.
     failure_stage: FailureStage | None = None
     failure_reason: str | None = None
@@ -170,16 +161,14 @@ class RunRecord(RecordModel):
 def build_analyst_request(run: RunRecord) -> AnalystRequest | None:
     """One request covering every realization gap in the run; None if there is none."""
 
-    evidence = run.evidence
-    forcing = evidence.forcing
-    if evidence.agent_plan is None or forcing is None or forcing.realized_plan is None:
+    if run.agent_plan is None or run.forcing is None:
         return None
     # Every forcing gap, parallel ones included: the rates leave those out, but the
     # analyst explains what forcing did not reproduce.
-    gaps = realization_gaps(evidence.agent_plan, forcing.realized_plan)
+    gaps = realization_gaps(run.agent_plan, run.forcing.realized_plan)
     if not gaps:
         return None
-    assert evidence.postgres_plan is not None
+    assert run.postgres_plan is not None
 
     # Costs, row counts and times are left out of the plans the analyst sees: hints
     # distort them, and they would only invite the model to compare numbers.
@@ -199,12 +188,12 @@ def build_analyst_request(run: RunRecord) -> AnalystRequest | None:
         return structure(plan.model_dump(exclude_none=True, exclude_defaults=True))
 
     payload = {
-        "query": evidence.rewritten_sql,
-        "database_description": evidence.database_description,
+        "query": run.rewritten_sql,
+        "database_description": run.database_description,
         "plans": {
-            "P_postgresql": plan_structure(evidence.postgres_plan),
-            "A_agent": plan_structure(evidence.agent_plan),
-            "R_realized": plan_structure(forcing.realized_plan),
+            "P_postgresql": plan_structure(run.postgres_plan),
+            "A_agent": plan_structure(run.agent_plan),
+            "R_realized": plan_structure(run.forcing.realized_plan),
         },
         "realization_gaps": [
             {
@@ -214,11 +203,7 @@ def build_analyst_request(run: RunRecord) -> AnalystRequest | None:
             }
             for gap in gaps
         ],
-        "selected_forcing": {
-            "hints": forcing.hints,
-            "switch_offs": forcing.switch_offs,
-            "leading": forcing.leading,
-        },
+        "selected_forcing": run.forcing.model_dump(include={"hints", "switch_offs", "leading"}),
         "known_limits": [
             "pg_hint_plan cannot force every PostgreSQL operator or rewrite",
             "hints may not reach repeated or generated aliases",
@@ -279,29 +264,19 @@ def run_analyst(client: anthropic.Anthropic, run: RunRecord) -> AnalystResult:
     return AnalystResult(status="completed", assessments=assessments)
 
 
-def write_run(run: RunRecord, root: Path = AGENT_RUNS) -> Path:
-    """Append run as one line of its experiment's file, agent_runs/<experiment>.jsonl."""
+def write_run(run: RunRecord, experiment_id: str, root: Path = AGENT_RUNS) -> None:
+    """Append run as one line of the experiment's file, agent_runs/<experiment_id>.jsonl."""
 
     root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{run.identity.experiment_id}.jsonl"
-    with path.open("a", encoding="utf-8") as experiment:
+    with (root / f"{experiment_id}.jsonl").open("a", encoding="utf-8") as experiment:
         experiment.write(run.model_dump_json() + "\n")
-    return path
 
 
 def load_experiment(experiment_id: str, root: Path = AGENT_RUNS) -> list[RunRecord]:
     """Load an experiment's runs in the order they were saved."""
 
     lines = (root / f"{experiment_id}.jsonl").read_text(encoding="utf-8").splitlines()
-    runs = []
-    for number, line in enumerate(lines, 1):
-        try:
-            runs.append(RunRecord.model_validate_json(line))
-        except ValidationError:
-            # Only the last line may be broken: a run cut off by a crash mid-write.
-            if number < len(lines):
-                raise
-    return runs
+    return [RunRecord.model_validate_json(line) for line in lines]
 
 
 def evaluation_from_run(run: RunRecord) -> PlanEvaluation | None:
@@ -310,25 +285,23 @@ def evaluation_from_run(run: RunRecord) -> PlanEvaluation | None:
     agent's plan was forced.
     """
 
-    postgres, agent, forcing = (
-        run.evidence.postgres_plan, run.evidence.agent_plan, run.evidence.forcing
-    )
-    if postgres is None or agent is None or forcing is None:
+    if run.postgres_plan is None or run.agent_plan is None:
         return None
-
-    if forcing.realized_plan is None:
+    if run.forcing is None:
+        # A run with an agent plan was always forced, so no forcing means it failed, and
+        # failure_reason says why.
         outcome: ForcePlanResult | ForcingFailure = ForcingFailure(
-            forcing.failure_reason or "Forcing failed without a recorded reason."
+            run.failure_reason or "Forcing failed without a recorded reason."
         )
     else:
         outcome = ForcePlanResult(
-            hints=forcing.hints or "",
-            plan=forcing.realized_plan,
-            gaps=tuple(realization_gaps(agent, forcing.realized_plan)),
-            switch_offs=bool(forcing.switch_offs),
-            leading=bool(forcing.leading),
+            hints=run.forcing.hints,
+            plan=run.forcing.realized_plan,
+            gaps=tuple(realization_gaps(run.agent_plan, run.forcing.realized_plan)),
+            switch_offs=run.forcing.switch_offs,
+            leading=run.forcing.leading,
         )
-    return evaluate_plans(postgres, agent, outcome)
+    return evaluate_plans(run.postgres_plan, run.agent_plan, outcome)
 
 
 MetricName = Literal[
@@ -370,15 +343,12 @@ def summarise_workload(runs: list[RunRecord]) -> dict[str, QuerySummary]:
 
     summary: dict[str, QuerySummary] = {}
     for run in runs:
-        evidence = run.evidence
         evaluation = evaluation_from_run(run)
-        timing = evidence.timing
-        realized = evidence.forcing.realized_plan if evidence.forcing else None
-        summary[run.identity.query_name] = QuerySummary(
+        summary[run.query_name] = QuerySummary(
             failure_stage=run.failure_stage,
             answers=(
-                len(evidence.agent_attempts)
-                if evidence.agent_attempts and run.failure_stage != "agent_request"
+                len(run.agent_attempts)
+                if run.agent_attempts and run.failure_stage != "agent_request"
                 else None
             ),
             scores={} if evaluation is None else {
@@ -389,19 +359,20 @@ def summarise_workload(runs: list[RunRecord]) -> dict[str, QuerySummary]:
             },
             parallel=ParallelFlags(*(
                 None if plan is None else is_parallel(plan)
-                for plan in (evidence.postgres_plan, evidence.agent_plan, realized)
+                for plan in (
+                    run.postgres_plan,
+                    run.agent_plan,
+                    run.forcing.realized_plan if run.forcing else None,
+                )
             )),
             time_ratio=(
-                timing.realized_ms / timing.postgres_ms
-                if timing and timing.postgres_ms and timing.realized_ms is not None
+                run.realized_ms / run.postgres_ms
+                if run.postgres_ms and run.realized_ms is not None
                 else None
             ),
             # A completed run times both plans, so a missing time means a timeout.
-            timed_out=bool(
-                run.failure_stage is None
-                and timing
-                and (timing.postgres_ms is None or timing.realized_ms is None)
-            ),
+            timed_out=run.failure_stage is None
+            and (run.postgres_ms is None or run.realized_ms is None),
         )
     return summary
 
@@ -448,12 +419,6 @@ def collect_run(
     and, with analyst_client, the analyst. The run is saved however far it got.
     """
 
-    created_at = datetime.now(UTC)
-    identity = RunIdentity(
-        experiment_id=experiment_id,
-        query_name=query_name,
-        created_at=created_at,
-    )
     try:
         git_commit: str | None = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -461,48 +426,28 @@ def collect_run(
         ).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
         git_commit = None
-    provenance = RunProvenance(
-        git_commit=git_commit,
-        agent_model=AGENT_MODEL,
-        prompt_sha256=sha256(agent_system_prompt().encode("utf-8")).hexdigest(),
-    )
     rewritten = unique_aliases(sql)
-    description: DatabaseDescription | None = None
-    postgres_plan: PlanNode | None = None
-    agent_plan: PlanNode | None = None
-    attempts: tuple[AgentAttempt, ...] = ()
-    forcing: ForcingEvidence | None = None
-    timing: TimingEvidence | None = None
-    analyst = AnalystResult()
-
-    # Each stage fills in its evidence, so a failed run keeps everything before it.
-    def make_record(stage: FailureStage | None = None, reason: str | None = None) -> RunRecord:
-        return RunRecord(
-            identity=identity,
-            provenance=provenance,
-            evidence=RunEvidence(
-                original_sql=sql,
-                rewritten_sql=rewritten,
-                database_description=description.text if description else None,
-                postgres_plan=postgres_plan,
-                agent_plan=agent_plan,
-                agent_attempts=attempts,
-                forcing=forcing,
-                timing=timing,
-            ),
-            failure_stage=stage,
-            failure_reason=reason,
-            analyst=analyst,
-        )
+    run = RunRecord(
+        query_name=query_name,
+        created_at=datetime.now(UTC),
+        provenance=Provenance(
+            git_commit=git_commit,
+            agent_model=AGENT_MODEL,
+            prompt_sha256=sha256(agent_system_prompt().encode("utf-8")).hexdigest(),
+        ),
+        original_sql=sql,
+        rewritten_sql=rewritten,
+    )
 
     def finish(stage: FailureStage | None = None, reason: str | None = None) -> RunRecord:
-        run = make_record(stage, reason)
-        write_run(run, output_root)
+        run.failure_stage, run.failure_reason = stage, reason
+        write_run(run, experiment_id, output_root)
         return run
 
     try:
         description = describe_database(connection, rewritten)
-        postgres_plan = get_postgres_plan(connection, rewritten)
+        run.database_description = description.text
+        run.postgres_plan = get_postgres_plan(connection, rewritten)
     except Exception as error:
         if isinstance(error, psycopg.Error):
             connection.rollback()
@@ -512,44 +457,37 @@ def collect_run(
         if client is None:
             client = anthropic.Anthropic(api_key=api_key())
         result = ask_agent(client, rewritten, description)
-        agent_plan = result.plan
-        attempts = result.attempts
+        run.agent_plan, run.agent_attempts = result.plan, result.attempts
     except AgentPlanError as error:
-        attempts = error.attempts
+        run.agent_attempts = error.attempts
         return finish("agent_plan", str(error))
     except AgentError as error:
-        attempts = error.attempts
+        run.agent_attempts = error.attempts
         return finish("agent_request", str(error))
     except (anthropic.AnthropicError, RuntimeError) as error:
         return finish("agent_request", str(error))
 
-    outcome = try_force_plan(connection, rewritten, agent_plan)
+    outcome = try_force_plan(connection, rewritten, result.plan)
     if isinstance(outcome, ForcingFailure):
-        forcing = ForcingEvidence(failure_reason=outcome.reason)
         return finish("forcing", outcome.reason)
-    forcing = ForcingEvidence(
+    run.forcing = Forcing(
         realized_plan=outcome.plan,
         hints=outcome.hints,
         switch_offs=outcome.switch_offs,
         leading=outcome.leading,
     )
 
-    postgres_ms = realized_ms = None
-    timing_error: str | None = None
     try:
-        postgres_ms = execution_time(connection, rewritten)
-        realized_ms = execution_time(connection, rewritten, outcome.hints)
+        run.postgres_ms = execution_time(connection, rewritten)
+        run.realized_ms = execution_time(connection, rewritten, outcome.hints)
     except psycopg.Error as error:
         connection.rollback()
-        timing_error = str(error)
+        return finish("timing", str(error))
     except RuntimeError as error:
-        timing_error = str(error)
-    timing = TimingEvidence(postgres_ms=postgres_ms, realized_ms=realized_ms)
-    if timing_error:
-        return finish("timing", timing_error)
+        return finish("timing", str(error))
 
     if analyst_client is not None:
-        analyst = run_analyst(analyst_client, make_record())
+        run.analyst = run_analyst(analyst_client, run)
     return finish()
 
 

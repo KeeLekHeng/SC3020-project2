@@ -90,7 +90,7 @@ def run_main(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list[str]:
 
     def collect_run(*_args: object, query_name: str, **_kwargs: object) -> object:
         ran.append(query_name)
-        return record(query_name)
+        return record(query_name, postgres_ms=100.0, realized_ms=100.0)
 
     monkeypatch.setattr(project, "getpass", lambda *_args: "password")
     monkeypatch.setattr(project.psycopg, "connect", lambda **_kwargs: FakeConnection())
@@ -109,7 +109,7 @@ def test_experiments_flag_runs_every_workload_query(
     lines = capsys.readouterr().out.splitlines()
     # The stored run: an Index Scan proposed, a Seq Scan realized, one answer.
     q1 = next(line for line in lines if line.startswith("Q1 "))
-    assert q1.split() == ["Q1", "completed", "1", "1/1", "0/2", "0/1", "0/2", "no/no/no", "-"]
+    assert q1.split() == ["Q1", "completed", "1", "1/1", "0/2", "0/1", "0/2", "no/no/no", "1.00x"]
     assert "Usable agent plans: 22/22, 22 on the first answer" in lines
     assert "Same plan as PostgreSQL, apart from parallelism: proposed 0/22, realized 22/22" in lines
     assert "Plans forced: 22/22" in lines
