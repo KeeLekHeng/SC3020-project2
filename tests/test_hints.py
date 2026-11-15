@@ -560,6 +560,34 @@ def test_sorts_match_however_their_keys_are_written() -> None:
     assert differences(postgres, agent) == []
 
 
+def test_set_operations_compare_by_strategy() -> None:
+    # EXPLAIN gives a SetOp both its command and strategy; an agent plan has no command.
+    postgres = PlanNode(
+        node_type="SetOp",
+        operation="Intersect",
+        strategy="Hashed",
+        children=(scan("o", "orders"),),
+    )
+    agent = postgres.model_copy(update={"operation": None})
+    sorted_agent = agent.model_copy(update={"strategy": "Sorted"})
+
+    assert differences(postgres, agent) == []
+    assert [str(d.decision) for d in differences(postgres, sorted_agent)] == ["setop(o)"]
+
+
+def test_bitmap_indexes_match_in_any_order() -> None:
+    def bitmap_scan(*indexes: str) -> PlanNode:
+        reads = tuple(PlanNode(node_type="Bitmap Index Scan", index_name=i) for i in indexes)
+        return PlanNode(
+            node_type="Bitmap Heap Scan",
+            alias="o",
+            relation="orders",
+            children=(PlanNode(node_type="BitmapOr", children=reads),),
+        )
+
+    assert differences(bitmap_scan("a_idx", "b_idx"), bitmap_scan("b_idx", "a_idx")) == []
+
+
 def test_partial_aggregate_strategy_is_compared() -> None:
     hashed = parallel_aggregate("Hashed", "Sorted")
     grouped = parallel_aggregate("Sorted", "Sorted")

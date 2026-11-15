@@ -66,7 +66,7 @@ class Choice(NamedTuple):
     # - outer: the outer side's aliases, such as "o" for join(c, o)
     # - aggregate: "Plain", "Sorted", "Hashed" or "Mixed"
     # - gather: "Gather" or "Gather Merge"
-    # - other operators: their operation or strategy, else "used"
+    # - other operators: their strategy, else "used"
     value: str
     node: PlanNode
 
@@ -183,8 +183,8 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
       grouping compare by how the rows are grouped
     - gather(l): "Gather" or "Gather Merge", the operator combining parallel workers'
       rows, keyed by the tables below it, so moving it is a different decision
-    - any other operator, by its lowercased type: its operation or strategy, or "used"
-      if it has neither, such as sort(o): "used"
+    - any other operator, by its lowercased type: its strategy, or "used" if it has
+      none, such as sort(o): "used" or setop(c, s): "Hashed"
 
     A decision present in only one plan means only that plan made the choice, for
     example a sort.
@@ -219,9 +219,11 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
             found[Decision("scan", (node.alias,))] = Choice(node.node_type, node)
             if node.node_type in INDEXED:
                 index = node.index_name or ", ".join(
-                    n.index_name
-                    for n in node.walk(subplans=False)
-                    if n.node_type == "Bitmap Index Scan" and n.index_name
+                    sorted(
+                        n.index_name
+                        for n in node.walk(subplans=False)
+                        if n.node_type == "Bitmap Index Scan" and n.index_name
+                    )
                 )
                 found[Decision("index", (node.alias,))] = Choice(index or UNSPECIFIED, node)
             parallel = "parallel" if node.parallel_aware else "serial"
@@ -239,7 +241,9 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
             kind, value = "gather", node.node_type
         else:
             kind = node.node_type.lower()
-            value = node.operation or node.strategy or "used"
+            # Not the SetOp command, such as Intersect: the query fixes it, and an agent
+            # plan has no field for it.
+            value = node.strategy or "used"
 
         found[Decision(kind, tables)] = Choice(value, node)
 

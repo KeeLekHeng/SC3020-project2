@@ -313,7 +313,7 @@ Costs from the forced plan are also unsuitable for comparison because hints and 
 
 ### Conditions, filters and keys are not compared
 
-`decisions()` does not compare join conditions, index conditions, filters, group keys or sort keys. This avoids treating formatting differences as semantic differences, but it can miss an incorrect or incomplete expression in an agent plan.
+`decisions()` does not compare join conditions, index conditions, filters, group keys, sort keys or a SetOp's command, such as `Intersect`, which the query fixes; a SetOp is compared by its strategy. This avoids treating formatting differences as semantic differences, but it can miss an incorrect or incomplete expression in an agent plan.
 
 A sort counts only as present or absent over its tables. Its keys follow from the query and the operator above it: the `ORDER BY`, the `GROUP BY` or the merge condition. EXPLAIN writes them in its own form, which the agent cannot be expected to match:
 
