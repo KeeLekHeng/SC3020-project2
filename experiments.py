@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
-from enum import Enum
 from hashlib import sha256
 import json
 import os
@@ -12,7 +11,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from statistics import fmean, median
-from typing import Callable, Literal, get_args
+from typing import Callable, Literal, NamedTuple, get_args
 
 import anthropic
 import psycopg
@@ -60,16 +59,8 @@ class RecordModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class RunStatus(str, Enum):
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class AnalystStatus(str, Enum):
-    NOT_REQUESTED = "not_requested"
-    COMPLETED = "completed"
-    UNAVAILABLE = "unavailable"
-    INVALID_RESPONSE = "invalid_response"
+RunStatus = Literal["completed", "failed"]
+AnalystStatus = Literal["not_requested", "completed", "unavailable", "invalid_response"]
 
 
 class RunIdentity(RecordModel):
@@ -148,6 +139,9 @@ class AnalystConfiguration(RecordModel):
     max_tokens: int = Field(default=ANALYST_MAX_TOKENS, gt=0)
 
 
+ANALYST_CONFIGURATION = AnalystConfiguration()
+
+
 class AnalystAssessment(RecordModel):
     gap_id: str = Field(min_length=1)
     cause: AnalystCause
@@ -160,31 +154,28 @@ class AnalystResponse(RecordModel):
     assessments: tuple[AnalystAssessment, ...]
 
 
-class AnalystRequest(RecordModel):
+class AnalystRequest(NamedTuple):
     system: str
     user: str
     gap_ids: tuple[str, ...]
 
 
 class AnalystResult(RecordModel):
-    status: AnalystStatus = AnalystStatus.NOT_REQUESTED
+    status: AnalystStatus = "not_requested"
     configuration: AnalystConfiguration | None = None
     assessments: tuple[AnalystAssessment, ...] = ()
     reason: str | None = None
 
     @model_validator(mode="after")
     def status_matches_payload(self) -> "AnalystResult":
-        failed = self.status in {
-            AnalystStatus.UNAVAILABLE,
-            AnalystStatus.INVALID_RESPONSE,
-        }
+        failed = self.status in {"unavailable", "invalid_response"}
         if failed and not self.reason:
             raise ValueError("An unavailable or invalid analyst result needs a reason.")
-        if self.status is AnalystStatus.NOT_REQUESTED and (
+        if self.status == "not_requested" and (
             self.configuration is not None or self.assessments or self.reason is not None
         ):
             raise ValueError("A not-requested analyst result cannot contain output.")
-        if self.status is not AnalystStatus.NOT_REQUESTED and self.configuration is None:
+        if self.status != "not_requested" and self.configuration is None:
             raise ValueError("A requested analyst result needs its configuration.")
         if failed and self.assessments:
             raise ValueError("A failed analyst result cannot contain assessments.")
@@ -231,9 +222,7 @@ def _structural_plan(plan: PlanNode) -> dict[str, object]:
                 for key, item in value.items()
                 if key not in _NON_STRUCTURAL_PLAN_FIELDS
             }
-        if isinstance(value, list):
-            return [strip(item) for item in value]
-        if isinstance(value, tuple):
+        if isinstance(value, (list, tuple)):
             return [strip(item) for item in value]
         return value
 
@@ -312,54 +301,42 @@ def build_analyst_request(run: RunRecord) -> AnalystRequest | None:
 
 
 def run_analyst(client: anthropic.Anthropic, run: RunRecord) -> AnalystResult:
-    """Make at most one advisory model call for all gaps in a run."""
-
-    request = build_analyst_request(run)
-    if request is None:
-        return AnalystResult(
-            status=AnalystStatus.COMPLETED,
-            configuration=AnalystConfiguration(),
-        )
-    response = client.messages.create(
-        model=ANALYST_MODEL,
-        max_tokens=ANALYST_MAX_TOKENS,
-        system=request.system,
-        messages=[{"role": "user", "content": request.user}],
-    )
-    if response.stop_reason == "refusal":
-        raise RuntimeError("The analyst declined the request.")
-    if response.stop_reason == "max_tokens":
-        raise RuntimeError("The analyst response was cut off at max_tokens.")
-    text = "".join(
-        block.text
-        for block in response.content
-        if isinstance(block, anthropic.types.TextBlock)
-    )
-    assessments = validate_analyst_response(text, set(request.gap_ids))
-    return AnalystResult(
-        status=AnalystStatus.COMPLETED,
-        configuration=AnalystConfiguration(),
-        assessments=assessments,
-    )
-
-
-def advisory_result(client: anthropic.Anthropic, run: RunRecord) -> AnalystResult:
-    """Contain analyst failures so deterministic evidence and metrics remain valid."""
+    """
+    Make at most one advisory model call for all gaps in a run. Failures become a
+    status, so deterministic evidence and metrics remain valid.
+    """
 
     try:
-        return run_analyst(client, run)
+        request = build_analyst_request(run)
+        if request is None:
+            return AnalystResult(status="completed", configuration=ANALYST_CONFIGURATION)
+        response = client.messages.create(
+            model=ANALYST_MODEL,
+            max_tokens=ANALYST_MAX_TOKENS,
+            system=request.system,
+            messages=[{"role": "user", "content": request.user}],
+        )
+        if response.stop_reason == "refusal":
+            raise RuntimeError("The analyst declined the request.")
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError("The analyst response was cut off at max_tokens.")
+        text = "".join(
+            block.text
+            for block in response.content
+            if isinstance(block, anthropic.types.TextBlock)
+        )
+        assessments = validate_analyst_response(text, set(request.gap_ids))
     except (ValueError, ValidationError) as error:
         return AnalystResult(
-            status=AnalystStatus.INVALID_RESPONSE,
-            configuration=AnalystConfiguration(),
-            reason=str(error),
+            status="invalid_response", configuration=ANALYST_CONFIGURATION, reason=str(error)
         )
     except (anthropic.AnthropicError, RuntimeError) as error:
         return AnalystResult(
-            status=AnalystStatus.UNAVAILABLE,
-            configuration=AnalystConfiguration(),
-            reason=str(error),
+            status="unavailable", configuration=ANALYST_CONFIGURATION, reason=str(error)
         )
+    return AnalystResult(
+        status="completed", configuration=ANALYST_CONFIGURATION, assessments=assessments
+    )
 
 
 MetricName = Literal[
@@ -424,15 +401,15 @@ class RunRecord(RecordModel):
 
     @model_validator(mode="after")
     def status_matches_evidence(self) -> "RunRecord":
-        if self.status is RunStatus.FAILED and (
+        if self.status == "failed" and (
             not self.failure_stage or not self.failure_reason
         ):
             raise ValueError("A failed run needs a failure stage and reason.")
-        if self.status is RunStatus.COMPLETED and (
+        if self.status == "completed" and (
             self.failure_stage is not None or self.failure_reason is not None
         ):
             raise ValueError("A completed run cannot carry a pipeline failure.")
-        if self.status is RunStatus.COMPLETED:
+        if self.status == "completed":
             forcing = self.evidence.forcing
             required = {
                 "database context": self.database,
@@ -596,12 +573,14 @@ def aggregate_runs(runs: list[RunRecord]) -> WorkloadSummary:
             scores[name].append((run, score))
 
     query_names = {run.identity.query_name for run in runs}
+    failed_runs = sum(run.status == "failed" for run in runs)
+    incomplete_reasons = Counter(reason for _run, reason in incomplete)
     aggregates: dict[MetricName, MetricAggregate] = {}
     for name in names:
         per_query_samples: dict[str, list[float]] = defaultdict(list)
         numerator = denominator = 0
         undefined = unavailable = 0
-        reasons: Counter[str] = Counter(reason for _run, reason in incomplete)
+        reasons = incomplete_reasons.copy()
         for run, score in scores[name]:
             if score.status is MetricStatus.DEFINED:
                 assert score.rate is not None
@@ -631,7 +610,7 @@ def aggregate_runs(runs: list[RunRecord]) -> WorkloadSummary:
             defined_runs=defined,
             undefined_runs=undefined,
             unavailable_runs=unavailable + len(incomplete),
-            failed_runs=sum(run.status is RunStatus.FAILED for run in runs),
+            failed_runs=failed_runs,
             included_queries=len(per_query),
             excluded_queries=len(query_names - per_query.keys()),
             exclusion_reasons=dict(sorted(reasons.items())),
@@ -777,11 +756,10 @@ def collect_run(
         description = describe_database(connection, rewritten)
         database = database_context(connection, description)
         postgres_plan = get_postgres_plan(connection, rewritten)
-    except psycopg.Error as error:
-        connection.rollback()
-        return finish(RunStatus.FAILED, "postgres_plan", str(error))
     except Exception as error:
-        return finish(RunStatus.FAILED, "postgres_plan", str(error))
+        if isinstance(error, psycopg.Error):
+            connection.rollback()
+        return finish("failed", "postgres_plan", str(error))
 
     try:
         if client is None:
@@ -791,14 +769,14 @@ def collect_run(
         attempts = result.attempts
     except (AgentPlanError, AgentError) as error:
         attempts = error.attempts
-        return finish(RunStatus.FAILED, "agent_plan", str(error))
+        return finish("failed", "agent_plan", str(error))
     except (anthropic.AnthropicError, RuntimeError) as error:
-        return finish(RunStatus.FAILED, "agent_plan", str(error))
+        return finish("failed", "agent_plan", str(error))
 
     outcome = try_force_plan(connection, rewritten, agent_plan)
     forcing = forcing_evidence(outcome)
     if isinstance(outcome, ForcingFailure):
-        return finish(RunStatus.FAILED, "forcing", outcome.reason)
+        return finish("failed", "forcing", outcome.reason)
 
     try:
         postgres_ms = execution_time(connection, rewritten, timeout_ms=timeout_ms)
@@ -811,9 +789,9 @@ def collect_run(
         )
     except psycopg.Error as error:
         connection.rollback()
-        return finish(RunStatus.FAILED, "timing", str(error))
+        return finish("failed", "timing", str(error))
     except RuntimeError as error:
-        return finish(RunStatus.FAILED, "timing", str(error))
+        return finish("failed", "timing", str(error))
     timing = TimingEvidence(
         postgres_ms=postgres_ms,
         realized_ms=realized_ms,
@@ -821,8 +799,8 @@ def collect_run(
         realized_timed_out=realized_ms is None,
     )
     if analyst_client is not None:
-        analyst = advisory_result(analyst_client, make_record(RunStatus.COMPLETED))
-    return finish(RunStatus.COMPLETED)
+        analyst = run_analyst(analyst_client, make_record("completed"))
+    return finish("completed")
 
 
 def collect_experiment(

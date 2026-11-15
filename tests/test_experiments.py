@@ -16,7 +16,6 @@ from experiments import (
     AnalystAssessment,
     AnalystResult,
     AnalystResponse,
-    AnalystStatus,
     DatabaseContext,
     ForcingEvidence,
     MeasurementConfiguration,
@@ -25,12 +24,10 @@ from experiments import (
     RunIdentity,
     RunProvenance,
     RunRecord,
-    RunStatus,
     TimingEvidence,
     collect_run,
     collect_experiment,
     aggregate_runs,
-    advisory_result,
     build_analyst_request,
     database_context,
     evaluation_from_run,
@@ -124,7 +121,7 @@ def record(*, failed: bool = False) -> RunRecord:
             ),
             timing=None if failed else TimingEvidence(postgres_ms=1, realized_ms=1),
         ),
-        status=RunStatus.FAILED if failed else RunStatus.COMPLETED,
+        status="failed" if failed else "completed",
         failure_stage="agent" if failed else None,
         failure_reason="No usable answer" if failed else None,
     )
@@ -292,7 +289,7 @@ def test_documented_sample_record_validates() -> None:
     loaded = RunRecord.model_validate(json.loads(sample))
 
     assert loaded.identity.run_id == "q1-s1"
-    assert loaded.status is RunStatus.FAILED
+    assert loaded.status == "failed"
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -313,7 +310,7 @@ def test_existing_run_is_never_replaced(run_root: Path) -> None:
     path = write_run(original, run_root)
 
     with pytest.raises(FileExistsError):
-        write_run(original.model_copy(update={"status": RunStatus.COMPLETED}), run_root)
+        write_run(original.model_copy(update={"status": "completed"}), run_root)
 
     assert load_run(path) == original
     assert list(path.parent.glob("*.tmp")) == []
@@ -401,7 +398,7 @@ def test_collector_stores_success_and_only_selected_forcing_evidence(
         client=object(),  # type: ignore[arg-type]
     )
 
-    assert run.status is RunStatus.COMPLETED
+    assert run.status == "completed"
     assert run.evidence.postgres_plan == postgres
     assert run.evidence.agent_plan == agent
     assert [attempt.response for attempt in run.evidence.agent_attempts] == ["bad", "good"]
@@ -438,7 +435,7 @@ def test_collector_preserves_failure_and_prior_evidence(
         client=object(),  # type: ignore[arg-type]
     )
 
-    assert run.status is RunStatus.FAILED
+    assert run.status == "failed"
     assert run.failure_stage == expected_stage
     assert run.evidence.postgres_plan is not None
     assert run.evidence.agent_attempts
@@ -470,7 +467,7 @@ def test_collector_stores_postgres_evidence_when_client_initialization_fails(
         output_root=run_root,
     )
 
-    assert run.status is RunStatus.FAILED
+    assert run.status == "failed"
     assert run.failure_stage == "agent_plan"
     assert run.evidence.postgres_plan is not None
     assert load_run(
@@ -502,7 +499,7 @@ def test_collector_stores_attempts_completed_before_request_failure(
         client=object(),  # type: ignore[arg-type]
     )
 
-    assert run.status is RunStatus.FAILED
+    assert run.status == "failed"
     assert run.failure_stage == "agent_plan"
     assert run.evidence.agent_attempts == (
         completed,
@@ -525,7 +522,7 @@ def test_collector_records_timeout_without_discarding_plans(
         client=object(),  # type: ignore[arg-type]
     )
 
-    assert run.status is RunStatus.COMPLETED
+    assert run.status == "completed"
     assert run.evidence.timing is not None
     assert run.evidence.timing.realized_ms is None
     assert run.evidence.timing.realized_timed_out is True
@@ -562,7 +559,7 @@ def test_collector_preserves_selected_plan_when_timing_fails(
         client=object(),  # type: ignore[arg-type]
     )
 
-    assert run.status is RunStatus.FAILED
+    assert run.status == "failed"
     assert run.failure_stage == "timing"
     assert run.failure_reason == "timing failed"
     assert run.evidence.forcing is not None
@@ -598,7 +595,7 @@ def test_collector_rolls_back_database_errors(
         client=object(),  # type: ignore[arg-type]
     )
 
-    assert run.status is RunStatus.FAILED
+    assert run.status == "failed"
     assert run.failure_stage == stage
     assert connection.rollbacks == 1
 
@@ -899,7 +896,7 @@ def test_zero_gap_run_completes_without_an_analyst_call() -> None:
 
     result = run_analyst(client, run)  # type: ignore[arg-type]
 
-    assert result.status.value == "completed"
+    assert result.status == "completed"
     assert result.assessments == ()
     assert client.requests == []
 
@@ -920,15 +917,15 @@ def test_analyst_failures_and_unknown_advice_never_change_metrics() -> None:
         for gap_id in request.gap_ids
     )
 
-    completed = advisory_result(FakeAnalystClient(unknown), run)  # type: ignore[arg-type]
-    malformed = advisory_result(MalformedAnalystClient(), run)  # type: ignore[arg-type]
-    refused = advisory_result(MalformedAnalystClient(refusal=True), run)  # type: ignore[arg-type]
+    completed = run_analyst(FakeAnalystClient(unknown), run)  # type: ignore[arg-type]
+    malformed = run_analyst(MalformedAnalystClient(), run)  # type: ignore[arg-type]
+    refused = run_analyst(MalformedAnalystClient(refusal=True), run)  # type: ignore[arg-type]
 
-    assert completed.status is AnalystStatus.COMPLETED
+    assert completed.status == "completed"
     assert completed.assessments[0].cause == "unknown"
-    assert malformed.status is AnalystStatus.INVALID_RESPONSE
+    assert malformed.status == "invalid_response"
     assert malformed.reason
-    assert refused.status is AnalystStatus.UNAVAILABLE
+    assert refused.status == "unavailable"
     assert refused.reason
     for analyst in (completed, malformed, refused, AnalystResult()):
         assert evaluation_from_run(run.model_copy(update={"analyst": analyst})) == before
@@ -964,7 +961,7 @@ def test_collector_persists_analyst_inside_the_same_run(
     )
 
     stored = load_run(run_root / "experiment-analyst" / "with-analyst.json")
-    assert run.analyst.status is AnalystStatus.COMPLETED
+    assert run.analyst.status == "completed"
     assert stored.analyst == run.analyst
     assert len(stored.analyst.assessments) == 2
 
@@ -986,7 +983,7 @@ def test_public_json_contract_round_trips_run_evaluation_summary_and_advice() ->
     run = run.model_copy(
         update={
             "analyst": AnalystResult(
-                status=AnalystStatus.COMPLETED,
+                status="completed",
                 configuration=AnalystConfiguration(),
                 assessments=advice,
             )
@@ -1045,7 +1042,7 @@ def test_small_multi_query_repeated_sample_experiment_end_to_end(
     assert {(run.identity.query_name, run.identity.sample) for run in loaded} == {
         ("Q1", 1), ("Q1", 2), ("Q2", 1), ("Q2", 2)
     }
-    assert all(run.analyst.status is AnalystStatus.COMPLETED for run in loaded)
+    assert all(run.analyst.status == "completed" for run in loaded)
     assert summary.metrics["proposed_difference"].total_runs == 4
     assert summary.metrics["proposed_difference"].included_queries == 2
     assert summary.timing.per_query_median_ratio == {"Q1": 1.0, "Q2": 1.0}
