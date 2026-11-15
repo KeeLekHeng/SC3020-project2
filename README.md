@@ -41,7 +41,7 @@ py project.py
 
 This opens the Streamlit GUI in your browser. Under **Database connection**, check the host, port, database and user (they default to the settings below), enter the password, and optionally press **Test connection**: it reports the PostgreSQL version and whether `pg_hint_plan` loads. Then type a query or pick one from `queries/` and press Execute. The query goes through the same steps as one query of the workload, and the run is appended to `agent_runs/<UTC time of the session's first run>.jsonl`. A query PostgreSQL cannot plan, such as one with a typo, shows its error and is not saved. This needs the Anthropic API key.
 
-The sidebar has New query, which opens that form, and lists every run in `agent_runs/`, newest first, each labelled with its query, its time and the start time of the experiment it belongs to. Click a run to see its results; a new run opens when it finishes. A failed run's label starts with ✗, and **Delete run** on a run's page removes it from its file for good. Viewing a saved run needs neither the database nor the key.
+The sidebar has New query, which opens that form, and lists every run in `agent_runs/`, newest first, each labelled with its query, its time and its session's start time. Click a run to see its results; a new run opens when it finishes. A failed run's label starts with ✗, and **Delete run** on a run's page removes it from its file for good. Viewing a saved run needs neither the database nor the key.
 
 The results panel shows the query's SQL, with a collapsed rewritten version below it when the plans were made from a version with unique aliases, then the four metrics, the timings and parallel flags, and PostgreSQL's plan (P), the agent's plan (A) and the realized plan (R) as three trees. Each decision that differs gets a number, shown on every node that holds it and in the table below, so the same number pairs the nodes being compared. A filled node in the agent's or realized plan made that decision differently from PostgreSQL's plan, which is outlined instead; a dashed border marks a decision no other plan makes; a red border and "not kept by R" mark a request the realized plan did not keep. Hovering a node shows its decisions in all three plans. Each metric's help icon defines it. A table lists every decision that differs, and expanders show the hints and the analyst's advice.
 
@@ -117,12 +117,11 @@ One run on 2026-11-11 with the Docker database:
 
 A run over all 22 queries costs 3 to 4 US cents.
 
-### Notes for the comparison and GUI work
+### Limits to know
 
 - PostgreSQL plans most TPC-H queries in parallel and the agent few. The metrics leave `parallel` and `gather` decisions out and report one parallel flag per plan instead; [docs/metrics.md](docs/metrics.md#parallelism-is-reported-separately) says why. [Comparing two plans](docs/plan-forcing.md#comparing-two-plans) says how each kind of decision is counted.
-- PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; count only followed decisions as the agent's. [docs/plan-forcing.md](docs/plan-forcing.md) says what hints fix, what they cannot, and how gaps are found.
+- PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; [docs/plan-forcing.md](docs/plan-forcing.md) says what hints fix, what they cannot, and how gaps are found.
 - The agent can only write plans that hints can force, and the comparison is uneven in several ways. [docs/agent-plan.md](docs/agent-plan.md) lists what the agent cannot express and how fair the comparison is.
-- When `get_agent_plan()` raises, show it as a failed agent plan, as `project.py --experiments` records it. The retry loop can run out of answers.
 
 ## Run the tests
 

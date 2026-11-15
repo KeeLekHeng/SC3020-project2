@@ -28,4 +28,4 @@ The analyst uses the agent's model, the one that proposed the plan, so its expla
 - **Execution time:** each plan runs once to warm the cache and then three times; the stored time is the mean of the three. Each row gives the realized plan's time over PostgreSQL's, or none when either timed out.
 - **Parallelism:** the rates leave out parallel and gather decisions. Each query's PostgreSQL, agent and realized plans get a parallel flag instead, true when the plan has a Gather or Gather Merge; a plan the run never produced has none. [docs/metrics.md](metrics.md#parallelism-is-reported-separately) gives the reasons.
 
-A GUI or report reader can load the records and recompute the summary without connecting to PostgreSQL or calling the agent or the analyst.
+The GUI and any report reader load the records and recompute the summary without connecting to PostgreSQL or calling the agent or the analyst.

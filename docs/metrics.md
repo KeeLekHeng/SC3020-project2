@@ -287,7 +287,7 @@ Only the parallelism decisions are left out. A choice that parallelism makes mor
 
 ## Structured result contract
 
-The typed Python result is `PlanEvaluation`. It holds the proposed comparison, the realizability result, the realized comparison, the intended-difference realization score and the forcing outcome. Each difference keeps the `PlanNode` that made each choice, so a consumer can highlight the node. Rates remain unrounded numbers; formatting belongs to the CLI or GUI.
+The typed Python result is `PlanEvaluation`. It holds the proposed comparison, the realizability result, the realized comparison, the intended-difference realization score, the forcing outcome and the decisions that score counts. Each difference keeps the `PlanNode` that made each choice, so a consumer can highlight the node. Rates remain unrounded numbers; formatting belongs to the CLI or GUI.
 
 ## Reproducibility records
 
