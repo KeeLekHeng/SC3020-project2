@@ -23,10 +23,9 @@ This document defines three complementary metrics:
 No single metric answers all three questions. They should be reported together.
 A supporting fourth metric, the intended-difference realization rate, combines all
 three plans to show which of the agent's disagreements with PostgreSQL took effect.
-Two diagnostic views are also recommended: a per-kind breakdown and a core structural
-difference rate that excludes `parallel` and `gather` decisions. These views explain
-whether one broad planning choice is dominating an overall percentage; they do not
-replace the three primary metrics.
+All four leave out the `parallel` and `gather` decisions; whether each plan runs in
+parallel is reported separately, as one flag per plan (see
+[Parallelism](#parallelism-is-reported-separately)).
 
 ## The unit of comparison: planner decisions
 
@@ -52,10 +51,11 @@ A join is identified by the sorted set of aliases below it. This allows correspo
 joins to be matched semantically even when the two plan trees have different shapes.
 
 Let `D(X)` be the decision mapping returned by `decisions(X)`. For two plans `X` and
-`Y`, their comparison universe is the union of their decision keys:
+`Y`, their comparison universe is the union of their decision keys, without the
+`parallel` and `gather` kinds:
 
 ```text
-U(X, Y) = keys(D(X)) union keys(D(Y))
+U(X, Y) = {d in keys(D(X)) union keys(D(Y)) where d.kind not in {parallel, gather}}
 ```
 
 A key is different when:
@@ -110,12 +110,6 @@ different choices. The proposed-plan difference rate is:
 ProposedDifference(P, A) = |M(P, A)| / |U(P, A)|
 ```
 
-The corresponding similarity rate is:
-
-```text
-ProposedSimilarity(P, A) = 1 - ProposedDifference(P, A)
-```
-
 ### Reasoning
 
 This is the primary measure of the agent's own planning behaviour. It evaluates the
@@ -137,12 +131,11 @@ scan is impossible and falls back to a sequential scan.
 
 ```python
 comparison = compare_plans(postgres_plan, agent_plan)
-proposed_difference = comparison.all_kinds.difference
+proposed_difference = comparison.difference
 ```
 
 `proposed_difference.numerator` and `.denominator` are the documented fraction. If the
-comparison universe is empty, both the difference and similarity scores are
-`not_applicable`, although a valid execution plan always produces at least one decision.
+comparison universe is empty, the score is `not_applicable`.
 
 ## Metric 2: plan realizability rate
 
@@ -157,10 +150,11 @@ plan?
 Agent-proposed plan A  versus  realized agent plan R
 ```
 
-Only decision kinds that the forcing layer can potentially target are included:
+Only decision kinds that the forcing layer can potentially target are included, without
+`parallel`:
 
 ```text
-scan, index, parallel, join, outer
+scan, index, join, outer
 ```
 
 An `index` counts only when the agent names one. A hint without an index lets
@@ -192,8 +186,11 @@ If the agent plan contains no force-eligible decisions, the rate is `not_applica
 and should be reported as `N/A`, not as 0% or 100%.
 
 `force_plan()` also returns `realization_gaps()`. The gaps should be listed alongside
-this rate because they explain exactly which requested scan, parallelism, join-method
-or outer-side decisions were not reproduced. When calculating the rate, count
+this rate because they explain exactly which requested scan, join-method or outer-side
+decisions were not reproduced. `force_plan()` still reports `parallel` gaps, so that
+forcing is checked against every hint, but the rate and its listed gaps leave them
+out. Between its tries, `force_plan()` keeps the one with the fewest gaps the rate
+counts, and uses parallel gaps only to break a tie. When calculating the rate, count
 unmatched decisions requested by `A`; a new decision that appears only in `R` is useful
 diagnostic information but is not itself an agent request or realization gap.
 
@@ -282,7 +279,7 @@ asked for from those PostgreSQL introduced while planning the hinted query.
 
 ```python
 comparison = compare_plans(postgres_plan, realized_agent_plan)
-realized_difference = comparison.all_kinds.difference
+realized_difference = comparison.difference
 ```
 
 `evaluate_plans(postgres_plan, agent_plan, forcing_outcome)` composes this comparison
@@ -298,9 +295,9 @@ the realized plan keep?
 
 ### Definition
 
-Let `F(A)` be the force-eligible decisions requested by the agent. The agent's intended
-differences are those whose choice differs from PostgreSQL's normal plan, including a
-decision `P` does not have:
+Let `F(A)` be the force-eligible decisions requested by the agent, without `parallel`.
+The agent's intended differences are those whose choice differs from PostgreSQL's normal
+plan, including a decision `P` does not have:
 
 ```text
 Intended(P, A) = {d in F(A) where A_d differs from P_d}
@@ -313,7 +310,7 @@ Choices are compared with the same equality rule as the other metrics. A decisio
 realized exactly when it is not a realization gap.
 
 If the agent agrees with PostgreSQL on every force-eligible decision, the rate is
-`not_applicable`. If forcing fails, it is `unavailable`, with the number of intended
+`not_applicable`. This includes a query whose only disagreement is parallelism. If forcing fails, it is `unavailable`, with the number of intended
 differences still known as its denominator.
 
 ### Reasoning
@@ -365,70 +362,51 @@ This does **not** mean that the agent closely agreed with PostgreSQL. It means t
 agent proposed a different plan, much of that proposal could not be realized, and
 PostgreSQL's corrections made the final plan resemble its normal plan.
 
-## Aggregating results across a workload
+## Reporting a workload
 
-Report the three metrics for every query before producing workload-level summaries.
-For the overall workload, use the arithmetic mean of the per-query rates:
+Report the four metrics for every query, as fractions, in one table. Do not average
+them across queries. The queries are not a sample of a wider population, and a rate
+over 2 decisions and a rate over 20 measure different things, so neither a mean of the
+rates nor a pooled fraction has a clear meaning.
 
-```text
-MacroAverage = sum(per-query rate) / number of queries with a defined rate
-```
+Across the workload, report counts instead, each over the queries that reached that
+stage:
 
-This gives every query equal importance. A single large query with many joins should
-not dominate all smaller queries merely because it produces more decisions.
+- queries with a usable agent plan, how many on the first answer, and which had none
+  after three answers;
+- queries where the agent proposed the same plan as PostgreSQL (proposed difference
+  0), and where the realized plan is the same (realized difference 0);
+- agent plans that were forced, out of those tried; and
+- parallel plans among PostgreSQL's, the agent's and the realized plans.
 
-The report may additionally include a micro-average calculated from the total
-numerators and denominators across all queries. If it is included, label it clearly:
+Failures are counted, not dropped. Excluding them would bias the results in the
+agent's favour.
 
-```text
-MicroAverage = sum(different decisions) / sum(all compared decisions)
-```
+## Parallelism is reported separately
 
-Always report the number of successful agent plans, failed agent plans and plans that
-could not be forced. Excluding failures without reporting them would bias the results
-in the agent's favour.
+One choice, to run a query in parallel or not, changes the `parallel` decision of every
+scan and adds or removes a `gather` decision; a Gather in a different place counts at
+both places. Hints can force which scans are parallel but cannot fix where the Gather
+goes. In earlier TPC-H runs, PostgreSQL planned 14 of the 22 queries in parallel and
+the agent 2 to 7 of them, depending on the run. Counted as decisions, parallelism would
+dominate every rate. A parallel hash join and the same join run serially would be 3/7
+different, though every scan and join matches.
 
-## Recommended result breakdown
+The four metrics therefore leave out the `parallel` and `gather` kinds, and each plan
+gets one flag instead: `is_parallel()` in `comparison.py` is true when any node of the
+plan, subqueries and InitPlans included, is a Gather or Gather Merge. PostgreSQL runs
+parallel workers only below one of these, and the agent's plans are validated to do
+the same, so the flag means the same for `P`, `A` and `R`. It describes the plan, not
+how many workers start when the query runs.
 
-In addition to the overall rates, differences should be grouped by decision kind:
+The workload summary shows the three flags for each query next to its execution-time
+ratio, and counts the parallel plans of each kind over the queries that have one, such
+as `PostgreSQL 14/22, agent 3/20, realized 3/19`, together with how many queries'
+realized plan did not follow the agent's choice. `differences()` still lists the
+`parallel` and `gather` decisions, so they remain visible for a single query.
 
-- scan method and index;
-- parallel versus serial scan;
-- join method;
-- join order and outer side;
-- aggregation strategy;
-- Gather placement;
-- sorting and other operators.
-
-This breakdown explains *why* two plans differ. An overall percentage alone cannot
-distinguish one major join-order change from several smaller scan choices.
-
-### Core structural difference rate
-
-Report the proposed and realized difference rates both with all decision kinds and
-with `parallel` and `gather` removed from their comparison universes:
-
-```text
-CoreUniverse(X, Y)
-    = {d in U(X, Y) where d.kind not in {parallel, gather}}
-
-CoreDifference(X, Y)
-    = different decisions in CoreUniverse(X, Y) / |CoreUniverse(X, Y)|
-```
-
-The all-kinds rate remains the official overall rate. The core rate is a diagnostic
-view motivated by how parallelism is represented:
-
-- one serial-versus-parallel strategy can create one `parallel` difference per scan;
-- moving a Gather creates two keyed differences, one at the old location and one at
-  the new location; and
-- hints can force which scans are parallel, but cannot fix the exact Gather location
-  or whether PostgreSQL uses Gather or Gather Merge.
-
-Do not silently remove these decisions. Show the all-kinds rate, core rate and
-parallelism category together. In the documented TPC-H runs, PostgreSQL planned 14 of
-22 queries in parallel while the agent planned only 2 to 7, depending on the run, so
-this distinction may materially affect the results.
+Only the parallelism decisions are left out. A choice that parallelism makes more
+likely, such as a different join method, still counts as that kind of difference.
 
 ## Structured result contract
 
@@ -440,21 +418,14 @@ the CLI or GUI.
 
 ## Reproducibility records
 
-Agent answers vary between calls, so every evaluated query should retain enough
-information to reconstruct its result. Save at least:
-
-- the original and `unique_aliases()`-rewritten SQL;
-- model name, effort setting and relevant prompt/version identifier;
-- the raw `AgentResult.answer`, summary and `attempts`;
-- the validated agent `PlanNode`;
-- PostgreSQL's normal plan and the realized hinted plan;
-- the generated hints, selected forcing attempt and realization gaps;
-- PostgreSQL version, database scale, indexes and relevant planner settings; and
-- all metric numerators, denominators, rates and per-kind breakdowns.
-
-Saving only the final percentages is insufficient because another model call may
-produce a different plan. Failed agent calls and plans that cannot be forced must also
-remain in the experiment record.
+Agent answers vary between calls, so every evaluated query keeps enough to reconstruct
+its result: the original and rewritten SQL, the agent's model and a hash of its prompt,
+the database description it saw (PostgreSQL version, sizes, indexes and settings), every
+answer it gave, the three plans, and the selected hints. The realization gaps and
+metrics are recomputed from these, not saved. Saving only the final percentages is
+insufficient because another model call may produce a different plan. Failed agent
+calls and plans that cannot be forced also stay in the record.
+[experiments.md](experiments.md) describes the record.
 
 ## Limitations
 
@@ -499,11 +470,13 @@ conditions, filters or group keys in full. This avoids treating formatting diffe
 as semantic differences, but it can miss an incorrect or incomplete expression in an
 agent plan.
 
-### Worker counts are not compared
+### Parallelism is only a flag
 
-The metric records whether a scan is parallel or serial and whether a Gather exists,
-but it does not compare the exact number of planned workers. Plans with different
-degrees of parallelism can therefore appear equal on this dimension.
+The rates leave parallelism out, and the flag records only whether a plan runs in
+parallel: not which parts, where the Gather is, or how many workers it plans. Two
+parallel plans therefore look the same on this dimension. The effect on speed still
+shows in the execution-time ratio, though that ratio mixes every difference between
+the plans.
 
 ### Some operators are folded or omitted
 

@@ -570,7 +570,6 @@ def test_agent_gives_up_after_max_attempts() -> None:
     with pytest.raises(AgentPlanError) as caught:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, max_attempts=2)
 
-    assert caught.value.answer == "still no plan"
     assert [attempt.response for attempt in caught.value.attempts] == [
         "no plan", "still no plan"
     ]
@@ -581,10 +580,20 @@ def test_agent_gives_up_after_max_attempts() -> None:
 def test_cut_off_answer_raises() -> None:
     client = FakeClient("{", stop_reason="max_tokens")
 
-    with pytest.raises(AgentError, match="max_tokens") as caught:
+    with pytest.raises(AgentPlanError, match="max_tokens") as caught:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert [attempt.response for attempt in caught.value.attempts] == ["{"]
+
+
+def test_refusal_is_an_unusable_answer() -> None:
+    client = FakeClient("I cannot help with that.", stop_reason="refusal")
+
+    with pytest.raises(AgentPlanError, match="declined") as caught:
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
+
+    assert [attempt.response for attempt in caught.value.attempts] == ["I cannot help with that."]
+    assert len(client.requests) == 1
 
 
 def test_request_failure_preserves_completed_prior_attempts() -> None:

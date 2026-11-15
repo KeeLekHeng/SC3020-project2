@@ -6,7 +6,7 @@ from pathlib import Path
 # workload project.py --experiments runs.
 TPCH = {
     path.stem: path.read_text(encoding="utf-8").strip()
-    for path in (Path(__file__).resolve().parents[1] / "queries").glob("Q*.sql")
+    for path in sorted((Path(__file__).resolve().parents[1] / "queries").glob("Q*.sql"))
 }
 
 # Shapes that each broke forcing at some point, keyed by what they exercise.

@@ -1,109 +1,56 @@
 # Stored plan-metric experiments
 
-Each query sample produces one versioned JSON `RunRecord`. Raw plans and the selected
-forcing outcome are the source of truth: metric percentages are recomputed when the
-record is loaded. The main sections are:
+`python project.py --experiments` runs each query in the workload once and saves one
+JSON `RunRecord` per query as `agent_runs/<experiment>/<UTC start time>.json`. A run is
+saved however far it got. The stored plans are the source of truth: the metrics are
+recomputed from them when a record is loaded, never stored. `RunRecord` in `project.py`
+defines the fields:
 
-- `identity`: experiment, run, query, sample and timestamp;
-- `provenance`: schema version, Git commit and dirty-worktree flag;
-- `planner` and `measurement`: material request and timing configuration;
-- `database`: PostgreSQL version, exact planner-visible description, and validation
-  index map;
-- `evidence`: SQL, textual planner attempts, available P/A/R plans, selected forcing
-  outcome and measured times;
-- `analyst`: optional advisory status and assessments; and
-- top-level status plus failure stage and reason for incomplete attempts.
+- `identity`: experiment, run, query and start time;
+- `provenance`: record format version, git commit (none outside a git checkout), agent
+  model and a hash of its system prompt, so runs from different code or prompts are
+  not mixed;
+- `evidence`: the SQL, the database description the agent saw, PostgreSQL's plan, the
+  agent's plan and every answer it gave, the forcing outcome, and the timings;
+- `failure_stage` and `failure_reason`: both empty for a completed run; otherwise
+  `postgres_plan`, `agent_plan` (no usable plan), `agent_request` (the API request
+  failed), `forcing` or `timing`, and why; and
+- `analyst`: the optional advice below.
 
-Credentials are never fields in the schema. A dirty Git flag makes clear that the
-commit alone does not identify every local code change.
+An existing file is never overwritten.
 
-By default, each run uses its UTC start time as its identifier and filename, for
-example `agent_runs/report-workload/2026-11-14_15-20-30.123456Z.json`.
-Callers may supply an explicit run identifier instead. An identifier that already
-exists raises `FileExistsError`; an earlier file is never overwritten. Existing records
-with older identifiers remain loadable.
+## Advisory analyst
 
-## Advisory analyst boundary
+When enabled, one Haiku call receives every realization gap of the run, parallel ones
+included, with the three plans stripped of costs and times. Its suggested cause for each
+gap is stored in the run's `analyst` section as an AI-generated second opinion.
+`not_requested` means analysis was off; `completed` holds one assessment per gap, or
+none when there was no gap and no call was made; `unavailable` and `invalid_response`
+give the reason.
 
-When enabled, one fresh Haiku conversation receives every realization gap for the run.
-The response is stored inside that run's `analyst` section as an AI-generated second
-opinion. Requested analysis records its model, prompt version and token limit.
-`not_requested` means analysis was disabled; `completed` holds zero or more assessments;
-`unavailable` and `invalid_response` include a readable failure reason. Zero-gap runs
-complete with no assessments and make no model call.
+The same Haiku model proposed the plan, so its explanation is not independent ground
+truth. It never feeds the metrics.
 
-The same Haiku model family may have proposed and analysed the plan, so its explanation
-is not independent ground truth. Analyst fields are never inputs to deterministic
-metric recomputation.
+## Workload summary
 
-## Minimal failed-run example
+`summarise_workload()` returns one row per query, recomputed from the stored runs:
 
-```json
-{
-  "identity": {
-    "experiment_id": "report-workload",
-    "run_id": "q1-s1",
-    "query_name": "Q1",
-    "sample": 1,
-    "created_at": "2026-11-14T12:00:00Z"
-  },
-  "provenance": {
-    "schema_version": 1,
-    "git_commit": "abc123",
-    "git_dirty": false
-  },
-  "planner": {
-    "model": "claude-haiku-5-5",
-    "prompt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "max_tokens": 64000,
-    "first_effort": "low",
-    "retry_effort": "medium",
-    "max_attempts": 3
-  },
-  "measurement": {
-    "timeout_ms": 60000,
-    "warmup_runs": 1,
-    "measured_runs": 1
-  },
-  "database": null,
-  "evidence": {
-    "original_sql": "SELECT * FROM orders",
-    "rewritten_sql": "SELECT * FROM orders",
-    "postgres_plan": null,
-    "agent_plan": null,
-    "agent_attempts": [],
-    "forcing": null,
-    "timing": null
-  },
-  "status": "failed",
-  "failure_stage": "postgres_plan",
-  "failure_reason": "PostgreSQL was unavailable",
-  "analyst": {
-    "status": "not_requested",
-    "assessments": [],
-    "reason": null
-  }
-}
-```
+- **Rates:** the four metrics as fractions. A rate that is undefined or unavailable
+  is shown as N/A, never as zero. There is no average across queries;
+  [docs/metrics.md](metrics.md#reporting-a-workload) gives the workload counts printed
+  instead.
+- **Agent answers:** for each query that reached the agent, how many answers it gave,
+  out of three. A query whose third answer is still unusable fails at `agent_plan` and
+  is listed as having no usable plan; a refusal or a cut-off answer counts as unusable
+  and ends the attempts. A failed API request fails at `agent_request` and counts
+  towards neither.
+- **Execution time:** each plan runs once to warm the cache and then three times; the
+  stored time is the mean of the three. Each row gives the agent-plan time over
+  PostgreSQL's, or none when either timed out.
+- **Parallelism:** the rates leave out parallel and gather decisions. Each query's
+  PostgreSQL, agent and realized plans get a parallel flag instead, true when the plan
+  has a Gather or Gather Merge; a plan the run never produced has none.
+  [docs/metrics.md](metrics.md#parallelism-is-reported-separately) gives the reasons.
 
-## Aggregation
-
-Defined sample rates are averaged within each query before the workload macro-average.
-The separately labelled micro-average pools raw numerators and denominators, so runs
-with more decisions carry more weight. Undefined and failed runs are counted beside
-both results. Execution time uses `realized_ms / postgres_ms` per run and the median
-ratio for repeated samples of one query; it has no pooled workload average.
-
-## JSON-compatible consumer contract
-
-The public boundary consists of Pydantic-validated JSON rather than manual serializers
-on in-memory plan or comparison classes:
-
-- `RunRecord.model_dump_json()` and `RunRecord.model_validate_json()` exchange raw run
-  evidence and the separately labelled `analyst` section; `evaluation_from_run()`
-  recomputes its `PlanEvaluation`; and
-- `WorkloadSummary.model_dump_json()` and `model_validate_json()` exchange macro/micro
-  values, inclusion counts, exclusion reasons, and per-query timing medians.
-
-A GUI or report reader can load these records without connecting to PostgreSQL or
-calling either model. Summary JSON can always be regenerated from compatible raw runs.
+A GUI or report reader can load the records and recompute the summary without
+connecting to PostgreSQL or calling either model.

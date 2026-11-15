@@ -26,9 +26,9 @@ def test_live_pipeline_produces_three_metrics_and_details(
 
     evaluation = evaluate_plans(postgres, postgres, outcome)
 
-    assert evaluation.proposed.all_kinds.difference.status is MetricStatus.DEFINED
+    assert evaluation.proposed.difference.status is MetricStatus.DEFINED
     assert evaluation.realizability.score.status is MetricStatus.DEFINED
-    assert evaluation.realized.all_kinds.difference.status is MetricStatus.DEFINED
+    assert evaluation.realized.difference.status is MetricStatus.DEFINED
     assert isinstance(evaluation.proposed.differences, tuple)
     assert isinstance(evaluation.realized.differences, tuple)
 

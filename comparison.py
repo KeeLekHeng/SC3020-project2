@@ -32,6 +32,11 @@ FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
 # Decision kinds that build_hints() can force; realization_gaps() checks only these.
 FORCED_KINDS = {"scan", "index", "parallel", "join", "outer"}
 
+# Decision kinds the rates leave out. One choice to run in parallel or not changes the
+# parallel decision of every scan, and hints cannot fix where a Gather goes, so these
+# would swamp the rates; is_parallel() reports the choice once per plan instead.
+PARALLEL_KINDS = {"parallel", "gather"}
+
 # The index choice of an index scan that names no index, as an agent plan may. A hint
 # cannot force it, so it is never a request, but it differs from any named index.
 UNSPECIFIED = "unspecified"
@@ -97,49 +102,13 @@ class MetricScore:
 
 
 @dataclass(frozen=True)
-class ComparisonView:
-    """Matching and different counts for one decision universe; None if unobservable."""
-
-    matching: int | None
-    different: int | None
-    total: int | None
-    difference: MetricScore
-    similarity: MetricScore
-
-
-@dataclass(frozen=True)
-class KindComparison:
-    """A pairwise comparison restricted to one decision kind."""
-
-    kind: str
-    view: ComparisonView
-
-
-@dataclass(frozen=True)
-class DecisionMatch:
-    """A decision present with equivalent choices in both plans."""
-
-    decision: Decision
-    a: Choice
-    b: Choice
-
-
-@dataclass(frozen=True)
-class DecisionChoice:
-    """One decision and choice, used in realizability detail lists."""
-
-    decision: Decision
-    choice: Choice
-
-
-@dataclass(frozen=True)
 class PlanComparison:
-    """All-kinds, core, per-kind, and detailed comparison of two plans."""
+    """
+    How two plans differ, outside PARALLEL_KINDS: the difference rate, and the decisions
+    behind it.
+    """
 
-    all_kinds: ComparisonView
-    core: ComparisonView
-    by_kind: tuple[KindComparison, ...]
-    matches: tuple[DecisionMatch, ...]
+    difference: MetricScore
     differences: tuple[Difference, ...]
 
 
@@ -163,18 +132,28 @@ class ForcingFailure:
 
 @dataclass(frozen=True)
 class RealizabilityResult:
-    """How many force-eligible agent requests appear in the realized plan."""
+    """How many force-eligible agent requests outside PARALLEL_KINDS the realized plan kept."""
 
     score: MetricScore
-    reproduced: tuple[DecisionChoice, ...]
-    extra: tuple[DecisionChoice, ...]
     # The requested force-eligible decisions not reproduced, from the forcing outcome.
     gaps: tuple[Difference, ...]
 
 
 @dataclass(frozen=True)
 class PlanEvaluation:
-    """The plan comparisons, realizability and intended-difference realization."""
+    """
+    The four metrics for one query, all leaving out PARALLEL_KINDS. P is PostgreSQL's
+    plan, A the agent's, and R the plan PostgreSQL chose when forced with A's hints.
+
+    - proposed.difference: decisions where A differs from P, over the decisions in
+      either plan. Lower means A is closer to P.
+    - realizability.score: A's force-eligible requests that R kept, over A's requests.
+      Higher means forcing reproduced more of A.
+    - realized.difference: decisions where R differs from P, over the decisions in
+      either plan. Lower means R is closer to P.
+    - intended: of A's force-eligible requests that differ from P, those R kept.
+      Higher means more of the agent's deliberate changes took effect.
+    """
 
     proposed: PlanComparison
     realizability: RealizabilityResult
@@ -265,36 +244,27 @@ def decisions(plan: PlanNode) -> dict[Decision, Choice]:
 
 
 def compare_plans(a: PlanNode, b: PlanNode) -> PlanComparison:
-    """Compare any two plans over the union of their semantic decision keys."""
+    """Compare two plans over the union of their decisions outside PARALLEL_KINDS."""
     found_a, found_b = decisions(a), decisions(b)
-    # An index is compared only when both plans scan the table through one, so a
-    # different scan method counts once, as scan, and not again as index.
-    same = {
-        decision: choices_equal(found_a.get(decision), found_b.get(decision))
-        for decision in sorted(found_a.keys() | found_b.keys())
-        if decision.kind != "index" or (decision in found_a and decision in found_b)
-    }
-
-    matches = tuple(
-        DecisionMatch(decision, found_a[decision], found_b[decision])
-        for decision, equal in same.items()
-        if equal
-    )
+    same = _rated(_compared(found_a, found_b))
     found_differences = tuple(
         Difference(decision, found_a.get(decision), found_b.get(decision))
         for decision, equal in same.items()
         if not equal
     )
-    all_kinds = _comparison_view(list(same.values()))
-    core = _comparison_view(
-        [equal for d, equal in same.items() if d.kind not in {"parallel", "gather"}]
+    difference = _rate(
+        len(found_differences), len(same), "The plans have no decisions to compare."
     )
-    by_kind = tuple(
-        KindComparison(kind, _comparison_view([e for d, e in same.items() if d.kind == kind]))
-        for kind in sorted({decision.kind for decision in same})
-    )
+    return PlanComparison(difference, found_differences)
 
-    return PlanComparison(all_kinds, core, by_kind, matches, found_differences)
+
+def is_parallel(plan: PlanNode) -> bool:
+    """
+    Whether any part of plan, subqueries included, runs in parallel. PostgreSQL runs
+    parallel workers only below a Gather or Gather Merge, and the agent's plans are
+    validated to do the same.
+    """
+    return any(node.node_type in GATHER for node in plan.walk())
 
 
 def realizability(
@@ -305,39 +275,21 @@ def realizability(
     Measure reproduced force-eligible requests without claiming hint causality.
 
     outcome must come from forcing requested_plan: its gaps are the unreproduced requests.
+    Decisions in PARALLEL_KINDS are left out.
     """
-    requested = _requests(requested_plan)
+    requested = _rated(_requests(requested_plan))
 
     if isinstance(outcome, ForcingFailure):
-        score = MetricScore(
-            None,
-            len(requested),
-            None,
-            MetricStatus.UNAVAILABLE,
-            outcome.reason,
-        )
-        return RealizabilityResult(score, (), (), ())
+        score = MetricScore(None, len(requested), None, MetricStatus.UNAVAILABLE, outcome.reason)
+        return RealizabilityResult(score, ())
 
-    realized = _requests(outcome.plan)
-    gap_keys = {gap.decision for gap in outcome.gaps}
-    reproduced_keys = [d for d in sorted(requested) if d not in gap_keys]
-    extra_keys = sorted(realized.keys() - requested.keys())
+    gaps = tuple(gap for gap in outcome.gaps if gap.decision.kind not in PARALLEL_KINDS)
     score = _rate(
-        len(reproduced_keys),
+        len(requested) - len(gaps),
         len(requested),
         "The agent requested no force-eligible decisions.",
     )
-
-    return RealizabilityResult(
-        score=score,
-        reproduced=tuple(
-            DecisionChoice(decision, requested[decision]) for decision in reproduced_keys
-        ),
-        extra=tuple(
-            DecisionChoice(decision, realized[decision]) for decision in extra_keys
-        ),
-        gaps=outcome.gaps,
-    )
+    return RealizabilityResult(score, gaps)
 
 
 def evaluate_plans(
@@ -349,10 +301,10 @@ def evaluate_plans(
     proposed = compare_plans(postgres_plan, agent_plan)
     result = realizability(agent_plan, outcome)
     postgres = decisions(postgres_plan)
-    requested = _requests(agent_plan)
+    requested = _rated(_requests(agent_plan))
     # Unlike the general pairwise metric, count every explicit forceable request here,
-    # including a named index that PostgreSQL's plan does not have. IDRR asks whether
-    # the agent's intended requests survived, not how many structural differences to
+    # including a named index that PostgreSQL's plan does not have. This metric asks
+    # whether the agent's intended requests survived, not how many structural differences to
     # display without double-counting one access-method change.
     disagreements = [
         decision
@@ -361,15 +313,17 @@ def evaluate_plans(
     ]
 
     if isinstance(outcome, ForcingFailure):
-        realized = _unavailable_comparison(outcome.reason)
+        realized = PlanComparison(
+            MetricScore(None, None, None, MetricStatus.UNAVAILABLE, outcome.reason), ()
+        )
         intended = MetricScore(
             None, len(disagreements), None, MetricStatus.UNAVAILABLE, outcome.reason
         )
     else:
         realized = compare_plans(postgres_plan, outcome.plan)
-        reproduced = {item.decision for item in result.reproduced}
+        missed = {gap.decision for gap in result.gaps}
         intended = _rate(
-            sum(decision in reproduced for decision in disagreements),
+            sum(decision not in missed for decision in disagreements),
             len(disagreements),
             "The agent chose like PostgreSQL on every force-eligible decision.",
         )
@@ -378,8 +332,16 @@ def evaluate_plans(
 
 
 def differences(a: PlanNode, b: PlanNode) -> list[Difference]:
-    """Return every decision plans a and b made differently, sorted by decision."""
-    return list(compare_plans(a, b).differences)
+    """
+    Return every decision plans a and b made differently, sorted by decision, including
+    the PARALLEL_KINDS that compare_plans() leaves out.
+    """
+    found_a, found_b = decisions(a), decisions(b)
+    return [
+        Difference(decision, found_a.get(decision), found_b.get(decision))
+        for decision, equal in _compared(found_a, found_b).items()
+        if not equal
+    ]
 
 
 def realization_gaps(requested: PlanNode, forced: PlanNode) -> list[Difference]:
@@ -413,17 +375,20 @@ def force_plan(
     Force plan on PostgreSQL and return the selected try: its hints, the plan chosen,
     the realization gaps and its retry settings.
 
-    Some hints backfire: a switch-off of an operator plan needs but does not show, and
-    a Leading hint over an anti join made from a LEFT JOIN, which build_hints() cannot
-    tell apart (see its limitations). So while the forced plan has gaps, this tries
-    again without switch-offs, then with switch-offs but without Leading hints, and
-    returns the result with the fewest gaps; a tie keeps the earlier try.
+    Two kinds of hint can backfire: switching off an operator that the plan needs
+    without showing it, such as a Materialize, and a Leading hint over an anti join
+    made from a LEFT JOIN, which build_hints() cannot tell apart (see its limitations).
+    So while the forced plan has gaps, this tries again without switch-offs, then with
+    switch-offs but without Leading hints, and
+    returns the result with the fewest gaps outside PARALLEL_KINDS, which the rates
+    count; fewer gaps overall, then the earlier try, break a tie.
 
     Raises ValueError when build_hints() refuses the plan, and
     psycopg.errors.UndefinedFile or InsufficientPrivilege when pg_hint_plan cannot be
     loaded (see get_postgres_plan()).
     """
     best: ForcePlanResult | None = None
+    best_rank = (0, 0)
 
     for switch_offs, leading in ((True, True), (False, True), (True, False)):
         hints = build_hints(plan, query, switch_offs, leading)
@@ -436,8 +401,9 @@ def force_plan(
             switch_offs=switch_offs,
             leading=leading,
         )
-        if best is None or len(candidate.gaps) < len(best.gaps):
-            best = candidate
+        rank = (sum(gap.decision.kind not in PARALLEL_KINDS for gap in gaps), len(gaps))
+        if best is None or rank < best_rank:
+            best, best_rank = candidate, rank
 
         if not gaps:
             break
@@ -502,21 +468,21 @@ def _rate(numerator: int, denominator: int, empty: str) -> MetricScore:
     return MetricScore(numerator, denominator, numerator / denominator, MetricStatus.DEFINED)
 
 
-def _comparison_view(same: list[bool]) -> ComparisonView:
-    """Counts and rates for a decision universe, given whether each decision matched."""
-    total, matching = len(same), sum(same)
-    different = total - matching
-    empty = "The plans have no decisions to compare."
-    return ComparisonView(
-        matching,
-        different,
-        total,
-        _rate(different, total, empty),
-        _rate(matching, total, empty),
-    )
+def _compared(a: dict[Decision, Choice], b: dict[Decision, Choice]) -> dict[Decision, bool]:
+    """Whether two plans' decisions match, for every decision either plan has."""
+    # An index is compared only when both plans scan the table through one, so a
+    # different scan method counts once, as scan, and not again as index.
+    return {
+        decision: choices_equal(a.get(decision), b.get(decision))
+        for decision in sorted(a.keys() | b.keys())
+        if decision.kind != "index" or (decision in a and decision in b)
+    }
 
 
-def _unavailable_comparison(reason: str) -> PlanComparison:
-    score = MetricScore(None, None, None, MetricStatus.UNAVAILABLE, reason)
-    view = ComparisonView(None, None, None, score, score)
-    return PlanComparison(view, view, (), (), ())
+def _rated[T](found: dict[Decision, T]) -> dict[Decision, T]:
+    """found without the decisions in PARALLEL_KINDS, which the rates leave out."""
+    return {
+        decision: value
+        for decision, value in found.items()
+        if decision.kind not in PARALLEL_KINDS
+    }
