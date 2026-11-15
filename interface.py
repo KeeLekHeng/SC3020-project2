@@ -331,9 +331,24 @@ def show_run(run: RunRecord, experiment_id: str) -> None:
     for column, (label, value, definition) in zip(st.columns(4), timing):
         column.metric(label, value, help=definition)
     if summary.timed_out:
+        slow = " and ".join(
+            name for name, ms in (("P", run.postgres_ms), ("R", run.realized_ms)) if ms is None
+        )
         st.warning(
-            f"A plan ran longer than {timeout_s} s and was stopped, so its time and the "
+            f"{slow} ran longer than {timeout_s} s and was stopped, so its time and the "
             "time ratio are unknown."
+        )
+    flags = [value for value in summary.parallel if value is not None]
+    if len(set(flags)) > 1:
+        st.info(
+            "The plans differ in running in parallel: "
+            + ", ".join(
+                f"{name} {'is' if value else 'is not'}"
+                for name, value in zip("PAR", summary.parallel)
+                if value is not None
+            )
+            + ". The rates and the marks leave parallelism out, but it can explain much "
+            "of a difference in time."
         )
 
     realized = run.forcing.realized_plan if run.forcing else None
@@ -371,7 +386,7 @@ def show_run(run: RunRecord, experiment_id: str) -> None:
 
     if evaluation and numbered:
         gap_decisions = {d.decision for d in evaluation.realizability.gaps}
-        st.markdown("**Decisions that differ**")
+        st.markdown("**Decisions that differ between P, A and R**")
         st.caption(
             "#: the number on the nodes above. —: the plan has no such decision. "
             "✗: the agent asked for it, R did not keep it."
@@ -385,21 +400,33 @@ def show_run(run: RunRecord, experiment_id: str) -> None:
                         name: str(plan_found[decision]) if decision in plan_found else "—"
                         for name, plan_found in zip("PAR", found)
                     },
-                    "gap": "✗" if decision in gap_decisions else "",
+                    "not kept by R": "✗" if decision in gap_decisions else "",
                 }
                 for decision, number in sorted(
                     numbered.items(), key=lambda item: (item[1], item[0])
                 )
             ],
             hide_index=True,
+            height="content",
         )
 
     if run.forcing:
         with st.expander("pg_hint_plan hints"):
+            st.caption(
+                "The hints that produced R. Forcing tries up to three sets, with and "
+                "without join order and planner switch-offs, and keeps the one whose "
+                "plan missed the fewest requests, so a request marked *not kept by R* "
+                "may have no hint here."
+            )
             st.code(run.forcing.hints or "(none)", wrap_lines=True)
     # The analyst is only called when forcing missed a request, so most runs have none.
     if run.analyst.reason:
-        st.warning(f"The analyst could not explain the missed requests: {run.analyst.reason}")
+        st.warning(
+            "The analyst's answer was invalid, so no explanations are shown."
+            if run.analyst.status == "invalid_response"
+            else "The analyst could not be reached, so no explanations are shown."
+        )
+        st.expander("Analyst error details").code(run.analyst.reason, wrap_lines=True)
     if run.analyst.assessments:
         with st.expander("Analyst: why R missed requests"):
             st.caption(
