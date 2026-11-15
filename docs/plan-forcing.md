@@ -64,8 +64,8 @@ The plan as printed does not mark parallel scans. In this plan the scan of `orde
 `force_plan()` forces a plan: it calls `build_hints()` and then `get_postgres_plan()` with the hints. It returns a `ForcePlanResult`: the hints, the plan PostgreSQL built with them, the gaps, and which retry was chosen.
 
 1. `decisions()` reduces a plan to its planner decisions, such as `scan(orders): Seq Scan` and `join(customer, orders): Hash Join`.
-2. `realization_gaps()` compares the requested force-eligible decisions with the plan PostgreSQL built. A **gap** is a requested decision whose choice is missing or different in the realized plan. A force-eligible decision that appears only in the realized plan is an extra diagnostic, not a gap. The force-eligible kinds are the scan method, the index when the requested plan names one, parallel or serial, the join method, and the outer side. Join order needs no kind of its own: a join is named by the set of tables it joins, so a different order gives different joins. The worker count is not checked.
-3. Some hints can backfire. So while there are gaps, `force_plan()` tries again without the switch-offs, then with the switch-offs but without `Leading` hints. It returns the try with the fewest gaps.
+2. `realization_gaps()` compares the requested force-eligible decisions with the plan PostgreSQL built. A **gap** is a requested decision whose choice is missing or different in the realized plan. A decision that appears only in the realized plan is not a gap. The force-eligible kinds are the scan method, the index when the requested plan names one, parallel or serial, the join method, and the outer side. Join order needs no kind of its own: a join is named by the set of tables it joins, so a different order gives different joins. The worker count is not checked.
+3. Some hints can backfire. So while there are gaps, `force_plan()` tries again without the switch-offs, then with the switch-offs but without `Leading` hints. It returns the try with the fewest gaps outside parallelism, which the metrics leave out; parallel gaps only break a tie.
 
 A plan with no gaps is **fully followed**. `build_hints()` refuses a plan it cannot write hints for, with a `ValueError`: a table name used twice that the rewrite could not separate, an alias the query does not have, or an alias that contains `/*`, which would open a comment inside the hint.
 
@@ -73,7 +73,7 @@ A plan with no gaps is **fully followed**. `build_hints()` refuses a plan it can
 
 `differences(a, b)` lists every decision that two plans made differently. The project compares PostgreSQL's plan with the plan PostgreSQL built from the agent's hints. Both must be for the same query text, the one from `unique_aliases()`, because decisions are matched by alias.
 
-Each difference gives the decision and the two choices. A choice is missing when only one plan has that decision, such as a Sort that the other plan does not need. These are 5 of the 16 differences `project.py` printed for TPC-H Q5 in one run:
+Each difference gives the decision and the two choices. A choice is missing when only one plan has that decision, such as a Sort that the other plan does not need. These are 5 of the 16 differences `differences()` found for TPC-H Q5 in one run:
 
 ```text
 - scan(lineitem): PostgreSQL Index Scan, agent Seq Scan

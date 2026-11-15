@@ -1,6 +1,6 @@
 # SC3020-project2
 
-Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For each query, `project.py --experiments` gets PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, compares the plans, saves the run, and aggregates the comparison metrics over the workload. The data is TPC-H. The GUI is separate work.
+Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For each query, `project.py --experiments` gets PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, compares the plans, times them, and saves the run. It prints the comparison metrics for each query and counts across the workload. The data is TPC-H. The GUI is separate work.
 
 ## Requirements
 
@@ -107,7 +107,7 @@ A run over all 22 queries costs 3 to 4 US cents.
 
 ### Notes for the comparison and GUI work
 
-- PostgreSQL plans 14 of the 22 queries in parallel; the agent chose parallel plans for 2 to 7, depending on the run. The metrics leave `parallel` and `gather` decisions out and report one parallel flag per plan instead; [docs/metrics.md](docs/metrics.md#parallelism-is-reported-separately) says why. [Comparing two plans](docs/plan-forcing.md#comparing-two-plans) says how each kind of decision is counted.
+- PostgreSQL plans most TPC-H queries in parallel and the agent few. The metrics leave `parallel` and `gather` decisions out and report one parallel flag per plan instead; [docs/metrics.md](docs/metrics.md#parallelism-is-reported-separately) says why. [Comparing two plans](docs/plan-forcing.md#comparing-two-plans) says how each kind of decision is counted.
 - PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; count only followed decisions as the agent's. [docs/plan-forcing.md](docs/plan-forcing.md) says what hints fix, what they cannot, and how gaps are found.
 - The agent can only write plans that hints can force, and the comparison is uneven in several ways. [docs/agent-plan.md](docs/agent-plan.md) lists what the agent cannot express and how fair the comparison is.
 - When `get_agent_plan()` raises, show it as a failed agent plan, as `project.py --experiments` records it. The retry loop can run out of answers.
@@ -127,9 +127,11 @@ py -m pytest
 | `tests/test_hints.py` | Hint building, the alias rewrite and plan comparison. | Nothing. |
 | `tests/test_forcing.py` | Forcing PostgreSQL's own plan for TPC-H Q1–Q22, for query shapes that are hard to force and for a few edited plans, such as swapped join sides; every forced decision must be followed. | The database with `pg_hint_plan`. |
 | `tests/test_agent.py` | The agent's answer validation, the prompt, the database description and the retry loop with a fake client. | No API key; the database for the description tests. |
-| `tests/test_experiments.py` | Versioned run storage, offline recomputation, aggregation, timing summaries and advisory analysis with fake clients. | Nothing. |
+| `tests/test_metrics.py` | The four comparison metrics, parallelism left out of them, and how `force_plan()` chooses between its tries. | Nothing. |
+| `tests/test_experiments.py` | Run storage in JSON Lines, each stage of collecting a run, the per-query summary and the advisory analyst, with fake clients. | Nothing. |
+| `tests/test_project.py` | The `--experiments` command line and the timing helper. | The database for two timing tests. |
 
-Tests that need the database are skipped when it is unavailable. All use `EXPLAIN` only, so no query runs.
+Tests that need the database are skipped when it is unavailable. Apart from the two timing tests, which run small queries with `EXPLAIN ANALYZE`, all use `EXPLAIN` only.
 
 ## Project files
 
@@ -144,6 +146,7 @@ Tests that need the database are skipped when it is unavailable. All use `EXPLAI
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
 | `docs/plan-forcing.md` | The hints that force a plan, how a forced plan is checked, how well forcing works, and what cannot be forced. |
 | `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |
-| `docs/experiments.md` | The run schema, analyst boundary, aggregation rules and JSON consumer contract. |
+| `docs/metrics.md` | The four comparison metrics, why parallelism is reported separately, how to report a workload, and the limits of the comparison. |
+| `docs/experiments.md` | The run record, the advisory analyst and the per-query summary. |
 | `tests/` | The tests above; `tests/fixtures/` holds a sample query and an agent answer for it. |
 | `agent_runs/` | Not in git: one JSON Lines file per experiment, one run record per line, with the plans, the agent's answers, the forcing outcome, the timings and the analyst's advice. |
