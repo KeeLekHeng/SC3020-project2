@@ -1,6 +1,6 @@
 """
-Entry point. python project.py --experiments runs every query in queries/ and saves each
-run under agent_runs/. Run records, their aggregation and the advisory analyst live here
+Entry point. python project.py --experiments runs every query in queries/ and saves the
+runs to agent_runs/<experiment>.jsonl. Run records, their aggregation and the advisory analyst live here
 too.
 """
 
@@ -11,10 +11,8 @@ from datetime import UTC, datetime
 from getpass import getpass
 from hashlib import sha256
 import json
-import os
 from pathlib import Path
 import subprocess
-import tempfile
 from statistics import fmean
 from typing import Any, Literal, NamedTuple, get_args
 
@@ -79,10 +77,8 @@ FailureStage = Literal["postgres_plan", "agent_plan", "agent_request", "forcing"
 
 
 class RunIdentity(RecordModel):
-    # Both name a folder and a file under agent_runs/, so they are limited to safe
-    # characters.
+    # Names the file agent_runs/<experiment_id>.jsonl, so it is limited to safe characters.
     experiment_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
-    run_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
     query_name: str
     created_at: datetime
 
@@ -160,7 +156,7 @@ class AnalystResult(RecordModel):
 
 
 class RunRecord(RecordModel):
-    """One query's run, saved as agent_runs/<experiment_id>/<run_id>.json."""
+    """One query's run, saved as one line of agent_runs/<experiment_id>.jsonl."""
 
     identity: RunIdentity
     provenance: RunProvenance
@@ -284,41 +280,28 @@ def run_analyst(client: anthropic.Anthropic, run: RunRecord) -> AnalystResult:
 
 
 def write_run(run: RunRecord, root: Path = AGENT_RUNS) -> Path:
-    """Atomically create one JSON run file without replacing an existing run."""
+    """Append run as one line of its experiment's file, agent_runs/<experiment>.jsonl."""
 
-    directory = root / run.identity.experiment_id
-    directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / f"{run.identity.run_id}.json"
-    payload = run.model_dump_json(indent=2).encode("utf-8") + b"\n"
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=f".{run.identity.run_id}.", suffix=".tmp", dir=directory,
-            delete=False,
-        ) as output:
-            temporary = Path(output.name)
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        # A hard link publishes the complete bytes atomically and fails if another run
-        # already owns this identifier. The temporary name is then discarded.
-        os.link(temporary, destination)
-        return destination
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def load_run(path: Path) -> RunRecord:
-    """Load and validate one run record."""
-
-    return RunRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{run.identity.experiment_id}.jsonl"
+    with path.open("a", encoding="utf-8") as experiment:
+        experiment.write(run.model_dump_json() + "\n")
+    return path
 
 
 def load_experiment(experiment_id: str, root: Path = AGENT_RUNS) -> list[RunRecord]:
-    """Load all stored runs for an experiment in stable path order."""
+    """Load an experiment's runs in the order they were saved."""
 
-    return [load_run(path) for path in sorted((root / experiment_id).glob("*.json"))]
+    lines = (root / f"{experiment_id}.jsonl").read_text(encoding="utf-8").splitlines()
+    runs = []
+    for number, line in enumerate(lines, 1):
+        try:
+            runs.append(RunRecord.model_validate_json(line))
+        except ValidationError:
+            # Only the last line may be broken: a run cut off by a crash mid-write.
+            if number < len(lines):
+                raise
+    return runs
 
 
 def evaluation_from_run(run: RunRecord) -> PlanEvaluation | None:
@@ -468,7 +451,6 @@ def collect_run(
     created_at = datetime.now(UTC)
     identity = RunIdentity(
         experiment_id=experiment_id,
-        run_id=created_at.strftime("%Y-%m-%d_%H-%M-%S.%fZ"),
         query_name=query_name,
         created_at=created_at,
     )
@@ -573,7 +555,7 @@ def collect_run(
 
 def run_experiments(connection: psycopg.Connection, queries: dict[str, str]) -> None:
     """
-    Run each query once, save each run under agent_runs/, and print one row per query
+    Run each query once, save the runs to one experiment file, and print one row per query
     and the workload counts. The analyst explains any realization gaps.
     """
     client = anthropic.Anthropic(api_key=api_key())
@@ -620,7 +602,7 @@ def run_experiments(connection: psycopg.Connection, queries: dict[str, str]) -> 
     answered = [row for row in rows if row.answers is not None]
     usable = [row for row in answered if row.failure_stage != "agent_plan"]
     unusable = [query for query, row in summary.items() if row.failure_stage == "agent_plan"]
-    print(f"\nSaved {len(runs)} run(s) under agent_runs/{experiment_id}/")
+    print(f"\nSaved {len(runs)} run(s) to agent_runs/{experiment_id}.jsonl")
     print(
         f"Usable agent plans: {len(usable)}/{len(answered)}, "
         f"{sum(row.answers == 1 for row in usable)} on the first answer"
@@ -667,7 +649,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--experiments",
         action="store_true",
-        help="run every query in queries/ and save each run under agent_runs/",
+        help="run every query in queries/ and save the runs to agent_runs/<start time>.jsonl",
     )
     parser.add_argument(
         "-q",

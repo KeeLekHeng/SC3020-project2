@@ -33,7 +33,6 @@ from project import (
     collect_run,
     evaluation_from_run,
     load_experiment,
-    load_run,
     run_analyst,
     summarise_workload,
     write_run,
@@ -74,7 +73,6 @@ def record(
     return RunRecord(
         identity=RunIdentity(
             experiment_id="experiment",
-            run_id=query,
             query_name=query,
             created_at=datetime(2026, 11, 15, tzinfo=UTC),
         ),
@@ -133,16 +131,29 @@ def advice_for(run: RunRecord) -> FakeAnalystClient:
 # Stored runs
 
 
-def test_run_json_round_trips_and_is_never_replaced(tmp_path: Path) -> None:
-    run = record()
+def test_runs_are_appended_to_their_experiment_file(tmp_path: Path) -> None:
+    runs = [record("Q1"), record("Q2", agent=None, failure_stage="agent_plan")]
 
-    path = write_run(run, tmp_path)
+    paths = {write_run(run, tmp_path) for run in runs}
 
-    assert path == tmp_path / "experiment" / "Q1.json"
-    assert load_run(path) == run
-    with pytest.raises(FileExistsError):
-        write_run(run, tmp_path)
-    assert list(path.parent.glob("*.tmp")) == []
+    assert paths == {tmp_path / "experiment.jsonl"}
+    assert load_experiment("experiment", tmp_path) == runs
+
+
+def test_a_run_cut_off_mid_write_is_left_out(tmp_path: Path) -> None:
+    path = write_run(record("Q1"), tmp_path)
+    with path.open("a", encoding="utf-8") as experiment:
+        experiment.write(record("Q2").model_dump_json()[:40])
+
+    assert load_experiment("experiment", tmp_path) == [record("Q1")]
+
+
+def test_a_broken_line_before_the_last_is_an_error(tmp_path: Path) -> None:
+    path = tmp_path / "experiment.jsonl"
+    path.write_text("not json\n" + record().model_dump_json() + "\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_experiment("experiment", tmp_path)
 
 
 def test_evaluation_is_recomputed_from_the_stored_plans() -> None:

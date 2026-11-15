@@ -49,7 +49,7 @@ Enter your PostgreSQL password when prompted. Change these settings in `project.
 | User | `postgres` |
 | Connection timeout | 10 seconds |
 
-This runs every query in `queries/` (TPC-H Q1–Q22; add more as `.sql` files), or only those named with `-q`/`--queries`, such as `-q Q1 Q6`, once each, and saves one JSON record per query under `agent_runs/<UTC start time>/`. For each query, it gets PostgreSQL's plan, asks the agent for its plan (up to three answers), forces that plan, times both plans with `EXPLAIN ANALYZE` as the mean of three runs after a warm-up, and asks the Haiku analyst about any decision PostgreSQL did not follow. It prints one row per query, with its status, the agent's answer count, the four metrics as fractions, whether each plan runs in parallel and the time ratio, then the workload counts: usable agent plans, plans the same as PostgreSQL's, plans forced and parallel plans. This step needs the Anthropic API key. [docs/plan-forcing.md](docs/plan-forcing.md) describes the hints and what they cannot force; [docs/experiments.md](docs/experiments.md) describes the records and the summary.
+This runs every query in `queries/` (TPC-H Q1–Q22; add more as `.sql` files), or only those named with `-q`/`--queries`, such as `-q Q1 Q6`, once each, and saves one JSON record per query as a line of `agent_runs/<UTC start time>.jsonl`. For each query, it gets PostgreSQL's plan, asks the agent for its plan (up to three answers), forces that plan, times both plans with `EXPLAIN ANALYZE` as the mean of three runs after a warm-up, and asks the Haiku analyst about any decision PostgreSQL did not follow. It prints one row per query, with its status, the agent's answer count, the four metrics as fractions, whether each plan runs in parallel and the time ratio, then the workload counts: usable agent plans, plans the same as PostgreSQL's, plans forced and parallel plans. This step needs the Anthropic API key. [docs/plan-forcing.md](docs/plan-forcing.md) describes the hints and what they cannot force; [docs/experiments.md](docs/experiments.md) describes the records and the summary.
 
 ## Get the AI agent's plan
 
@@ -146,4 +146,4 @@ Tests that need the database are skipped when it is unavailable. All use `EXPLAI
 | `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |
 | `docs/experiments.md` | The run schema, analyst boundary, aggregation rules and JSON consumer contract. |
 | `tests/` | The tests above; `tests/fixtures/` holds a sample query and an agent answer for it. |
-| `agent_runs/` | Not in git: versioned raw run records, including plans, attempts, selected forcing evidence, timings and optional analyst feedback. |
+| `agent_runs/` | Not in git: one JSON Lines file per experiment, one run record per line, with the plans, the agent's answers, the forcing outcome, the timings and the analyst's advice. |
