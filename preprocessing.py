@@ -943,6 +943,10 @@ def _hint_name(name: str) -> str:
 
 # Model that proposes the agent's plan; its key comes from api_key().
 AGENT_MODEL = "claude-haiku-5-5"
+AGENT_MAX_TOKENS = 64_000
+AGENT_MAX_ATTEMPTS = 3
+AGENT_FIRST_EFFORT = "low"
+AGENT_RETRY_EFFORT = "medium"
 
 # Operators the agent may use. All are PostgreSQL names, so the agent's plan, the
 # PostgreSQL plan and the hinted plan share one vocabulary. Every scan and join here can
@@ -1158,19 +1162,40 @@ class AgentAnswer(BaseModel):
         return PlanNode.model_validate(nodes[self.nodes[0].id])
 
 
+class AgentAttempt(BaseModel):
+    """One textual model response and the validation problems sent back for it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    response: str
+    validation_problems: tuple[str, ...] = ()
+
+
 class AgentPlanError(ValueError):
     """
     The agent's answer is unusable.
 
     errors lists every problem found, worded so they can go back to the agent in one
-    retry message; answer is the agent's raw text.
+    retry message. attempts holds every answer when ask_agent() gives up; the last one
+    is the answer these errors are about.
     """
 
-    def __init__(self, errors: list[str], answer: str = "") -> None:
+    def __init__(self, errors: list[str], attempts: tuple[AgentAttempt, ...] = ()) -> None:
         self.errors = errors
-        self.answer = answer
+        self.attempts = attempts
         problems = "\n".join(f"- {e}" for e in errors)
         super().__init__(f"The agent's plan is invalid:\n{problems}")
+
+
+class AgentError(RuntimeError):
+    """
+    An API request to the agent failed. attempts holds the answers completed before it
+    stopped.
+    """
+
+    def __init__(self, message: str, attempts: tuple[AgentAttempt, ...]) -> None:
+        self.attempts = attempts
+        super().__init__(message)
 
 
 class DatabaseDescription(NamedTuple):
@@ -1187,15 +1212,14 @@ class AgentResult(NamedTuple):
 
     query is the text the agent planned, after unique_aliases(). Plan the PostgreSQL
     side and force the agent's plan with this text, because the plan's aliases refer to
-    it. answer is the agent's raw final answer. problems lists, for each rejected answer
-    before it, the errors sent back, so there were len(problems) + 1 answers.
+    it. attempts holds every answer in order with the problems sent back for it; the
+    last one is the accepted answer.
     """
 
     plan: PlanNode
     summary: str
     query: str
-    answer: str
-    problems: list[list[str]]
+    attempts: tuple[AgentAttempt, ...]
 
 
 def validate_agent_plan(output: str) -> AgentAnswer:
@@ -1218,14 +1242,13 @@ def validate_agent_plan(output: str) -> AgentAnswer:
                 f"The answer is not valid JSON: {error}. Write one operator per line, "
                 "and check that every { and [ is closed in order."
             ],
-            output,
         ) from None
 
     try:
         answer = AgentAnswer.model_validate(data)
     except ValidationError as error:
         raise AgentPlanError(
-            [_format_error(e, data) for e in error.errors(include_url=False)], output
+            [_format_error(e, data) for e in error.errors(include_url=False)]
         ) from None
 
     errors: list[str] = []
@@ -1248,7 +1271,7 @@ def validate_agent_plan(output: str) -> AgentAnswer:
         earlier.add(node.id)
 
     if errors:
-        raise AgentPlanError(errors, output)
+        raise AgentPlanError(errors)
 
     children: dict[int, list[AgentPlanNode]] = {node.id: [] for node in answer.nodes}
     for node in answer.nodes:
@@ -1263,7 +1286,7 @@ def validate_agent_plan(output: str) -> AgentAnswer:
 
     _check_agent_node(root, children, {}, False, errors)
     if errors:
-        raise AgentPlanError(errors, output)
+        raise AgentPlanError(errors)
 
     return answer
 
@@ -1498,7 +1521,7 @@ def ask_agent(
     client: anthropic.Anthropic,
     query: str,
     database: DatabaseDescription,
-    max_attempts: int = 3,
+    max_attempts: int = AGENT_MAX_ATTEMPTS,
 ) -> AgentResult:
     """
     Run the conversation with the agent until it gives a usable plan.
@@ -1511,8 +1534,9 @@ def ask_agent(
     The first answer is asked for at low effort (how hard the model thinks), any retry
     at medium.
 
-    Raises AgentPlanError with the last answer's problems when no answer is usable, and
-    RuntimeError when the model declines or its answer is cut off.
+    Raises AgentPlanError with the last answer's problems when no answer is usable,
+    including when the model declines or its answer is cut off, and AgentError when an
+    API request fails.
     """
     system: list[anthropic.types.TextBlockParam] = [{
         "type": "text",
@@ -1520,32 +1544,39 @@ def ask_agent(
         "cache_control": {"type": "ephemeral"},
     }]
     messages: list[Any] = [{"role": "user", "content": agent_user_prompt(query, database)}]
-    problems: list[list[str]] = []
+    attempts: list[AgentAttempt] = []
     errors: list[str] = []
-    text = ""
 
     for attempt in range(1, max_attempts + 1):
         # Streaming avoids HTTP timeouts on long answers.
-        with client.messages.stream(
-            model=AGENT_MODEL,
-            max_tokens=64000,
-            system=system,
-            messages=messages,
-            output_config={"effort": "low" if attempt == 1 else "medium"},
-        ) as stream:
-            response = stream.get_final_message()
-
-        if response.stop_reason == "refusal":
-            category = response.stop_details.category if response.stop_details else None
-            raise RuntimeError(f"The model declined to plan the query ({category}).")
-
-        if response.stop_reason == "max_tokens":
-            raise RuntimeError("The agent's answer was cut off at max_tokens.")
+        try:
+            with client.messages.stream(
+                model=AGENT_MODEL,
+                max_tokens=AGENT_MAX_TOKENS,
+                system=system,
+                messages=messages,
+                output_config={
+                    "effort": AGENT_FIRST_EFFORT if attempt == 1 else AGENT_RETRY_EFFORT
+                },
+            ) as stream:
+                response = stream.get_final_message()
+        except anthropic.AnthropicError as error:
+            raise AgentError(str(error), tuple(attempts)) from error
 
         text = "".join(
             block.text for block in response.content
             if isinstance(block, anthropic.types.TextBlock)
         )
+        # A refusal or a cut-off answer is an unusable answer, but not worth a retry.
+        stopped = {
+            "refusal": "The model declined to plan the query"
+            f" ({response.stop_details.category if response.stop_details else None}).",
+            "max_tokens": "The agent's answer was cut off at max_tokens.",
+        }.get(response.stop_reason or "")
+        if stopped:
+            attempts.append(AgentAttempt(response=text, validation_problems=(stopped,)))
+            raise AgentPlanError([stopped], tuple(attempts))
+
         try:
             answer = validate_agent_plan(text)
             plan = answer.to_plan_node()
@@ -1553,10 +1584,11 @@ def ask_agent(
         except AgentPlanError as error:
             errors = error.errors
 
-        if not errors:
-            return AgentResult(plan, answer.summary, query, text, problems)
+        attempts.append(AgentAttempt(response=text, validation_problems=tuple(errors)))
 
-        problems.append(errors)
+        if not errors:
+            return AgentResult(plan, answer.summary, query, tuple(attempts))
+
         listed = "\n".join(f"- {error}" for error in errors)
         retry = (
             f"Your plan cannot be used yet:\n{listed}\n\n"
@@ -1569,7 +1601,7 @@ def ask_agent(
             {"role": "user", "content": retry},
         ]
 
-    raise AgentPlanError(errors, text)
+    raise AgentPlanError(errors, tuple(attempts))
 
 
 def _agent_database_errors(

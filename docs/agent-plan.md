@@ -165,4 +165,4 @@ Where it is still uneven:
 - **The agent is a small model thinking briefly.** A larger model or more effort may plan better.
 - **Answers vary.** The same query can get a different plan on the next call.
 - **The forced plan is partly PostgreSQL's.** When a plan is forced, PostgreSQL still applies its own changes, such as the two index scans for `min()` and `max()`. A decision counts as the agent's only if it is a forced kind and `force_plan()` does not report it as a gap.
-- **Plan quality is not measured yet.** The checks show that a plan is well formed and can be turned into hints. They do not show that it is fast. That needs the run times of both plans from `EXPLAIN ANALYZE`, and that timing comparison is not built.
+- **Plan quality is measured only by run time.** The checks show that a plan is well formed and can be turned into hints, not that it is fast. `python project.py --experiments` times PostgreSQL's plan and the forced agent plan with `EXPLAIN ANALYZE` and reports the ratio, which mixes every difference between the two plans; [the experiments document](experiments.md#workload-summary) describes the timing.

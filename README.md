@@ -1,6 +1,6 @@
 # SC3020-project2
 
-Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For one query, `project.py` prints PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, and lists the decisions the two plans made differently. The data is TPC-H. The GUI and the difference rate are not built yet.
+Compare PostgreSQL's execution plan for a query with a plan proposed by an AI agent, Claude Haiku 5.5. For each query, `project.py --experiments` gets PostgreSQL's plan, asks the agent for its own plan, forces that plan onto PostgreSQL with `pg_hint_plan` hints, compares the plans, times them, and saves the run. It prints the comparison metrics for each query and counts across the workload. The data is TPC-H. The GUI is separate work.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Compare PostgreSQL's execution plan for a query with a plan proposed by an AI ag
 
 ## Load the database
 
-`data/` holds the eight generated TPC-H `.tbl` files. The Docker command above creates the empty `tpch` database; without Docker, create it yourself. Then from the project root run:
+`data/` holds the eight TPC-H `.tbl` files, generated at scale factor 0.1 (about 100 MB; `lineitem` has 600,572 rows). TPC-H Q1–Q22 in `queries/` are `qgen -d -s 0.1` output: the default parameters, with intervals and Q15's view rewritten for PostgreSQL. The Docker command above creates the empty `tpch` database; without Docker, create it yourself. Then from the project root run:
 
 ```powershell
 py prepare_data.py
@@ -33,12 +33,10 @@ Enter your PostgreSQL password when prompted. The script requires exactly eight 
 
 The load is one transaction, so a failure leaves no tables behind. If the tables already exist, the script stops; drop them or recreate the database first.
 
-## Run the pipeline on a query
-
-Save one SQL query in `query.sql`, without an `EXPLAIN` prefix. The current one counts each customer's orders from `1995-01-01` onward. From the project root, run:
+## Run the experiment workload
 
 ```powershell
-py project.py
+py project.py --experiments
 ```
 
 Enter your PostgreSQL password when prompted. Change these settings in `project.py` if your setup differs:
@@ -51,13 +49,7 @@ Enter your PostgreSQL password when prompted. Change these settings in `project.
 | User | `postgres` |
 | Connection timeout | 10 seconds |
 
-`project.py` reads `query.sql` over a read-only connection and prints PostgreSQL's plan as an indented tree. Hints cannot tell two uses of one table name apart, so if the query reads a name more than once, it first gives each later use its own alias, such as `lineitem2`, and prints the rewritten query. It then runs three steps:
-
-1. **Round-trip check.** It forces PostgreSQL's own plan with `pg_hint_plan` hints, prints the hints and the plan PostgreSQL chose with them, and reports any forced decision PostgreSQL did not follow.
-2. **The agent's plan.** It asks the AI agent for its plan, prints the plan and the agent's strategy, and forces that plan the same way. This step needs the Anthropic API key and costs a fraction of a US cent per query.
-3. **The differences.** It lists every decision that PostgreSQL's plan and the agent's forced plan made differently, as `differences()` reports them.
-
-[docs/plan-forcing.md](docs/plan-forcing.md) describes the hints and what they cannot force. If `pg_hint_plan` cannot be loaded, no API key is set, or the agent gives no usable plan, the script says so and stops there. It uses `EXPLAIN` without `ANALYZE`, so the query does not run.
+This runs every query in `queries/` (TPC-H Q1–Q22 and the handwritten H1–H3; add more as `.sql` files), or only those named with `-q`/`--queries`, such as `-q Q1 Q6`, once each, and saves one JSON record per query as a line of `agent_runs/<UTC start time>.jsonl`. For each query, it gets PostgreSQL's plan, asks the agent for its plan (up to three answers), forces that plan, times both plans with `EXPLAIN ANALYZE` as the mean of three runs after a warm-up, and asks the Haiku analyst about any decision PostgreSQL did not follow. It prints one row per query, with its status, the agent's answer count, the four metrics as fractions, whether each plan runs in parallel and the time ratio, then the workload counts: usable agent plans, plans the same as PostgreSQL's, plans forced and parallel plans. This step needs the Anthropic API key. [docs/plan-forcing.md](docs/plan-forcing.md) describes the hints and what they cannot force; [docs/experiments.md](docs/experiments.md) describes the records and the summary.
 
 ## Get the AI agent's plan
 
@@ -80,10 +72,9 @@ Plan and force with `result.query`, the query after `unique_aliases()`, because 
 | `plan` | The agent's plan as a `PlanNode` tree. Each node's `reason` holds the agent's one-line reason for it. |
 | `summary` | One or two sentences on the agent's overall strategy. |
 | `query` | The query the agent planned. |
-| `answer` | The agent's raw JSON answer. |
-| `problems` | The errors sent back for each rejected answer, so `len(problems) + 1` answers were needed. |
+| `attempts` | Every answer in order, each with the problems sent back for it; the last is the accepted answer. |
 
-It raises `AgentPlanError`, with `.errors` and the raw `.answer`, when no answer is usable, and `RuntimeError` when the model declines or its answer is cut off. Errors from the Anthropic SDK, such as a missing API key or a rate limit, pass through. Answers vary from call to call, so save `result.answer` when a run must be repeatable.
+It raises `AgentPlanError`, with `.errors`, when no answer is usable, including when the model declines or its answer is cut off, and `AgentError` when an API request fails, such as on a rate limit. Both carry the answers so far in `.attempts`. A missing API key raises the Anthropic SDK's error. Answers vary from call to call, so save `result.attempts` when a run must be repeatable.
 
 ### How it works
 
@@ -99,7 +90,7 @@ The agent never sees PostgreSQL's plan or estimates, and its answer is not check
 4. **The checks.** `validate_agent_plan()` checks the answer, then `ask_agent()` checks it against the query and the database. [The format document](docs/agent-plan.md#how-an-answer-is-checked) lists the checks.
 5. **Retries.** All problems go back to the agent in one message, for up to three answers: the first at `low` effort, the rest at `medium`.
 
-### Results on TPC-H Q1–Q22
+### Results on TPC-H Q1–Q22 at scale factor 0.1
 
 One run on 2026-11-11 with the Docker database:
 
@@ -116,10 +107,10 @@ A run over all 22 queries costs 3 to 4 US cents.
 
 ### Notes for the comparison and GUI work
 
-- PostgreSQL plans 14 of the 22 queries in parallel; the agent chose parallel plans for 2 to 7, depending on the run. Expect `parallel` and `gather` differences in most of those queries, and consider reporting the difference rate with and without them. [Comparing two plans](docs/plan-forcing.md#comparing-two-plans) says how each kind of decision is counted, and why one choice can show as several differences.
+- PostgreSQL plans most TPC-H queries in parallel and the agent few. The metrics leave `parallel` and `gather` decisions out and report one parallel flag per plan instead; [docs/metrics.md](docs/metrics.md#parallelism-is-reported-separately) says why. [Comparing two plans](docs/plan-forcing.md#comparing-two-plans) says how each kind of decision is counted.
 - PostgreSQL cannot follow every agent decision. `force_plan()` reports the ones it did not follow as gaps; count only followed decisions as the agent's. [docs/plan-forcing.md](docs/plan-forcing.md) says what hints fix, what they cannot, and how gaps are found.
 - The agent can only write plans that hints can force, and the comparison is uneven in several ways. [docs/agent-plan.md](docs/agent-plan.md) lists what the agent cannot express and how fair the comparison is.
-- When `get_agent_plan()` raises, show it as a failed agent plan, as `project.py` does. The retry loop can run out of answers.
+- When `get_agent_plan()` raises, show it as a failed agent plan, as `project.py --experiments` records it. The retry loop can run out of answers.
 
 ## Run the tests
 
@@ -136,8 +127,11 @@ py -m pytest
 | `tests/test_hints.py` | Hint building, the alias rewrite and plan comparison. | Nothing. |
 | `tests/test_forcing.py` | Forcing PostgreSQL's own plan for TPC-H Q1–Q22, for query shapes that are hard to force and for a few edited plans, such as swapped join sides; every forced decision must be followed. | The database with `pg_hint_plan`. |
 | `tests/test_agent.py` | The agent's answer validation, the prompt, the database description and the retry loop with a fake client. | No API key; the database for the description tests. |
+| `tests/test_metrics.py` | The four comparison metrics, parallelism left out of them, and how `force_plan()` chooses between its tries. | Nothing. |
+| `tests/test_experiments.py` | Run storage in JSON Lines, each stage of collecting a run, the per-query summary and the advisory analyst, with fake clients. | Nothing. |
+| `tests/test_project.py` | The `--experiments` command line and the timing helper. | The database for two timing tests. |
 
-Tests that need the database are skipped when it is unavailable. All use `EXPLAIN` only, so no query runs.
+Tests that need the database are skipped when it is unavailable. Apart from the two timing tests, which run small queries with `EXPLAIN ANALYZE`, all use `EXPLAIN` only.
 
 ## Project files
 
@@ -146,11 +140,13 @@ Tests that need the database are skipped when it is unavailable. All use `EXPLAI
 | `data/*.tbl` | Source TPC-H table data. |
 | `prepare_data.py` | Converts the source data to CSV files in `data_clean/` and loads the database. |
 | `schema.sql` | Creates the eight database tables. |
-| `query.sql` | The query the pipeline runs on; edit this file to change the input. |
-| `project.py` | Prompts for the password and runs the pipeline on `query.sql`: PostgreSQL's plan, the same plan forced back as a check, the agent's plan, that plan forced, and the decisions the two made differently. |
+| `queries/` | The experiment workload, one query per `.sql` file; the file name is the query name. `Q1`–`Q22` are TPC-H; `H1`–`H3` are handwritten, each with a comment on what it exercises. |
+| `project.py` | The entry point. `--experiments` prompts for the password, runs the workload, stores one JSON record per query, and summarises the metrics. It also holds the record format and the advisory Haiku analyst. |
 | `preprocessing.py` | `PlanNode`, the plan form shared by every plan source. `get_postgres_plan()` runs `EXPLAIN`, optionally with `ANALYZE` or hints. `unique_aliases()` gives each reused table name its own alias. `build_hints()` turns a plan into `pg_hint_plan` hints. `get_agent_plan()` asks the AI agent for its plan, described by `describe_database()` and checked by `validate_agent_plan()`. |
 | `comparison.py` | `decisions()` lists a plan's planner decisions; `differences()` compares two plans; `force_plan()` forces a plan on PostgreSQL and reports, through `realization_gaps()`, the forced decisions it did not follow. |
 | `docs/plan-forcing.md` | The hints that force a plan, how a forced plan is checked, how well forcing works, and what cannot be forced. |
 | `docs/agent-plan.md` | The agent's plan format, the formats that were tried, and the limits of the format and the comparison. |
-| `tests/` | The tests above; `tests/fixtures/` holds a sample agent answer. |
-| `agent_runs/` | Not in git: raw agent answers and rendered prompts from local runs. |
+| `docs/metrics.md` | The four comparison metrics, why parallelism is reported separately, how to report a workload, and the limits of the comparison. |
+| `docs/experiments.md` | The run record, the advisory analyst and the per-query summary. |
+| `tests/` | The tests above; `tests/fixtures/` holds a sample query and an agent answer for it. |
+| `agent_runs/` | Not in git: one JSON Lines file per experiment, one run record per line, with the plans, the agent's answers, the forcing outcome, the timings and the analyst's advice. |

@@ -551,11 +551,13 @@ def test_finalize_aggregate_ignores_a_partial_stage_of_another_aggregate() -> No
     assert str(decisions(finalize)[Decision("aggregate", ("l", "o"))]) == "Hashed"
 
 
-def test_only_scans_match_any_index() -> None:
-    plain = PlanNode(node_type="Sort", sort_keys=("x",), children=(scan("o", "orders"),))
-    longer = plain.model_copy(update={"sort_keys": ("x on y",)})
+def test_sorts_match_however_their_keys_are_written() -> None:
+    postgres = PlanNode(
+        node_type="Sort", sort_keys=("o_orderdate",), children=(scan("o", "orders"),)
+    )
+    agent = postgres.model_copy(update={"sort_keys": ("o.o_orderdate",)})
 
-    assert [str(d.decision) for d in differences(plain, longer)] == ["sort(o)"]
+    assert differences(postgres, agent) == []
 
 
 def test_partial_aggregate_strategy_is_compared() -> None:

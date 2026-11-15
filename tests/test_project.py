@@ -1,28 +1,15 @@
-"""Command-line consumption of structured comparison results."""
-
-from types import SimpleNamespace
+"""The project.py entry point and its timing helper."""
 
 import psycopg
 import pytest
 
 import project
-from comparison import ForcePlanResult, ForcingFailure, realization_gaps
 from preprocessing import PlanNode
+from tests.test_experiments import record
 
 
 def scan(alias: str, node_type: str = "Seq Scan") -> PlanNode:
     return PlanNode(node_type=node_type, alias=alias, relation=alias)
-
-
-def outcome(plan: PlanNode, requested: PlanNode | None = None) -> ForcePlanResult:
-    requested = requested or plan
-    return ForcePlanResult(
-        hints="SeqScan(o)",
-        plan=plan,
-        gaps=tuple(realization_gaps(requested, plan)),
-        switch_offs=True,
-        leading=True,
-    )
 
 
 class FakeConnection:
@@ -34,84 +21,57 @@ class FakeConnection:
     def __exit__(self, *_args: object) -> None:
         pass
 
+
+class TimedConnection:
+    def __init__(self) -> None:
+        self.statements: list[bytes] = []
+
+    def execute(self, statement: bytes) -> None:
+        self.statements.append(statement)
+
     def rollback(self) -> None:
-        pass
+        self.statements.append(b"ROLLBACK")
 
 
-def test_show_forced_returns_all_selected_attempt_evidence(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    result = outcome(scan("o"))
-    monkeypatch.setattr(project, "force_plan", lambda *_args: result)
-
-    shown = project.show_forced(FakeConnection(), "SELECT 1", scan("o"))  # type: ignore[arg-type]
-
-    assert shown is result
-    assert isinstance(shown, ForcePlanResult)
-    assert "SeqScan(o)" in capsys.readouterr().out
-
-
-def test_show_forced_preserves_failure_reason(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def fail(*_args: object) -> ForcePlanResult:
-        raise ValueError("Cannot force this plan")
-
-    monkeypatch.setattr(project, "force_plan", fail)
-
-    shown = project.show_forced(FakeConnection(), "SELECT 1", scan("o"))  # type: ignore[arg-type]
-
-    assert shown == ForcingFailure("Cannot force this plan")
-    assert "Cannot force this plan" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("forcing_fails", [False, True])
-def test_main_prints_complete_or_partial_structured_metrics(
-    forcing_fails: bool,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    postgres = scan("o")
-    agent = scan("o", "Index Scan")
-    round_trip = outcome(postgres)
-    agent_outcome = (
-        ForcingFailure("pg_hint_plan unavailable")
-        if forcing_fails
-        else outcome(postgres, requested=agent)
-    )
-    shown = iter([round_trip, agent_outcome])
-
-    monkeypatch.setattr(project, "getpass", lambda *_args: "password")
-    monkeypatch.setattr(project.psycopg, "connect", lambda **_kwargs: FakeConnection())
-    monkeypatch.setattr(project, "get_postgres_plan", lambda *_args, **_kwargs: postgres)
-    monkeypatch.setattr(project, "api_key", lambda: "test-key")
+def test_execution_time_is_the_mean_after_a_warm_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    times = iter([999.0, 10.0, 20.0, 30.0])
     monkeypatch.setattr(
         project,
-        "get_agent_plan",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            plan=agent,
-            query="SELECT * FROM o",
-            problems=[],
-            summary="Use the index.",
-        ),
+        "get_postgres_plan",
+        lambda *_args, **_kwargs: PlanNode(node_type="Result", execution_time_ms=next(times)),
     )
-    monkeypatch.setattr(project, "show_forced", lambda *_args, **_kwargs: next(shown))
-    times = iter([100.0, 250.0])
-    monkeypatch.setattr(project, "execution_time", lambda *_args: next(times))
+    connection = TimedConnection()
 
-    project.main()
+    assert project.execution_time(connection, "SELECT 1") == 20.0  # type: ignore[arg-type]
+    assert connection.statements[-1] == b"RESET statement_timeout"
 
-    output = capsys.readouterr().out
-    assert "Proposed-plan difference: 1/2 decisions (50.0%)" in output
-    assert "scan(o): PostgreSQL Seq Scan, agent proposed Index Scan" in output
-    if forcing_fails:
-        assert "Plan realizability: N/A [unavailable]: pg_hint_plan unavailable" in output
-        assert "Realized-plan difference: N/A [unavailable]" in output
-    else:
-        assert "Plan realizability: 1/2 force-eligible decisions (50.0%)" in output
-        assert "Realized-plan difference: 0/2 decisions (0.0%)" in output
-        assert "PostgreSQL plan 100.0 ms, agent plan 250.0 ms" in output
-        assert "2.50x" in output
+
+def test_execution_time_without_a_reported_time_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        project, "get_postgres_plan", lambda *_args, **_kwargs: PlanNode(node_type="Result")
+    )
+
+    with pytest.raises(RuntimeError, match="no execution time"):
+        project.execution_time(TimedConnection(), "SELECT 1")  # type: ignore[arg-type]
+
+
+def test_execution_time_is_none_when_a_later_run_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs = iter([False, False, True])
+
+    def plan(*_args: object, **_kwargs: object) -> PlanNode:
+        if next(runs):
+            raise psycopg.errors.QueryCanceled()
+        return PlanNode(node_type="Result", execution_time_ms=10.0)
+
+    monkeypatch.setattr(project, "get_postgres_plan", plan)
+    connection = TimedConnection()
+
+    assert project.execution_time(connection, "SELECT 1") is None  # type: ignore[arg-type]
+    assert b"ROLLBACK" in connection.statements
 
 
 def test_execution_time_runs_the_query(connection: psycopg.Connection) -> None:
@@ -122,3 +82,43 @@ def test_execution_time_runs_the_query(connection: psycopg.Connection) -> None:
 
 def test_execution_time_is_none_past_the_timeout(connection: psycopg.Connection) -> None:
     assert project.execution_time(connection, "SELECT pg_sleep(1)", timeout_ms=10) is None
+
+
+def run_main(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list[str]:
+    """Run main() with a fake database, key and pipeline; return the queries it ran."""
+    ran: list[str] = []
+
+    def collect_run(*_args: object, query_name: str, **_kwargs: object) -> object:
+        ran.append(query_name)
+        return record(query_name, postgres_ms=100.0, realized_ms=100.0)
+
+    monkeypatch.setattr(project, "getpass", lambda *_args: "password")
+    monkeypatch.setattr(project.psycopg, "connect", lambda **_kwargs: FakeConnection())
+    monkeypatch.setattr(project, "api_key", lambda: "test-key")
+    monkeypatch.setattr(project, "collect_run", collect_run)
+    project.main(argv)
+    return ran
+
+
+def test_experiments_flag_runs_every_workload_query(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ran = run_main(monkeypatch, ["--experiments"])
+
+    assert ran == ["H1", "H2", "H3", *[f"Q{i}" for i in range(1, 23)]]
+    lines = capsys.readouterr().out.splitlines()
+    # The stored run: an Index Scan proposed, a Seq Scan realized, one answer.
+    q1 = next(line for line in lines if line.startswith("Q1 "))
+    assert q1.split() == ["Q1", "completed", "1", "1/1", "0/2", "0/1", "0/2", "no/no/no", "1.00x"]
+    assert "Usable agent plans: 25/25, 25 on the first answer" in lines
+    assert "Same plan as PostgreSQL, apart from parallelism: proposed 0/25, realized 25/25" in lines
+    assert "Plans forced: 25/25" in lines
+
+
+def test_queries_flag_runs_only_the_named_queries(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert run_main(monkeypatch, ["--experiments", "-q", "Q6", "Q1"]) == ["Q6", "Q1"]
+
+
+def test_unknown_query_stops_before_connecting() -> None:
+    with pytest.raises(SystemExit):
+        project.main(["--experiments", "-q", "Q99"])

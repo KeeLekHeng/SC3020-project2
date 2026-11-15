@@ -17,6 +17,7 @@ from preprocessing import (
     JOIN_HINTS,
     SCAN_HINTS,
     AgentNodeType,
+    AgentError,
     AgentPlanError,
     DatabaseDescription,
     PlanNode,
@@ -36,7 +37,7 @@ from preprocessing import (
 from tests.queries import TPCH
 
 FIXTURES = Path(__file__).parent / "fixtures"
-QUERY = (Path(__file__).parent.parent / "query.sql").read_text(encoding="utf-8")
+QUERY = (Path(__file__).parent / "fixtures" / "query.sql").read_text(encoding="utf-8")
 DATABASE = DatabaseDescription(
     "customer: ~15,000 rows, 361 pages\norders: ~150,000 rows, 2,648 pages",
     {"customer": {"customer_pkey"}, "orders": {"orders_pkey"}},
@@ -458,7 +459,9 @@ def test_user_prompt_lists_the_aliases_and_the_database() -> None:
 class FakeClient:
     """Stands in for anthropic.Anthropic: answers each request with the next reply."""
 
-    def __init__(self, *replies: str, stop_reason: str = "end_turn") -> None:
+    def __init__(
+        self, *replies: str | Exception, stop_reason: str = "end_turn"
+    ) -> None:
         self.replies = list(replies)
         self.stop_reason = stop_reason
         self.requests: list[dict[str, Any]] = []
@@ -475,9 +478,12 @@ class FakeClient:
         pass
 
     def get_final_message(self) -> SimpleNamespace:
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
         content = [
             anthropic.types.ThinkingBlock(type="thinking", thinking="", signature=""),
-            anthropic.types.TextBlock(type="text", text=self.replies.pop(0)),
+            anthropic.types.TextBlock(type="text", text=reply),
         ]
         return SimpleNamespace(
             content=content, stop_reason=self.stop_reason, stop_details=None
@@ -489,7 +495,9 @@ def test_good_first_answer_is_accepted() -> None:
 
     result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
-    assert result.problems == []
+    assert len(result.attempts) == 1
+    assert result.attempts[0].response == json.dumps(answer())
+    assert result.attempts[0].validation_problems == ()
     assert result.summary.startswith("Hash the filtered orders")
     assert result.plan.relations() == {"c", "o"}
 
@@ -506,7 +514,11 @@ def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
 
     result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
-    assert len(result.problems) == 1
+    assert [attempt.response for attempt in result.attempts] == [
+        json.dumps(bad), json.dumps(answer())
+    ]
+    assert result.attempts[0].validation_problems
+    assert result.attempts[1].validation_problems == ()
     assert [r["output_config"]["effort"] for r in client.requests] == ["low", "medium"]
     retry = client.requests[1]["messages"]
     assert [m["role"] for m in retry] == ["user", "assistant", "user"]
@@ -526,7 +538,7 @@ def test_plan_is_checked_against_the_query_and_not_postgresqls_plan() -> None:
 
     result = ask_agent(cast(anthropic.Anthropic, client), query, DATABASE)
 
-    assert result.problems == []
+    assert result.attempts[0].validation_problems == ()
 
 
 def test_unknown_index_goes_back_to_the_agent() -> None:
@@ -558,15 +570,40 @@ def test_agent_gives_up_after_max_attempts() -> None:
     with pytest.raises(AgentPlanError) as caught:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE, max_attempts=2)
 
-    assert caught.value.answer == "still no plan"
+    assert [attempt.response for attempt in caught.value.attempts] == [
+        "no plan", "still no plan"
+    ]
+    assert all(attempt.validation_problems for attempt in caught.value.attempts)
     assert len(client.requests) == 2
 
 
 def test_cut_off_answer_raises() -> None:
     client = FakeClient("{", stop_reason="max_tokens")
 
-    with pytest.raises(RuntimeError, match="max_tokens"):
+    with pytest.raises(AgentPlanError, match="max_tokens") as caught:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
+
+    assert [attempt.response for attempt in caught.value.attempts] == ["{"]
+
+
+def test_refusal_is_an_unusable_answer() -> None:
+    client = FakeClient("I cannot help with that.", stop_reason="refusal")
+
+    with pytest.raises(AgentPlanError, match="declined") as caught:
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
+
+    assert [attempt.response for attempt in caught.value.attempts] == ["I cannot help with that."]
+    assert len(client.requests) == 1
+
+
+def test_request_failure_preserves_completed_prior_attempts() -> None:
+    client = FakeClient("no plan", anthropic.AnthropicError("network failed"))
+
+    with pytest.raises(AgentError, match="network failed") as caught:
+        ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
+
+    assert [attempt.response for attempt in caught.value.attempts] == ["no plan"]
+    assert caught.value.attempts[0].validation_problems
 
 
 def test_database_description_reads_the_catalogs(connection: psycopg.Connection) -> None:
