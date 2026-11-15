@@ -12,8 +12,8 @@ venv/
 
 .pytest_cache/
 
-# Local agent runs and rendered prompts
-agent_runs/
+# Legacy local review records; current JSONL experiments are versioned
+agent_runs/live-pr2-review/
 
 # Local agent workflow files
 /.agents/

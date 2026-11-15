@@ -149,4 +149,4 @@ Tests that need the database are skipped when it is unavailable. Apart from the 
 | `docs/metrics.md` | The four comparison metrics, why parallelism is reported separately, how to report a workload, and the limits of the comparison. |
 | `docs/experiments.md` | The run record, the advisory analyst and the per-query summary. |
 | `tests/` | The tests above; `tests/fixtures/` holds a sample query and an agent answer for it. |
-| `agent_runs/` | Not in git: one JSON Lines file per experiment, one run record per line, with the plans, the agent's answers, the forcing outcome, the timings and the analyst's advice. |
+| `agent_runs/` | Versioned experiment evidence: one JSON Lines file per experiment, one run record per line, with the plans, the agent's answers, the forcing outcome, the timings and the analyst's advice. |
