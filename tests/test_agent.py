@@ -37,7 +37,7 @@ from preprocessing import (
 from tests.queries import TPCH
 
 FIXTURES = Path(__file__).parent / "fixtures"
-QUERY = (Path(__file__).parent.parent / "query.sql").read_text(encoding="utf-8")
+QUERY = (Path(__file__).parent / "fixtures" / "query.sql").read_text(encoding="utf-8")
 DATABASE = DatabaseDescription(
     "customer: ~15,000 rows, 361 pages\norders: ~150,000 rows, 2,648 pages",
     {"customer": {"customer_pkey"}, "orders": {"orders_pkey"}},

@@ -11,7 +11,7 @@ import psycopg
 import pytest
 from pydantic import ValidationError
 
-from experiments import (
+from project import (
     AnalystConfiguration,
     AnalystAssessment,
     AnalystResult,
@@ -337,7 +337,7 @@ def arrange_collection(
     agent_failure: bool = False,
     timed_out: bool = False,
 ) -> tuple[PlanNode, PlanNode]:
-    import experiments
+    import project
 
     postgres = PlanNode(node_type="Seq Scan", relation="orders", alias="orders")
     agent = PlanNode(
@@ -347,11 +347,11 @@ def arrange_collection(
         index_name="orders_pkey",
     )
     database = DatabaseDescription("PostgreSQL 18.1\norders", {"orders": {"orders_pkey"}})
-    monkeypatch.setattr(experiments, "capture_git_provenance", lambda _repo: RunProvenance(
+    monkeypatch.setattr(project, "capture_git_provenance", lambda _repo: RunProvenance(
         git_commit="abc123", git_dirty=False
     ))
-    monkeypatch.setattr(experiments, "describe_database", lambda *_args: database)
-    monkeypatch.setattr(experiments, "get_postgres_plan", lambda *_args, **_kwargs: postgres)
+    monkeypatch.setattr(project, "describe_database", lambda *_args: database)
+    monkeypatch.setattr(project, "get_postgres_plan", lambda *_args, **_kwargs: postgres)
     attempts = (
         AgentAttempt(response="bad", validation_problems=("invalid",)),
         AgentAttempt(response="good"),
@@ -359,10 +359,9 @@ def arrange_collection(
     if agent_failure:
         def fail_agent(*_args: object) -> AgentResult:
             raise AgentPlanError(["invalid"], "bad", attempts[:1])
-        monkeypatch.setattr(experiments, "ask_agent", fail_agent)
+        monkeypatch.setattr(project, "ask_agent", fail_agent)
     else:
-        monkeypatch.setattr(
-            experiments,
+        monkeypatch.setattr(project,
             "ask_agent",
             lambda *_args: AgentResult(agent, "Use index", "SELECT", "good", attempts),
         )
@@ -378,7 +377,7 @@ def arrange_collection(
         lambda *_args: ForcingFailure("cannot force") if forcing_failure else selected,
     )
     times = iter([100.0, None if timed_out else 125.0])
-    monkeypatch.setattr(experiments, "execution_time", lambda *_args, **_kwargs: next(times))
+    monkeypatch.setattr(project, "execution_time", lambda *_args, **_kwargs: next(times))
     return postgres, agent
 
 
@@ -448,14 +447,14 @@ def test_collector_preserves_failure_and_prior_evidence(
 def test_collector_stores_postgres_evidence_when_client_initialization_fails(
     run_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import experiments
+    import project
 
     arrange_collection(monkeypatch)
 
     def fail_client(**_kwargs: object) -> None:
         raise anthropic.AnthropicError("client initialization failed")
 
-    monkeypatch.setattr(experiments.anthropic, "Anthropic", fail_client)
+    monkeypatch.setattr(project.anthropic, "Anthropic", fail_client)
 
     run = collect_run(
         FakeConnection(),  # type: ignore[arg-type]
@@ -478,7 +477,7 @@ def test_collector_stores_postgres_evidence_when_client_initialization_fails(
 def test_collector_stores_attempts_completed_before_request_failure(
     run_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import experiments
+    import project
 
     arrange_collection(monkeypatch)
     completed = AgentAttempt(response="invalid response", validation_problems=("invalid JSON",))
@@ -486,7 +485,7 @@ def test_collector_stores_attempts_completed_before_request_failure(
     def fail_after_attempt(*_args: object) -> AgentResult:
         raise AgentError("network failed", (completed,))
 
-    monkeypatch.setattr(experiments, "ask_agent", fail_after_attempt)
+    monkeypatch.setattr(project, "ask_agent", fail_after_attempt)
 
     run = collect_run(
         FakeConnection(),  # type: ignore[arg-type]
@@ -533,7 +532,7 @@ def test_collector_records_timeout_without_discarding_plans(
 def test_collector_preserves_selected_plan_when_timing_fails(
     run_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import experiments
+    import project
 
     arrange_collection(monkeypatch)
 
@@ -546,7 +545,7 @@ def test_collector_preserves_selected_plan_when_timing_fails(
             return 100.0
         raise RuntimeError("timing failed")
 
-    monkeypatch.setattr(experiments, "execution_time", fail_realized_timing)
+    monkeypatch.setattr(project, "execution_time", fail_realized_timing)
 
     run = collect_run(
         FakeConnection(),  # type: ignore[arg-type]
@@ -571,7 +570,7 @@ def test_collector_preserves_selected_plan_when_timing_fails(
 def test_collector_rolls_back_database_errors(
     run_root: Path, monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
-    import experiments
+    import project
 
     arrange_collection(monkeypatch)
 
@@ -579,9 +578,9 @@ def test_collector_rolls_back_database_errors(
         raise psycopg.OperationalError("database failed")
 
     if stage == "postgres_plan":
-        monkeypatch.setattr(experiments, "get_postgres_plan", fail_database)
+        monkeypatch.setattr(project, "get_postgres_plan", fail_database)
     else:
-        monkeypatch.setattr(experiments, "execution_time", fail_database)
+        monkeypatch.setattr(project, "execution_time", fail_database)
     connection = FakeConnection()
 
     run = collect_run(
@@ -1003,10 +1002,10 @@ def test_public_json_contract_round_trips_run_evaluation_summary_and_advice() ->
 def test_small_multi_query_repeated_sample_experiment_end_to_end(
     run_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import experiments
+    import project
 
     arrange_collection(monkeypatch)
-    monkeypatch.setattr(experiments, "execution_time", lambda *_a, **_k: 100.0)
+    monkeypatch.setattr(project, "execution_time", lambda *_a, **_k: 100.0)
     request = build_analyst_request(gapped_run())
     assert request is not None
     assessments = tuple(
@@ -1026,8 +1025,8 @@ def test_small_multi_query_repeated_sample_experiment_end_to_end(
         queries={"Q1": "SELECT * FROM orders", "Q2": "SELECT count(*) FROM orders"},
         samples=2,
         output_root=run_root,
-        client_factory=lambda: object(),  # type: ignore[return-value]
-        analyst_client_factory=lambda: FakeAnalystClient(assessments),  # type: ignore[return-value]
+        client=object(),  # type: ignore[arg-type]
+        analyst_client=FakeAnalystClient(assessments),  # type: ignore[arg-type]
     )
     loaded = load_experiment("workload", run_root)
     summary = aggregate_runs(loaded)
@@ -1035,10 +1034,7 @@ def test_small_multi_query_repeated_sample_experiment_end_to_end(
     assert len(runs) == len(loaded) == 4
     for run in loaded:
         timestamp = run.identity.created_at.strftime("%Y-%m-%d_%H-%M-%S.%fZ")
-        assert run.identity.run_id == timestamp or (
-            run.identity.run_id.startswith(timestamp + "-")
-            and run.identity.run_id[len(timestamp) + 1:].isdigit()
-        )
+        assert run.identity.run_id == timestamp
     assert {(run.identity.query_name, run.identity.sample) for run in loaded} == {
         ("Q1", 1), ("Q1", 2), ("Q2", 1), ("Q2", 2)
     }
