@@ -18,8 +18,9 @@ names, so comparison.py works on one form for every source.
 
 The AI agent's side:
 
-- get_agent_plan() asks an LLM for its plan for a query and returns it as a PlanNode.
-  The answer must match AgentAnswer: a flat list of AgentPlanNode operators, each
+- ask_agent() asks an LLM for its plan for a query that already has unique aliases,
+  given describe_database()'s description, and returns it as a PlanNode.
+  get_agent_plan() does all three steps in one call. The answer must match AgentAnswer: a flat list of AgentPlanNode operators, each
   naming its parent, with the subset of PlanNode's fields the agent decides.
   validate_agent_plan() checks an answer, and every problem goes back to the agent in a
   retry message.
@@ -413,8 +414,8 @@ def build_hints(
       it can (see _orderable()), largest last, so the largest part is followed. A
       level whose top join gets no join hint gets no Leading hint, because
       pg_hint_plan disables every method for a join without one above a Leading hint.
-    - for a plan with joins, join_collapse_limit and from_collapse_limit of
-      COLLAPSE_LIMIT, with GEQO off, so PostgreSQL plans each join as one and the
+    - when at least one join gets a join hint, join_collapse_limit and
+      from_collapse_limit of COLLAPSE_LIMIT, with GEQO off, so PostgreSQL plans each join as one and the
       Leading hint applies
     - which scans run in parallel, and with how many workers; a plan without a Gather
       also gets Set(max_parallel_workers_per_gather 0), which turns parallelism off for
@@ -944,9 +945,7 @@ def _hint_name(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-# ---------------------------------------------------------------------------
 # Loading a schema and its data
-# ---------------------------------------------------------------------------
 
 # shortcut: sees only tables the DDL creates in the current schema; widen if a DDL ever
 # creates its tables in another schema.
@@ -1036,9 +1035,7 @@ def load_database(
         cursor.execute("ANALYZE")
 
 
-# ---------------------------------------------------------------------------
 # The AI agent's plan
-# ---------------------------------------------------------------------------
 
 # Model that proposes the agent's plan; its key comes from api_key().
 AGENT_MODEL = "claude-haiku-5-5"
@@ -1138,8 +1135,9 @@ class AgentPlanNode(BaseModel):
 
     Limitations, each there so that build_hints() can force the plan:
 
-    - Every table alias the query reads is scanned exactly once (see
-      _agent_database_errors()). The plan cannot read one alias twice or leave one
+    - Every table alias the query reads is scanned exactly once: _check_agent_node()
+      rejects an alias used twice, and _agent_database_errors() a missing or unknown
+      one. The plan cannot read one alias twice or leave one
       out, as PostgreSQL's own plans sometimes do.
     - Only the operators in AgentNodeType can be chosen. Memoize and Incremental
       Sort, for example, cannot.
@@ -1309,9 +1307,9 @@ class AgentResult(NamedTuple):
     """
     The agent's accepted plan.
 
-    query is the text the agent planned, after unique_aliases(). Plan the PostgreSQL
-    side and force the agent's plan with this text, because the plan's aliases refer to
-    it. attempts holds every answer in order with the problems sent back for it; the
+    query is the text the agent planned, which get_agent_plan() rewrites with
+    unique_aliases() first. Plan the PostgreSQL side and force the agent's plan with this
+    text, because the plan's aliases refer to it. attempts holds every answer in order with the problems sent back for it; the
     last one is the accepted answer.
     """
 

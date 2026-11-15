@@ -4,8 +4,6 @@ show PostgreSQL's plan (P), the agent's plan (A) and the realized plan (R) side 
 with the metrics. Start it with python project.py.
 """
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 from datetime import UTC, datetime
 import difflib
@@ -20,7 +18,7 @@ import sqlglot
 from sqlglot.errors import SqlglotError
 import streamlit as st
 
-from comparison import Choice, Decision, MetricScore, MetricStatus, PlanEvaluation, decisions
+from comparison import Choice, Decision, MetricStatus, PlanEvaluation, decisions
 from preprocessing import SEPARATE_PLANS, PlanNode, api_key
 from project import (
     AGENT_RUNS,
@@ -79,6 +77,7 @@ def mark_plans(
     differing = proposed | realized | gaps | set(evaluation.disagreements)
 
     numbers: dict[tuple[str, ...], int] = {}
+    # A first, so the agent's plan, which the run is about, reads #1, #2, ... top-down.
     for index in (1, 0, 2):
         plan = plans[index]
         if plan is None:
@@ -219,11 +218,6 @@ def pretty_sql(sql: str) -> str:
         return sql
 
 
-def score_text(score: MetricScore) -> str:
-    if score.status is MetricStatus.DEFINED:
-        return f"{score.numerator}/{score.denominator} ({score.rate:.0%})"
-    return "N/A" if score.status is MetricStatus.NOT_APPLICABLE else "unavailable"
-
 
 def run_page_key(run: RunRecord) -> str:
     """A run's page URL, from its creation time, which deleting other runs never moves."""
@@ -290,7 +284,10 @@ def show_run(run: RunRecord, experiment_id: str) -> None:
         for column, (label, score, definition) in zip(st.columns(4), metrics):
             column.metric(
                 label,
-                score_text(score),
+                f"{score.numerator}/{score.denominator} ({score.rate:.0%})"
+                if score.status is MetricStatus.DEFINED
+                else "N/A" if score.status is MetricStatus.NOT_APPLICABLE
+                else "unavailable",
                 help=definition + (f"\n\n{score.explanation}" if score.explanation else ""),
             )
 
@@ -415,11 +412,11 @@ def show_run(run: RunRecord, experiment_id: str) -> None:
             st.caption(
                 "The hints that produced R. Forcing tries up to three sets, with and "
                 "without join order and planner switch-offs, and keeps the one whose "
-                "plan missed the fewest requests, so a request marked *not kept by R* "
+                "plan missed the fewest non-parallel requests, so a request marked *not kept by R* "
                 "may have no hint here."
             )
             st.code(run.forcing.hints or "(none)", wrap_lines=True)
-    # The analyst is only called when forcing missed a request, so most runs have none.
+    # The analyst is called only when R missed a request, parallel ones included.
     if run.analyst.reason:
         st.warning(
             "The analyst's answer was invalid, so no explanations are shown."
@@ -470,8 +467,8 @@ def new_run_page() -> None:
         st.session_state.setdefault(key, kept[key])
 
     status = st.session_state.get("connection_status")
-    # Any edit or click reruns the page, which cuts a run short after it is saved, so
-    # the whole form is locked until the run ends.
+    # Any edit or click reruns the page, which would cut a running run short, so the
+    # whole form is locked until the run ends.
     running = kept.get("running", False)
     with st.expander("Database connection", expanded=not (status and status[1])):
         host_column, port_column, database_column, user_column, password_column = (

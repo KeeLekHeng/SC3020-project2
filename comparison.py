@@ -4,7 +4,12 @@ Compare query execution plans.
 Each plan is reduced to its decisions, one per planner choice, such as the scan method
 for a table or the join method for a set of tables. Comparing two plans means comparing
 their decisions; see decisions() for what they leave out. force_plan() forces a plan
-on PostgreSQL and checks which forced decisions it followed.
+on PostgreSQL and checks which forced decisions it followed: a decision it did not
+follow is a realization gap (realization_gaps()).
+
+evaluate_plans() turns PostgreSQL's plan (P), the agent's plan (A) and the realized plan
+(R) into the four metrics in PlanEvaluation: proposed difference, realizability,
+realized difference and intended realization.
 """
 
 from dataclasses import dataclass
@@ -29,7 +34,8 @@ from preprocessing import (
 # make two equal plans differ.
 FOLDED = {"Hash", "Bitmap Index Scan", "Subquery Scan"}
 
-# Decision kinds that build_hints() can force; realization_gaps() checks only these.
+# Decision kinds that build_hints() can force, called force-eligible; realization_gaps()
+# checks only these.
 FORCED_KINDS = {"scan", "index", "parallel", "join", "outer"}
 
 # Decision kinds the rates leave out. One choice to run in parallel or not changes the
@@ -92,7 +98,7 @@ class MetricStatus(str, Enum):
 
 @dataclass(frozen=True)
 class MetricScore:
-    """One transparent metric value with the raw fraction used to calculate it."""
+    """One metric value, with the fraction it was calculated from."""
 
     numerator: int | None
     denominator: int | None
@@ -114,7 +120,7 @@ class PlanComparison:
 
 @dataclass(frozen=True)
 class ForcePlanResult:
-    """The selected forcing attempt and all evidence needed to evaluate it."""
+    """The selected forcing try and all evidence needed to evaluate it."""
 
     hints: str
     plan: PlanNode
@@ -125,7 +131,7 @@ class ForcePlanResult:
 
 @dataclass(frozen=True)
 class ForcingFailure:
-    """A forcing attempt that produced no realized plan."""
+    """A forcing try that produced no realized plan."""
 
     reason: str
 
@@ -158,12 +164,9 @@ class PlanEvaluation:
     proposed: PlanComparison
     realizability: RealizabilityResult
     realized: PlanComparison
-    # Of the force-eligible decisions where the agent chose differently from PostgreSQL,
-    # how many the realized plan kept.
     intended: MetricScore
-    forcing: ForcePlanResult | ForcingFailure
-    # The decisions intended counts: A's force-eligible requests that differ from P,
-    # including a named index P's plan does not use, which proposed leaves out.
+    # The decisions intended counts, including a named index P's plan does not use,
+    # which proposed leaves out.
     disagreements: tuple[Decision, ...] = ()
 
 
@@ -282,7 +285,7 @@ def realizability(
     outcome: ForcePlanResult | ForcingFailure,
 ) -> RealizabilityResult:
     """
-    Measure reproduced force-eligible requests without claiming hint causality.
+    Count the force-eligible requests the realized plan kept, whichever hint caused it.
 
     outcome must come from forcing requested_plan: its gaps are the unreproduced requests.
     Decisions in PARALLEL_KINDS are left out.
@@ -307,15 +310,14 @@ def evaluate_plans(
     agent_plan: PlanNode,
     outcome: ForcePlanResult | ForcingFailure,
 ) -> PlanEvaluation:
-    """Compose proposed, realizability, and realized metrics without database access."""
+    """Compute the four metrics of PlanEvaluation, without database access."""
     proposed = compare_plans(postgres_plan, agent_plan)
     result = realizability(agent_plan, outcome)
     postgres = decisions(postgres_plan)
     requested = _rated(_requests(agent_plan))
-    # Unlike the general pairwise metric, count every explicit forceable request here,
-    # including a named index that PostgreSQL's plan does not have. This metric asks
-    # whether the agent's intended requests survived, not how many structural differences to
-    # display without double-counting one access-method change.
+    # Unlike compare_plans(), count every force-eligible request, including a named index
+    # PostgreSQL's plan does not use: this asks which of the agent's changes survived,
+    # not how many decisions differ.
     disagreements = [
         decision
         for decision, choice in requested.items()
@@ -338,7 +340,7 @@ def evaluate_plans(
             "The agent chose like PostgreSQL on every force-eligible decision.",
         )
 
-    return PlanEvaluation(proposed, result, realized, intended, outcome, tuple(disagreements))
+    return PlanEvaluation(proposed, result, realized, intended, tuple(disagreements))
 
 
 def differences(a: PlanNode, b: PlanNode) -> list[Difference]:
@@ -361,8 +363,8 @@ def realization_gaps(requested: PlanNode, forced: PlanNode) -> list[Difference]:
     requested is the plan given to build_hints(), as each Difference's a; forced is the
     plan PostgreSQL chose with those hints, as b. Only the kinds in FORCED_KINDS are
     checked, and only decisions requested by the original plan can be gaps. Extra
-    force-eligible decisions introduced by the realized plan are diagnostics, not
-    failed requests. An empty result means every requested force-eligible decision was
+    force-eligible decisions introduced by the realized plan are not failed requests and
+    are left out. An empty result means every requested force-eligible decision was
     reproduced.
 
     A gap can be a decision no hint asked for, because build_hints() skips some scans
@@ -397,29 +399,20 @@ def force_plan(
     psycopg.errors.UndefinedFile or InsufficientPrivilege when pg_hint_plan cannot be
     loaded (see get_postgres_plan()).
     """
-    best: ForcePlanResult | None = None
-    best_rank = (0, 0)
-
+    tries: list[ForcePlanResult] = []
     for switch_offs, leading in ((True, True), (False, True), (True, False)):
         hints = build_hints(plan, query, switch_offs, leading)
         forced = get_postgres_plan(connection, query, hints=hints)
-        gaps = realization_gaps(plan, forced)
-        candidate = ForcePlanResult(
-            hints=hints,
-            plan=forced,
-            gaps=tuple(gaps),
-            switch_offs=switch_offs,
-            leading=leading,
-        )
-        rank = (sum(gap.decision.kind not in PARALLEL_KINDS for gap in gaps), len(gaps))
-        if best is None or rank < best_rank:
-            best, best_rank = candidate, rank
-
+        gaps = tuple(realization_gaps(plan, forced))
+        tries.append(ForcePlanResult(hints, forced, gaps, switch_offs, leading))
         if not gaps:
             break
 
-    assert best is not None
-    return best
+    # min() keeps the first of equal ranks, so the earlier try wins a tie.
+    return min(
+        tries,
+        key=lambda t: (sum(g.decision.kind not in PARALLEL_KINDS for g in t.gaps), len(t.gaps)),
+    )
 
 
 def try_force_plan(

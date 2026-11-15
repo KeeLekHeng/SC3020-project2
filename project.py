@@ -6,8 +6,6 @@ agent_runs/<experiment>.jsonl. Run records, their summary and the advisory analy
 here too.
 """
 
-from __future__ import annotations
-
 import argparse
 from datetime import UTC, datetime
 from getpass import getpass
@@ -216,7 +214,7 @@ def build_analyst_request(run: RunRecord) -> AnalystRequest | None:
             "pg_hint_plan cannot force every PostgreSQL operator or rewrite",
             "hints may not reach repeated or generated aliases",
             "Leading hints cannot express every join-side arrangement",
-            "of up to three forcing tries, the selected one missed the fewest requests",
+            "of up to three forcing tries, the selected one missed the fewest non-parallel requests",
         ],
     }
     schema = json.dumps(AnalystResponse.model_json_schema(), separators=(",", ":"))
@@ -476,6 +474,8 @@ def collect_run(
         description = describe_database(connection, rewritten)
         run.database_description = description.text
         run.postgres_plan = get_postgres_plan(connection, rewritten)
+    # Any error here, from PostgreSQL or from parsing the SQL, means the query cannot be
+    # planned, so the run is kept as a failure at this stage rather than crashing.
     except Exception as error:
         if isinstance(error, psycopg.Error):
             connection.rollback()
@@ -655,13 +655,12 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.queries and not args.experiments:
         parser.error("-q/--queries needs --experiments")
+    settings = CONNECTION_SETTINGS | {"dbname": args.database}
     if args.load_data:
         password = os.environ.get("PGPASSWORD") or getpass("PostgreSQL password: ")
         try:
             # One transaction: a failed load leaves no tables behind.
-            with psycopg.connect(
-                **CONNECTION_SETTINGS | {"dbname": args.database}, password=password
-            ) as connection:
+            with psycopg.connect(**settings, password=password) as connection:
                 load_database(connection, args.schema, args.data, PROJECT_FOLDER / "data_clean")
         except ValueError as error:
             sys.exit(str(error))
@@ -698,10 +697,8 @@ def main(argv: list[str] | None = None) -> None:
         print("No ANTHROPIC_API_KEY is set (see the README), so experiments cannot run.")
         return
 
-    password = getpass("PostgreSQL password: ")
-    with psycopg.connect(
-        **CONNECTION_SETTINGS | {"dbname": args.database}, password=password
-    ) as connection:
+    password = os.environ.get("PGPASSWORD") or getpass("PostgreSQL password: ")
+    with psycopg.connect(**settings, password=password) as connection:
         connection.read_only = True
         print("Connected to PostgreSQL!")
         run_experiments(connection, queries)
