@@ -73,13 +73,19 @@ Enter your PostgreSQL password when prompted, or set `PGPASSWORD` to skip the pr
 | User | `postgres` |
 | Connection timeout | 10 seconds |
 
-This runs every query in `queries/` (TPC-H Q1–Q22 and the handwritten H1–H3; add more as `.sql` files), or only those named with `-q`/`--queries`, such as `-q Q1 Q6`, once each, and saves one JSON record per query as a line of `agent_runs/<UTC start time>.jsonl`. For each query, it gets PostgreSQL's plan, asks the agent for its plan (up to three answers), forces that plan, times both plans with `EXPLAIN ANALYZE` as the mean of three runs after a warm-up, and asks the analyst, a second call to the same model, why PostgreSQL did not follow any decision it missed. It prints one row per query, with its status, the agent's answer count, the four metrics as fractions, whether each plan runs in parallel and the time ratio, then the workload counts: usable agent plans, plans the same as PostgreSQL's, plans forced and parallel plans. This step needs the Anthropic API key. [docs/plan-forcing.md](docs/plan-forcing.md) describes the hints and what they cannot force; [docs/experiments.md](docs/experiments.md) describes the records and the summary.
+This runs every query in `queries/` (TPC-H Q1–Q22 and the handwritten H1–H3; add more as `.sql` files), or only those named with `-q`/`--queries`, such as `-q Q1 Q6`, once each. It saves one JSON record per query as a line of `agent_runs/<UTC start time>.jsonl`.
+
+For each query, the program gets PostgreSQL's plan and asks the agent for a plan (up to three answers). It then asks PostgreSQL to realize the agent's plan using hints. Both PostgreSQL's plan and the realized plan are timed with `EXPLAIN ANALYZE`: one warm-up run followed by the mean of three measured runs. Each run has a 60-second timeout, so a timeout can leave that plan's timing and the time ratio unavailable.
+
+When the realized plan does not reproduce one or more decisions, a second call to the same model suggests possible causes based on the available evidence. The analyst may report that the evidence is insufficient; its advice does not change the metrics. The program prints the four metric values as fractions or `N/A`, each plan's parallelism flag, and the time ratio. Its workload counts include plans with no differences among the decisions compared by the metrics; this does not necessarily mean that every plan detail is identical. This step needs the Anthropic API key. [docs/plan-forcing.md](docs/plan-forcing.md) describes the hints and what they cannot force; [docs/experiments.md](docs/experiments.md) describes the records and the summary.
 
 ## Get the AI agent's plan
 
 `preprocessing.get_agent_plan()` asks the agent for its plan for a query and returns it as a `PlanNode` tree, ready for `force_plan()` and `differences()`. To use it from your own code:
 
 ```python
+from getpass import getpass
+
 import psycopg
 
 from comparison import differences, force_plan
@@ -88,18 +94,23 @@ from project import CONNECTION_SETTINGS
 
 original_sql = "SELECT count(*) FROM orders o JOIN customer c ON c.c_custkey = o.o_custkey"
 
-connection = psycopg.connect(**CONNECTION_SETTINGS, password="postgres")
-result = get_agent_plan(connection, original_sql)
-postgres = get_postgres_plan(connection, result.query)
-forced = force_plan(connection, result.query, result.plan)
-diffs = differences(postgres, forced.plan)
+with psycopg.connect(
+    **CONNECTION_SETTINGS, password=getpass("PostgreSQL password: ")
+) as connection:
+    result = get_agent_plan(connection, original_sql)
+    postgres = get_postgres_plan(connection, result.query)
+    proposed_differences = differences(postgres, result.plan)
+    forced = force_plan(connection, result.query, result.plan)
+    realized_differences = differences(postgres, forced.plan)
 ```
+
+`proposed_differences` compares PostgreSQL's plan with the agent's proposal. `realized_differences` compares PostgreSQL's plan with the plan produced after applying the agent's hints.
 
 Plan and force with `result.query`, the query after `unique_aliases()`, because the agent's aliases refer to it. `result` is an `AgentResult`:
 
 | Field | Meaning |
 | --- | --- |
-| `plan` | The agent's plan as a `PlanNode` tree. Each node's `reason` holds the agent's one-line reason for it. |
+| `plan` | The agent's plan as a `PlanNode` tree. A node may include the agent's one-line reason for choosing its operator. |
 | `summary` | One or two sentences on the agent's overall strategy. |
 | `query` | The query the agent planned. |
 | `attempts` | Every answer in order, each with the problems sent back for it; the last is the accepted answer. |
@@ -144,6 +155,8 @@ The agent's calls for Q1–Q22 in that run cost 3 to 4 US cents; a workload run 
 ## Run the tests
 
 Install the test dependencies, set your PostgreSQL password, then run the tests from the project root:
+
+**Warning:** `tests/test_loading.py` drops and recreates a database named `load_data_test` on the configured PostgreSQL server. Run the tests only against a disposable server, and make sure that database does not contain data you need.
 
 ```powershell
 py -m pip install -r requirements-dev.txt
