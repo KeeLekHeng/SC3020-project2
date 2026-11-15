@@ -1162,41 +1162,44 @@ class AgentAnswer(BaseModel):
         return PlanNode.model_validate(nodes[self.nodes[0].id])
 
 
+class AgentAttempt(BaseModel):
+    """One textual model response and the validation problems sent back for it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    response: str
+    validation_problems: tuple[str, ...] = ()
+
+
 class AgentPlanError(ValueError):
     """
     The agent's answer is unusable.
 
     errors lists every problem found, worded so they can go back to the agent in one
-    retry message; answer is the agent's raw text.
+    retry message; answer is the agent's raw text. attempts holds every answer when
+    ask_agent() gives up.
     """
 
     def __init__(
         self,
         errors: list[str],
         answer: str = "",
-        attempts: tuple["AgentAttempt", ...] = (),
+        attempts: tuple[AgentAttempt, ...] = (),
     ) -> None:
         self.errors = errors
         self.answer = answer
-        self.attempts = attempts or (
-            (AgentAttempt(answer, tuple(errors)),) if answer else ()
-        )
+        self.attempts = attempts
         problems = "\n".join(f"- {e}" for e in errors)
         super().__init__(f"The agent's plan is invalid:\n{problems}")
 
 
-class AgentResponseError(RuntimeError):
-    """The model returned a terminal response that cannot produce a plan."""
+class AgentError(RuntimeError):
+    """
+    The agent gave no plan: an API request failed, or the model declined or was cut
+    off. attempts holds the answers completed before it stopped.
+    """
 
-    def __init__(self, message: str, attempts: tuple["AgentAttempt", ...]) -> None:
-        self.attempts = attempts
-        super().__init__(message)
-
-
-class AgentRequestError(RuntimeError):
-    """An agent API request failed after zero or more completed response attempts."""
-
-    def __init__(self, message: str, attempts: tuple["AgentAttempt", ...]) -> None:
+    def __init__(self, message: str, attempts: tuple[AgentAttempt, ...]) -> None:
         self.attempts = attempts
         super().__init__(message)
 
@@ -1209,31 +1212,21 @@ class DatabaseDescription(NamedTuple):
     """Index names of each table, keyed by table name."""
 
 
-class AgentAttempt(NamedTuple):
-    """One textual model response and the validation problems it produced."""
-
-    response: str
-    validation_problems: tuple[str, ...]
-
-
 class AgentResult(NamedTuple):
     """
     The agent's accepted plan.
 
     query is the text the agent planned, after unique_aliases(). Plan the PostgreSQL
     side and force the agent's plan with this text, because the plan's aliases refer to
-    it. answer is the agent's raw final answer. problems lists, for each rejected answer
-    before it, the errors sent back. attempts retains every textual response in order,
-    paired with its validation outcome; hidden thinking and SDK response objects are
-    deliberately excluded.
+    it. answer is the agent's raw final answer. attempts holds every answer in order
+    with the problems sent back for it, so the last one is answer with none.
     """
 
     plan: PlanNode
     summary: str
     query: str
     answer: str
-    problems: list[list[str]]
-    attempts: tuple[AgentAttempt, ...] = ()
+    attempts: tuple[AgentAttempt, ...]
 
 
 def validate_agent_plan(output: str) -> AgentAnswer:
@@ -1550,8 +1543,7 @@ def ask_agent(
     at medium.
 
     Raises AgentPlanError with the last answer's problems when no answer is usable,
-    AgentResponseError when the model declines or is cut off, and AgentRequestError
-    with every completed earlier attempt when an API request fails.
+    and AgentError when an API request fails or the model declines or is cut off.
     """
     system: list[anthropic.types.TextBlockParam] = [{
         "type": "text",
@@ -1559,7 +1551,6 @@ def ask_agent(
         "cache_control": {"type": "ephemeral"},
     }]
     messages: list[Any] = [{"role": "user", "content": agent_user_prompt(query, database)}]
-    problems: list[list[str]] = []
     attempts: list[AgentAttempt] = []
     errors: list[str] = []
     text = ""
@@ -1578,24 +1569,23 @@ def ask_agent(
             ) as stream:
                 response = stream.get_final_message()
         except anthropic.AnthropicError as error:
-            raise AgentRequestError(str(error), tuple(attempts)) from error
+            raise AgentError(str(error), tuple(attempts)) from error
 
         text = "".join(
             block.text for block in response.content
             if isinstance(block, anthropic.types.TextBlock)
         )
         if response.stop_reason == "refusal":
-            attempts.append(AgentAttempt(text, ()))
+            attempts.append(AgentAttempt(response=text))
             category = response.stop_details.category if response.stop_details else None
-            raise AgentResponseError(
+            raise AgentError(
                 f"The model declined to plan the query ({category}).", tuple(attempts)
             )
 
         if response.stop_reason == "max_tokens":
-            attempts.append(AgentAttempt(text, ()))
-            raise AgentResponseError(
-                "The agent's answer was cut off at max_tokens.", tuple(attempts)
-            )
+            attempts.append(AgentAttempt(response=text))
+            raise AgentError("The agent's answer was cut off at max_tokens.", tuple(attempts))
+
         try:
             answer = validate_agent_plan(text)
             plan = answer.to_plan_node()
@@ -1603,12 +1593,11 @@ def ask_agent(
         except AgentPlanError as error:
             errors = error.errors
 
-        attempts.append(AgentAttempt(text, tuple(errors)))
+        attempts.append(AgentAttempt(response=text, validation_problems=tuple(errors)))
 
         if not errors:
-            return AgentResult(plan, answer.summary, query, text, problems, tuple(attempts))
+            return AgentResult(plan, answer.summary, query, text, tuple(attempts))
 
-        problems.append(errors)
         listed = "\n".join(f"- {error}" for error in errors)
         retry = (
             f"Your plan cannot be used yet:\n{listed}\n\n"

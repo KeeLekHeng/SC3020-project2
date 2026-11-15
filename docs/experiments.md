@@ -101,12 +101,10 @@ The public boundary consists of Pydantic-validated JSON rather than manual seria
 on in-memory plan or comparison classes:
 
 - `RunRecord.model_dump_json()` and `RunRecord.model_validate_json()` exchange raw run
-  evidence and the separately labelled `analyst` section;
-- `evaluation_json()` and `load_evaluation_json()` exchange a freshly recomputed
-  `PlanEvaluation`; and
+  evidence and the separately labelled `analyst` section; `evaluation_from_run()`
+  recomputes its `PlanEvaluation`; and
 - `WorkloadSummary.model_dump_json()` and `model_validate_json()` exchange macro/micro
   values, inclusion counts, exclusion reasons, and per-query timing medians.
 
 A GUI or report reader can load these records without connecting to PostgreSQL or
-calling either model. Derived evaluation and summary JSON can always be regenerated
-from compatible raw runs.
+calling either model. Summary JSON can always be regenerated from compatible raw runs.

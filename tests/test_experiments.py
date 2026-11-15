@@ -20,7 +20,6 @@ from experiments import (
     DatabaseContext,
     ForcingEvidence,
     MeasurementConfiguration,
-    PlannerAttempt,
     PlannerConfiguration,
     RunEvidence,
     RunIdentity,
@@ -35,11 +34,9 @@ from experiments import (
     build_analyst_request,
     database_context,
     evaluation_from_run,
-    evaluation_json,
     forcing_evidence,
     load_run,
     load_experiment,
-    load_evaluation_json,
     planner_configuration,
     run_analyst,
     validate_analyst_response,
@@ -48,8 +45,8 @@ from experiments import (
 from comparison import ForcePlanResult, ForcingFailure, realization_gaps
 from preprocessing import (
     AgentAttempt,
+    AgentError,
     AgentPlanError,
-    AgentRequestError,
     AgentResult,
     DatabaseDescription,
     PlanNode,
@@ -114,7 +111,7 @@ def record(*, failed: bool = False) -> RunRecord:
             rewritten_sql="SELECT * FROM orders",
             postgres_plan=postgres,
             agent_plan=None if failed else agent,
-            agent_attempts=() if failed else (PlannerAttempt(response="{}"),),
+            agent_attempts=() if failed else (AgentAttempt(response="{}"),),
             forcing=(
                 None
                 if failed
@@ -184,7 +181,7 @@ def test_selected_forcing_outcome_round_trips_into_evaluator() -> None:
                 rewritten_sql="SELECT * FROM orders",
                 postgres_plan=postgres,
                 agent_plan=agent,
-                agent_attempts=(PlannerAttempt(response="{}"),),
+                agent_attempts=(AgentAttempt(response="{}"),),
                 forcing=forcing_evidence(selected),
                 timing=TimingEvidence(postgres_ms=1, realized_ms=1),
             )
@@ -220,8 +217,6 @@ def test_offline_evaluation_recomputes_gaps_from_plans() -> None:
                 forcing=ForcingEvidence(
                     realized_plan=postgres,
                     hints="IndexScan(orders orders_pkey)",
-                    # Deliberately stale: current evaluation must ignore this cache.
-                    gaps=(),
                     switch_offs=True,
                     leading=True,
                 ),
@@ -274,7 +269,7 @@ def test_runtime_configuration_and_database_context_are_explicit() -> None:
 
     planner = planner_configuration()
     database = database_context(
-        Connection(),
+        Connection(),  # type: ignore[arg-type]
         DatabaseDescription(
             "PostgreSQL 18.1\nSettings: work_mem=4MB",
             {"orders": {"orders_date_idx", "orders_pkey"}},
@@ -361,8 +356,8 @@ def arrange_collection(
     monkeypatch.setattr(experiments, "describe_database", lambda *_args: database)
     monkeypatch.setattr(experiments, "get_postgres_plan", lambda *_args, **_kwargs: postgres)
     attempts = (
-        AgentAttempt("bad", ("invalid",)),
-        AgentAttempt("good", ()),
+        AgentAttempt(response="bad", validation_problems=("invalid",)),
+        AgentAttempt(response="good"),
     )
     if agent_failure:
         def fail_agent(*_args: object) -> AgentResult:
@@ -372,7 +367,7 @@ def arrange_collection(
         monkeypatch.setattr(
             experiments,
             "ask_agent",
-            lambda *_args: AgentResult(agent, "Use index", "SELECT", "good", [["invalid"]], attempts),
+            lambda *_args: AgentResult(agent, "Use index", "SELECT", "good", attempts),
         )
     selected = ForcePlanResult(
         hints="IndexScan(orders orders_pkey)",
@@ -382,12 +377,11 @@ def arrange_collection(
         leading=True,
     )
     monkeypatch.setattr(
-        experiments,
-        "force_plan",
+        "comparison.force_plan",
         lambda *_args: ForcingFailure("cannot force") if forcing_failure else selected,
     )
     times = iter([100.0, None if timed_out else 125.0])
-    monkeypatch.setattr(experiments, "measure_execution_time", lambda *_args, **_kwargs: next(times))
+    monkeypatch.setattr(experiments, "execution_time", lambda *_args, **_kwargs: next(times))
     return postgres, agent
 
 
@@ -490,10 +484,10 @@ def test_collector_stores_attempts_completed_before_request_failure(
     import experiments
 
     arrange_collection(monkeypatch)
-    completed = AgentAttempt("invalid response", ("invalid JSON",))
+    completed = AgentAttempt(response="invalid response", validation_problems=("invalid JSON",))
 
     def fail_after_attempt(*_args: object) -> AgentResult:
-        raise AgentRequestError("network failed", (completed,))
+        raise AgentError("network failed", (completed,))
 
     monkeypatch.setattr(experiments, "ask_agent", fail_after_attempt)
 
@@ -511,9 +505,7 @@ def test_collector_stores_attempts_completed_before_request_failure(
     assert run.status is RunStatus.FAILED
     assert run.failure_stage == "agent_plan"
     assert run.evidence.agent_attempts == (
-        PlannerAttempt(
-            response="invalid response", validation_problems=("invalid JSON",)
-        ),
+        completed,
     )
 
 
@@ -557,7 +549,7 @@ def test_collector_preserves_selected_plan_when_timing_fails(
             return 100.0
         raise RuntimeError("timing failed")
 
-    monkeypatch.setattr(experiments, "measure_execution_time", fail_realized_timing)
+    monkeypatch.setattr(experiments, "execution_time", fail_realized_timing)
 
     run = collect_run(
         FakeConnection(),  # type: ignore[arg-type]
@@ -592,7 +584,7 @@ def test_collector_rolls_back_database_errors(
     if stage == "postgres_plan":
         monkeypatch.setattr(experiments, "get_postgres_plan", fail_database)
     else:
-        monkeypatch.setattr(experiments, "measure_execution_time", fail_database)
+        monkeypatch.setattr(experiments, "execution_time", fail_database)
     connection = FakeConnection()
 
     run = collect_run(
@@ -825,7 +817,8 @@ class FakeAnalystClient:
         self.requests.append(request)
         text = AnalystResponse(assessments=self.assessments).model_dump_json()
         return SimpleNamespace(
-            content=[anthropic.types.TextBlock(type="text", text=text)]
+            content=[anthropic.types.TextBlock(type="text", text=text)],
+            stop_reason="end_turn",
         )
 
 
@@ -865,7 +858,7 @@ def gapped_run() -> RunRecord:
                 rewritten_sql="SELECT * FROM orders",
                 postgres_plan=postgres,
                 agent_plan=agent,
-                agent_attempts=(PlannerAttempt(response="private planner prose",),),
+                agent_attempts=(AgentAttempt(response="private planner prose",),),
                 forcing=forcing_evidence(selected),
                 timing=TimingEvidence(postgres_ms=1, realized_ms=1),
             )
@@ -1003,11 +996,9 @@ def test_public_json_contract_round_trips_run_evaluation_summary_and_advice() ->
     summary = aggregate_runs([run])
 
     loaded_run = RunRecord.model_validate_json(run.model_dump_json())
-    loaded_evaluation = load_evaluation_json(evaluation_json(evaluation))
     loaded_summary = type(summary).model_validate_json(summary.model_dump_json())
 
     assert loaded_run.analyst.assessments == advice
-    assert loaded_evaluation == evaluation
     assert loaded_summary == summary
     assert loaded_summary.metrics["proposed_difference"].defined_runs == 1
 
@@ -1018,7 +1009,7 @@ def test_small_multi_query_repeated_sample_experiment_end_to_end(
     import experiments
 
     arrange_collection(monkeypatch)
-    monkeypatch.setattr(experiments, "measure_execution_time", lambda *_a, **_k: 100.0)
+    monkeypatch.setattr(experiments, "execution_time", lambda *_a, **_k: 100.0)
     request = build_analyst_request(gapped_run())
     assert request is not None
     assessments = tuple(

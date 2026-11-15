@@ -209,7 +209,7 @@ realized decisions are returned separately and never enter that denominator.
 Realizability is measured only on plans the validator accepted. The validator rejects
 an answer that `build_hints()` cannot turn into hints and asks the agent again, so plans
 the forcing layer cannot express never reach this denominator. Report the retry count
-(`len(AgentResult.problems)`) for each query, and across a workload the share of queries
+(`len(AgentResult.attempts) - 1`) for each query, and across a workload the share of queries
 whose first answer was rejected, next to this rate.
 
 ### Reasoning
@@ -445,7 +445,7 @@ information to reconstruct its result. Save at least:
 
 - the original and `unique_aliases()`-rewritten SQL;
 - model name, effort setting and relevant prompt/version identifier;
-- the raw `AgentResult.answer`, summary and retry problems;
+- the raw `AgentResult.answer`, summary and `attempts`;
 - the validated agent `PlanNode`;
 - PostgreSQL's normal plan and the realized hinted plan;
 - the generated hints, selected forcing attempt and realization gaps;

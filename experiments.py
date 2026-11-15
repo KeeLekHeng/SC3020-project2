@@ -12,22 +12,21 @@ from pathlib import Path
 import subprocess
 import tempfile
 from statistics import fmean, median
-from typing import Callable, Literal
+from typing import Callable, Literal, get_args
 
 import anthropic
 import psycopg
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from comparison import (
-    Difference,
     ForcePlanResult,
     ForcingFailure,
     PlanEvaluation,
     MetricScore,
     MetricStatus,
     evaluate_plans,
-    force_plan,
     realization_gaps,
+    try_force_plan,
 )
 from preprocessing import (
     AGENT_FIRST_EFFORT,
@@ -35,10 +34,9 @@ from preprocessing import (
     AGENT_MAX_TOKENS,
     AGENT_MODEL,
     AGENT_RETRY_EFFORT,
+    AgentAttempt,
+    AgentError,
     AgentPlanError,
-    AgentRequestError,
-    AgentResponseError,
-    AgentResult,
     DatabaseDescription,
     PlanNode,
     api_key,
@@ -54,7 +52,6 @@ RUN_SCHEMA_VERSION = 1
 ANALYST_MODEL = AGENT_MODEL
 ANALYST_MAX_TOKENS = 4_096
 ANALYST_PROMPT_VERSION = 1
-_EVALUATION_ADAPTER = TypeAdapter(PlanEvaluation)
 
 
 class RecordModel(BaseModel):
@@ -110,23 +107,9 @@ class DatabaseContext(RecordModel):
     indexes: dict[str, tuple[str, ...]]
 
 
-class PlannerAttempt(RecordModel):
-    response: str
-    validation_problems: tuple[str, ...] = ()
-
-
-class GapEvidence(RecordModel):
-    gap_id: str = Field(min_length=1)
-    kind: str = Field(min_length=1)
-    tables: tuple[str, ...]
-    requested: str | None
-    realized: str | None
-
-
 class ForcingEvidence(RecordModel):
     realized_plan: PlanNode | None = None
     hints: str | None = None
-    gaps: tuple[GapEvidence, ...] = ()
     switch_offs: bool | None = None
     leading: bool | None = None
     failure_reason: str | None = None
@@ -343,9 +326,9 @@ def run_analyst(client: anthropic.Anthropic, run: RunRecord) -> AnalystResult:
         system=request.system,
         messages=[{"role": "user", "content": request.user}],
     )
-    if getattr(response, "stop_reason", None) == "refusal":
+    if response.stop_reason == "refusal":
         raise RuntimeError("The analyst declined the request.")
-    if getattr(response, "stop_reason", None) == "max_tokens":
+    if response.stop_reason == "max_tokens":
         raise RuntimeError("The analyst response was cut off at max_tokens.")
     text = "".join(
         block.text
@@ -422,7 +405,7 @@ class RunEvidence(RecordModel):
     rewritten_sql: str
     postgres_plan: PlanNode | None = None
     agent_plan: PlanNode | None = None
-    agent_attempts: tuple[PlannerAttempt, ...] = ()
+    agent_attempts: tuple[AgentAttempt, ...] = ()
     forcing: ForcingEvidence | None = None
     timing: TimingEvidence | None = None
 
@@ -503,18 +486,6 @@ def load_run(path: Path) -> RunRecord:
     return RunRecord.model_validate_json(path.read_text(encoding="utf-8"))
 
 
-def evaluation_json(evaluation: PlanEvaluation) -> str:
-    """Serialize recomputed metric detail through Pydantic's public boundary."""
-
-    return _EVALUATION_ADAPTER.dump_json(evaluation).decode("utf-8")
-
-
-def load_evaluation_json(value: str) -> PlanEvaluation:
-    """Validate serialized recomputed metric detail for downstream consumers."""
-
-    return _EVALUATION_ADAPTER.validate_json(value)
-
-
 def capture_git_provenance(repository: Path) -> RunProvenance:
     """Record the checked-out commit and whether tracked or untracked files differ."""
 
@@ -549,28 +520,15 @@ def planner_configuration() -> PlannerConfiguration:
 
 
 def database_context(
-    connection: object, description: DatabaseDescription
+    connection: psycopg.Connection, description: DatabaseDescription
 ) -> DatabaseContext:
     """Preserve exactly what the planner saw plus its validation-only index map."""
 
-    info = getattr(connection, "info")
-    version = (info.parameter_status("server_version") or "unknown").split(" ")[0]
+    version = (connection.info.parameter_status("server_version") or "unknown").split(" ")[0]
     return DatabaseContext(
         postgres_version=version,
         description=description.text,
         indexes={table: tuple(sorted(names)) for table, names in description.indexes.items()},
-    )
-
-
-def gap_evidence(gap: Difference) -> GapEvidence:
-    """Copy one realization gap into the persistence boundary."""
-
-    return GapEvidence(
-        gap_id=str(gap.decision),
-        kind=gap.decision.kind,
-        tables=gap.decision.tables,
-        requested=gap.a.value if gap.a else None,
-        realized=gap.b.value if gap.b else None,
     )
 
 
@@ -582,7 +540,6 @@ def forcing_evidence(outcome: ForcePlanResult | ForcingFailure) -> ForcingEviden
     return ForcingEvidence(
         realized_plan=outcome.plan,
         hints=outcome.hints,
-        gaps=tuple(gap_evidence(gap) for gap in outcome.gaps),
         switch_offs=outcome.switch_offs,
         leading=outcome.leading,
     )
@@ -624,12 +581,7 @@ def _metric_scores(evaluation: PlanEvaluation) -> dict[MetricName, MetricScore]:
 def aggregate_runs(runs: list[RunRecord]) -> WorkloadSummary:
     """Recompute and aggregate count metrics; timing remains a per-query summary."""
 
-    names: tuple[MetricName, ...] = (
-        "proposed_difference",
-        "realizability",
-        "realized_difference",
-        "intended_realization",
-    )
+    names: tuple[MetricName, ...] = get_args(MetricName)
     scores: dict[MetricName, list[tuple[RunRecord, MetricScore]]] = {
         name: [] for name in names
     }
@@ -715,7 +667,7 @@ def aggregate_runs(runs: list[RunRecord]) -> WorkloadSummary:
     return WorkloadSummary(metrics=aggregates, timing=timing_summary)
 
 
-def measure_execution_time(
+def execution_time(
     connection: psycopg.Connection,
     query: str,
     hints: str = "",
@@ -768,7 +720,7 @@ def collect_run(
     database: DatabaseContext | None = None
     postgres_plan: PlanNode | None = None
     agent_plan: PlanNode | None = None
-    attempts: tuple[PlannerAttempt, ...] = ()
+    attempts: tuple[AgentAttempt, ...] = ()
     forcing: ForcingEvidence | None = None
     timing: TimingEvidence | None = None
     analyst = AnalystResult()
@@ -834,59 +786,27 @@ def collect_run(
     try:
         if client is None:
             client = anthropic.Anthropic(api_key=api_key())
-        result: AgentResult = ask_agent(client, rewritten, description)
+        result = ask_agent(client, rewritten, description)
         agent_plan = result.plan
-        attempts = tuple(
-            PlannerAttempt(
-                response=attempt.response,
-                validation_problems=attempt.validation_problems,
-            )
-            for attempt in result.attempts
-        )
-    except AgentPlanError as error:
-        attempts = tuple(
-            PlannerAttempt(
-                response=attempt.response,
-                validation_problems=attempt.validation_problems,
-            )
-            for attempt in error.attempts
-        )
-        return finish(RunStatus.FAILED, "agent_plan", str(error))
-    except (AgentRequestError, AgentResponseError) as error:
-        attempts = tuple(
-            PlannerAttempt(
-                response=attempt.response,
-                validation_problems=attempt.validation_problems,
-            )
-            for attempt in error.attempts
-        )
+        attempts = result.attempts
+    except (AgentPlanError, AgentError) as error:
+        attempts = error.attempts
         return finish(RunStatus.FAILED, "agent_plan", str(error))
     except (anthropic.AnthropicError, RuntimeError) as error:
         return finish(RunStatus.FAILED, "agent_plan", str(error))
 
-    try:
-        outcome: ForcePlanResult | ForcingFailure = force_plan(
-            connection, rewritten, agent_plan
-        )
-    except ValueError as error:
-        outcome = ForcingFailure(str(error))
-    except (psycopg.errors.UndefinedFile, psycopg.errors.InsufficientPrivilege) as error:
-        connection.rollback()
-        outcome = ForcingFailure(f"pg_hint_plan cannot be loaded: {error}")
-    except psycopg.Error as error:
-        connection.rollback()
-        outcome = ForcingFailure(f"PostgreSQL forcing failed: {error}")
+    outcome = try_force_plan(connection, rewritten, agent_plan)
     forcing = forcing_evidence(outcome)
     if isinstance(outcome, ForcingFailure):
         return finish(RunStatus.FAILED, "forcing", outcome.reason)
 
     try:
-        postgres_ms = measure_execution_time(connection, rewritten, timeout_ms=timeout_ms)
+        postgres_ms = execution_time(connection, rewritten, timeout_ms=timeout_ms)
         timing = TimingEvidence(
             postgres_ms=postgres_ms,
             postgres_timed_out=postgres_ms is None,
         )
-        realized_ms = measure_execution_time(
+        realized_ms = execution_time(
             connection, rewritten, outcome.hints, timeout_ms=timeout_ms
         )
     except psycopg.Error as error:

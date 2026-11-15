@@ -17,9 +17,8 @@ from preprocessing import (
     JOIN_HINTS,
     SCAN_HINTS,
     AgentNodeType,
+    AgentError,
     AgentPlanError,
-    AgentRequestError,
-    AgentResponseError,
     DatabaseDescription,
     PlanNode,
     agent_system_prompt,
@@ -496,7 +495,6 @@ def test_good_first_answer_is_accepted() -> None:
 
     result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
-    assert result.problems == []
     assert len(result.attempts) == 1
     assert result.attempts[0].response == json.dumps(answer())
     assert result.attempts[0].validation_problems == ()
@@ -516,11 +514,10 @@ def test_problems_go_back_to_the_agent_and_its_fix_is_accepted() -> None:
 
     result = ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
-    assert len(result.problems) == 1
     assert [attempt.response for attempt in result.attempts] == [
         json.dumps(bad), json.dumps(answer())
     ]
-    assert result.attempts[0].validation_problems == tuple(result.problems[0])
+    assert result.attempts[0].validation_problems
     assert result.attempts[1].validation_problems == ()
     assert [r["output_config"]["effort"] for r in client.requests] == ["low", "medium"]
     retry = client.requests[1]["messages"]
@@ -541,7 +538,7 @@ def test_plan_is_checked_against_the_query_and_not_postgresqls_plan() -> None:
 
     result = ask_agent(cast(anthropic.Anthropic, client), query, DATABASE)
 
-    assert result.problems == []
+    assert result.attempts[0].validation_problems == ()
 
 
 def test_unknown_index_goes_back_to_the_agent() -> None:
@@ -584,7 +581,7 @@ def test_agent_gives_up_after_max_attempts() -> None:
 def test_cut_off_answer_raises() -> None:
     client = FakeClient("{", stop_reason="max_tokens")
 
-    with pytest.raises(AgentResponseError, match="max_tokens") as caught:
+    with pytest.raises(AgentError, match="max_tokens") as caught:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert [attempt.response for attempt in caught.value.attempts] == ["{"]
@@ -593,7 +590,7 @@ def test_cut_off_answer_raises() -> None:
 def test_request_failure_preserves_completed_prior_attempts() -> None:
     client = FakeClient("no plan", anthropic.AnthropicError("network failed"))
 
-    with pytest.raises(AgentRequestError, match="network failed") as caught:
+    with pytest.raises(AgentError, match="network failed") as caught:
         ask_agent(cast(anthropic.Anthropic, client), QUERY, DATABASE)
 
     assert [attempt.response for attempt in caught.value.attempts] == ["no plan"]

@@ -42,7 +42,7 @@ def test_show_forced_returns_all_selected_attempt_evidence(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result = outcome(scan("o"))
-    monkeypatch.setattr(project, "force_plan", lambda *_args: result)
+    monkeypatch.setattr("comparison.force_plan", lambda *_args: result)
 
     shown = project.show_forced(FakeConnection(), "SELECT 1", scan("o"))  # type: ignore[arg-type]
 
@@ -57,7 +57,7 @@ def test_show_forced_preserves_failure_reason(
     def fail(*_args: object) -> ForcePlanResult:
         raise ValueError("Cannot force this plan")
 
-    monkeypatch.setattr(project, "force_plan", fail)
+    monkeypatch.setattr("comparison.force_plan", fail)
 
     shown = project.show_forced(FakeConnection(), "SELECT 1", scan("o"))  # type: ignore[arg-type]
 
@@ -91,7 +91,7 @@ def test_main_prints_complete_or_partial_structured_metrics(
         lambda *_args, **_kwargs: SimpleNamespace(
             plan=agent,
             query="SELECT * FROM o",
-            problems=[],
+            attempts=(object(),),
             summary="Use the index.",
         ),
     )

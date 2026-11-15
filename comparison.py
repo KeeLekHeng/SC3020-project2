@@ -446,6 +446,22 @@ def force_plan(
     return best
 
 
+def try_force_plan(
+    connection: psycopg.Connection, query: str, plan: PlanNode
+) -> ForcePlanResult | ForcingFailure:
+    """force_plan(), with a refused plan or a database error returned as ForcingFailure."""
+    try:
+        return force_plan(connection, query, plan)
+    except ValueError as error:
+        return ForcingFailure(str(error))
+    except (psycopg.errors.UndefinedFile, psycopg.errors.InsufficientPrivilege) as error:
+        connection.rollback()
+        return ForcingFailure(f"pg_hint_plan cannot be loaded, so plans cannot be forced: {error}")
+    except psycopg.Error as error:
+        connection.rollback()
+        return ForcingFailure(f"PostgreSQL forcing failed: {error}")
+
+
 def choices_equal(a: Choice | None, b: Choice | None) -> bool:
     """Whether two plans chose the same; a decision only one plan has never matches."""
     if a is None or b is None:

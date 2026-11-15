@@ -81,9 +81,9 @@ Plan and force with `result.query`, the query after `unique_aliases()`, because 
 | `summary` | One or two sentences on the agent's overall strategy. |
 | `query` | The query the agent planned. |
 | `answer` | The agent's raw JSON answer. |
-| `problems` | The errors sent back for each rejected answer, so `len(problems) + 1` answers were needed. |
+| `attempts` | Every answer in order, each with the problems sent back for it; the last is the accepted answer. |
 
-It raises `AgentPlanError`, with `.errors` and the raw `.answer`, when no answer is usable, and `RuntimeError` when the model declines or its answer is cut off. Errors from the Anthropic SDK, such as a missing API key or a rate limit, pass through. Answers vary from call to call, so save `result.answer` when a run must be repeatable.
+It raises `AgentPlanError`, with `.errors` and the raw `.answer`, when no answer is usable, and `AgentError` when a request fails, such as on a rate limit, or the model declines or its answer is cut off. Both carry the answers so far in `.attempts`. A missing API key raises the Anthropic SDK's error. Answers vary from call to call, so save `result.answer` when a run must be repeatable.
 
 ### How it works
 

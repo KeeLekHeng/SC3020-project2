@@ -5,7 +5,7 @@ from typing import Any
 import anthropic
 import psycopg
 
-from experiments import measure_execution_time as execution_time
+from experiments import execution_time
 from comparison import (
     ForcePlanResult,
     ForcingFailure,
@@ -13,7 +13,7 @@ from comparison import (
     MetricStatus,
     PlanEvaluation,
     evaluate_plans,
-    force_plan,
+    try_force_plan,
 )
 from preprocessing import (
     AgentPlanError,
@@ -41,19 +41,10 @@ def show_forced(
     and every force-eligible decision it did not reproduce. The returned structured
     outcome preserves hints, gaps, selected retry settings, or a failure reason.
     """
-    try:
-        result = force_plan(connection, query, plan)
-
-    except ValueError as error:
-        reason = str(error)
-        print(f"\n{reason}")
-        return ForcingFailure(reason)
-
-    except (psycopg.errors.UndefinedFile, psycopg.errors.InsufficientPrivilege) as error:
-        connection.rollback()
-        reason = f"pg_hint_plan cannot be loaded, so plans cannot be forced: {error}"
-        print(f"\n{reason}")
-        return ForcingFailure(reason)
+    result = try_force_plan(connection, query, plan)
+    if isinstance(result, ForcingFailure):
+        print(f"\n{result.reason}")
+        return result
 
     print(f"\npg_hint_plan hints:\n{result.hints}")
     print(f"\nPlan forced with the hints:\n{result.plan}")
@@ -163,7 +154,7 @@ def main() -> None:
             print(f"\nThe agent could not give a plan: {error}")
             return
 
-        print(f"\nAgent plan, after {len(result.problems) + 1} answer(s):\n{result.plan}")
+        print(f"\nAgent plan, after {len(result.attempts)} answer(s):\n{result.plan}")
         print(f"\nAgent's strategy: {result.summary}")
 
         outcome = show_forced(connection, result.query, result.plan)
