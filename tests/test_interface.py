@@ -68,7 +68,9 @@ def test_mark_plans_numbers_decisions_by_tables_and_pairs_nodes_across_plans() -
     # P joins c to o by hash and sorts; A asks for a merge join on an index scan of o
     # and no sort; R keeps the merge join but scans o sequentially.
     postgres = PlanNode(node_type="Sort", children=(join("Hash Join", scan("c"), scan("o")),))
-    agent = join("Merge Join", scan("c"), scan("o", "Index Scan"))
+    agent = join(
+        "Merge Join", scan("c"), scan("o", "Index Scan").model_copy(update={"index_name": "o_pkey"})
+    )
     realized = join("Merge Join", scan("c"), scan("o"))
     gaps = tuple(realization_gaps(agent, realized))
     evaluation = evaluate_plans(
@@ -82,8 +84,10 @@ def test_mark_plans_numbers_decisions_by_tables_and_pairs_nodes_across_plans() -
     )
 
     # Numbered top-down through A, then P: decisions over the same tables share one.
+    # index(o) is numbered though only intended realization counts it.
     assert {str(decision): number for decision, number in numbered.items()} == {
         "join(c, o)": 1,
+        "index(o)": 2,
         "scan(o)": 2,
         "sort(c, o)": 1,
     }
@@ -97,7 +101,10 @@ def test_mark_plans_numbers_decisions_by_tables_and_pairs_nodes_across_plans() -
     o_scan = a_marks[id(agent.children[1])]
     assert o_scan.numbers == (2,) and o_scan.filled and o_scan.gap
     assert not o_scan.dashed
-    assert o_scan.notes == ("#2 scan(o): P Seq Scan · A Index Scan · R Seq Scan (not kept by R)",)
+    assert o_scan.notes == (
+        "#2 index(o): P — · A o_pkey · R — (not kept by R)",
+        "#2 scan(o): P Seq Scan · A Index Scan · R Seq Scan (not kept by R)",
+    )
 
 
 def test_no_arguments_starts_the_gui_on_this_machine(monkeypatch: pytest.MonkeyPatch) -> None:

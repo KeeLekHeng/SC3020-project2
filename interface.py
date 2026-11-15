@@ -74,7 +74,9 @@ def mark_plans(
     proposed = {d.decision for d in evaluation.proposed.differences}
     realized = {d.decision for d in evaluation.realized.differences}
     gaps = {d.decision for d in evaluation.realizability.gaps}
-    differing = proposed | realized | gaps
+    # Intended realization counts disagreements the other two leave out, such as a
+    # named index P's plan does not use, so they are numbered and listed too.
+    differing = proposed | realized | gaps | set(evaluation.disagreements)
 
     numbers: dict[tuple[str, ...], int] = {}
     for index in (1, 0, 2):
